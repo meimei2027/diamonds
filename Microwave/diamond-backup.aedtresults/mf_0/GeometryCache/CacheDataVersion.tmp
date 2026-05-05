@@ -1,0 +1,12 @@
+$begin 'CacheDataVersion'
+	DataVersion=63
+$end 'CacheDataVersion'
+$begin 'VariableValues'
+	$smawidth='3.3mm'
+	$tracecenterx='0.32mm'
+	$copperthickness='0.018mm'
+	$substratethickness='1.6mm'
+	$lambda4='27mm'
+	$widthy='70mm'
+	$taperextra='0.1mm'
+$end 'VariableValues'

@@ -1,0 +1,17 @@
+$begin 'imprintInfo'
+	FileVersion='2025R2'
+	$begin 'imprintIDMap'
+	$end 'imprintIDMap'
+	$begin 'PartsInfo'
+		Part(167, 'substrate', -1, 6, 169, 172, 171, 170, 168, 173)
+		Part(223, 'bigring', -1, 9, 224, 306, 226, 225, 241, 307, 698, 696, 695)
+		Part(671, 'Polyline1', -1, 0)
+		Part(717, 'ground', -1, 1, 727)
+		Part(729, 'radbox', -1, 6, 730, 732, 733, 734, 731, 735)
+		Part(780, 'port1', -1, 1, 790)
+	$end 'PartsInfo'
+	$begin 'PartAddtionalPiecesInfo'
+	$end 'PartAddtionalPiecesInfo'
+	$begin 'faceImprintInfo'
+	$end 'faceImprintInfo'
+$end 'imprintInfo'
