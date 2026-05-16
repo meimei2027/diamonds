@@ -1,3 +1,11 @@
 .ipynb_checkpoints
 *.aedtresults/
 */aom-equations.pdf
+*.kra
+*.auto
+*.lock
+*.lck
+*-backups/
+fp-info-cache
+\#auto_saved_files\#
+fp-lib-table
