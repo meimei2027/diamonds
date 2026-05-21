@@ -1,0 +1,14 @@
+{signal: [
+  
+  {name: 'DG535 T0', wave: '03.........0', data: ['trigger Keysight33600A']},
+  {name: 'Keysight33600A', wave: '040.4040.40.', data: ['77MHz pulse to AOM', 'another pulse', '77MHz pulse to AOM', 'another pulse']},
+  {name: 'laser', wave: '027027270270', data: ['AOM delay', 'excitation', 'AOM delay', 'readout', 'AOM delay', 'excitation', 'AOM delay', 'readout']},
+  {name: 'DG535 A', wave: '0..3.......0', data: ['trigger SDG1062X']},
+  {name: 'microwave', wave: '0..8.0......', data:['Hahn echo']},
+  {name: 'DG535 B', wave: '0....3.....0', data:['trigger RTB2004']},
+  {name: 'RTB2004', wave: '0....50...50', data:['save to memory', 'save to memory']},
+  {name: 'DG535 C', wave: '0.....3....0', data:['trigger Keysight33600A']},
+  {name: 'DG535 D', wave: '0.........30', data:['trigger RTB2004']},
+  
+],
+ config: { hscale: 2 }}
