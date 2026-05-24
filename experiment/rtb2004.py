@@ -12,6 +12,7 @@ class RTB2004:
         self.inst.timeout = timeout
         self.inst.chunk_size = 10 * 1024 * 1024  # 10 MB chunks
         self.debug = True
+        self.reset()
 
     def reset(self):
         self.write("*RST")
@@ -30,22 +31,10 @@ class RTB2004:
         return self.inst.query(cmd).strip()
 
     def setup_segmented_mode(self, segments=1000):
-        self.write("*RST")
-        self.write("*CLS")
-
         self.write("ACQuire:MEMory MANual")
         self.write("ACQuire:POINts 10000")
         self.write(f"ACQuire:NSINgle:COUNt {segments}")
         self.write("ACQuire:SEGMented:STATe ON")
-
-        self.write("SINGle")
-        time.sleep(1)
-
-        self.write("STOP")
-        print(self.get_segment_count())
-
-        for i in range(1, segments):
-            self.read_segment(i)
             
 
 
@@ -68,16 +57,14 @@ class RTB2004:
 
 
     def wait_for_acquisition(self, timeout=60):
-        pass
-        # start = time.time()
-
-        # while True:
-        #     opc = self.inst.query("*OPC?").strip()
-        #     if opc == "1":
-        #         return
-        #     if time.time() - start > timeout:
-        #         raise TimeoutError("Acquisition timeout")
-        #     time.sleep(0.1)
+        start = time.time()
+        while True:
+            opc = self.inst.query("*OPC?").strip()
+            if opc == "1":
+                return
+            if time.time() - start > timeout:
+                raise TimeoutError("Acquisition timeout")
+            time.sleep(0.1)
 
 
     def get_segment_count(self):
@@ -108,8 +95,20 @@ class RTB2004:
 
 
     def run(self, segments=1000, ch=1):
-        sample_rate = self.set_timebase(1e-6)
-        print(sample_rate)
+        sample_rate = self.set_timebase(10e-6)
+        print("sample rate", sample_rate)
+        # print(self.get_timetable())
         self.setup_segmented_mode(
             segments=segments
         )
+
+        self.write("SINGle")
+        self.wait_for_acquisition()
+
+        # time.sleep(1)
+
+        self.write("STOP")
+        print(self.get_segment_count())
+
+        for i in range(1, segments):
+            self.read_segment(i)
