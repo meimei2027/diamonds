@@ -1,8 +1,9 @@
 import numpy as np
+import generate_arb
 
 def generate_waveforms(
     n_segments=1000,
-    fs=1e9,          # 1 GHz sampling rate (1 ns resolution)
+    fs=50e6,          # 1 GHz sampling rate (1 ns resolution)
     seed=42,
     f_min=1e6,
     f_max=50e6
@@ -10,7 +11,7 @@ def generate_waveforms(
     rng = np.random.default_rng(seed)
 
     dt = 1 / fs
-    t_1us = int(1e-6 * fs)  # samples per 1 µs
+    t_1us = int(1e-3 * fs)  # samples per 1 µs
 
     # random integer frequencies (Hz)
     freqs = rng.integers(f_min, f_max + 1, size=n_segments)
@@ -42,13 +43,17 @@ def generate_waveforms(
 
     square_wave = np.concatenate(square_wave)
 
-    # Print frequencies
     print("Frequencies used (Hz):")
-    print(freqs)
+    # print(freqs)
+    
 
-    return sine_wave, square_wave, freqs
+    t = np.arange(t_1us * 2 * n_segments) * dt
+
+    return t, sine_wave, square_wave, freqs
 
 
 # Example usage
 if __name__ == "__main__":
-    sine_wf, square_wf, freqs = generate_waveforms()
+    
+    t, ch1, ch2, freqs = generate_waveforms(n_segments=10)
+    generate_arb.write_csv("waveforms/test_scope.csv", t, ch1, ch2)

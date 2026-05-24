@@ -73,7 +73,7 @@ class KS33600A:
             self.write(f"SOUR{ch}:FUNC ARB")
             self.write(f"SOUR{ch}:FUNC:ARB {self.arb_name_prefix}{ch}")
             self.write(f"SOUR{ch}:FUNC:ARB:SRAT {sample_rate}")
-            
+
             self.write(f"TRIG{ch}:SOUR EXT")
             self.write(f"TRIG{ch}:SLOP POS")
 
@@ -100,3 +100,14 @@ class KS33600A:
         self.write("SOUR1:AM:DEPT 100")
         self.write("SOUR1:AM:STAT ON")
         self.write("OUTP1 ON")
+
+    def play_continuously(self, sample_rate, channel_list=(1, 2)):
+        for ch in channel_list:
+            self.write(f"SOUR{ch}:FUNC:ARB:FILT NORM")
+            self.write(f"SOUR{ch}:FUNC:ARB:PTP 1")
+            self.write(f"SOUR{ch}:FUNC ARB")
+            self.write(f"SOUR{ch}:FUNC:ARB {self.arb_name_prefix}{ch}")
+            self.write(f"SOUR{ch}:FUNC:ARB:SRAT {sample_rate}")
+            self.write(f"TRIG{ch}:SOUR IMM")
+            self.write(f"SOUR{ch}:BURS:STAT OFF")
+            self.write(f"OUTP{ch} ON")
