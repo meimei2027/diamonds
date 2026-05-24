@@ -4,16 +4,14 @@ import os
 from datetime import datetime
 import time
 
-
 class RTB2004:
-    def __init__(self, resource, segment_buffer_size=100, timeout=100000):
+    def __init__(self, resource, timeout=100000):
         self.rm = pyvisa.ResourceManager()
         self.inst = self.rm.open_resource(resource)
 
         self.inst.timeout = timeout
         self.inst.chunk_size = 10 * 1024 * 1024  # 10 MB chunks
         self.debug = True
-
 
     def reset(self):
         self.write("*RST")
@@ -46,12 +44,6 @@ class RTB2004:
         self.write("STOP")
         print(self.get_segment_count())
 
-        # self.write("CHANnel1:HISTory:PALL ON")
-        # self.write("CHANnel1:HISTory:REPLay ON")
-
-        # self.write("CHANnel1:HISTory:STARt -5")
-        # self.write("CHANnel1:HISTory:STOP 0")
-
         for i in range(1, segments):
             self.read_segment(i)
             
@@ -65,6 +57,7 @@ class RTB2004:
 
     def set_timebase(self, scale_seconds):
         self.write(f"TIMebase:SCALe {scale_seconds}")
+        return self.query("ACQuire:SRATe?")
 
 
     def set_trigger_edge(self, level=0.0):
@@ -99,7 +92,6 @@ class RTB2004:
         self.write(f"EXPort:WAVeform:NAME \"/USB_FRONT/DATA/WFMNEW0{segment_index}\"")
         self.write("EXPort:WAVeform:SAVE")
 
-
         # self.write("WAVeform:FORMat BYTE")
         # raw = self.inst.query_binary_values(
         #     "WAVeform:DATA?",
@@ -116,6 +108,8 @@ class RTB2004:
 
 
     def run(self, segments=1000, ch=1):
+        sample_rate = self.set_timebase(1e-6)
+        print(sample_rate)
         self.setup_segmented_mode(
             segments=segments
         )

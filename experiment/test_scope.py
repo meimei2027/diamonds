@@ -1,5 +1,5 @@
 import ks33600a
-import rtb2004_new
+import rtb2004
 import numpy as np
 
 # generator = ks33600a.KS33600A("USB0::0x0957::0x5707::MY53800810::INSTR")
@@ -7,7 +7,7 @@ import numpy as np
 # generator.play_continuously(sample_rate=50e6)
 # generator.close()
 
-scope = rtb2004_new.RTB2004("USB0::0x0AAD::0x01D6::108904::INSTR")
+scope = rtb2004.RTB2004("USB0::0x0AAD::0x01D6::108904::INSTR")
 scope.run(segments=10)
 scope.close()
 

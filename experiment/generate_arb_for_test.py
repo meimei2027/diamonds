@@ -22,10 +22,7 @@ def generate_waveforms(
     for f in freqs:
         t = np.arange(t_1us) * dt
 
-        # 1 µs sine wave
         sine = np.sin(2 * np.pi * f * t)
-
-        # 1 µs zero
         zeros = np.zeros(t_1us)
 
         sine_wave.append(sine)
@@ -33,7 +30,6 @@ def generate_waveforms(
 
     sine_wave = np.concatenate(sine_wave)
 
-    # Square wave: 1 µs on, 1 µs off
     one = np.ones(t_1us)
     zero = np.zeros(t_1us)
 
@@ -43,16 +39,13 @@ def generate_waveforms(
 
     square_wave = np.concatenate(square_wave)
 
-    print("Frequencies used (Hz):")
-    # print(freqs)
+    print(freqs / 1e6)
     
 
     t = np.arange(t_1us * 2 * n_segments) * dt
-
     return t, sine_wave, square_wave, freqs
 
 
-# Example usage
 if __name__ == "__main__":
     
     t, ch1, ch2, freqs = generate_waveforms(n_segments=10)
