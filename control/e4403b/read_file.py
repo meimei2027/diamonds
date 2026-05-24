@@ -2,6 +2,8 @@ import pyvisa
 import time
 from pathlib import Path
 import numpy as np
+import sys
+
 
 rm = pyvisa.ResourceManager()
 instr = rm.open_resource('GPIB0::18::INSTR')
@@ -10,7 +12,7 @@ instr.timeout = 20000
 instr.write_termination = '\n'
 instr.read_termination = '\n'
 
-instr.write(":FREQ:CENT 77MHz")
+instr.write(":FREQ:CENT 2.8GHz")
 instr.write(":FREQ:SPAN 500MHz")
 
 instr.write(":FORM REAL,32")          # binary float transfer
@@ -51,10 +53,14 @@ stop_freq  = center + span / 2
 
 freqs = np.linspace(start_freq, stop_freq, len(trace))
 
-save_dir = Path("./captures")
+save_dir = Path("./microwave")
 save_dir.mkdir(exist_ok=True)
 
-filename = "esa_trace.csv"
+if len(sys.argv) > 1:
+    filename = sys.argv[1]
+else:
+    filename = "esa_trace.csv"
+
 filepath = save_dir / filename
 
 data = np.column_stack((freqs, trace))
