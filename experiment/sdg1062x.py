@@ -11,6 +11,8 @@ class SDG1062X:
 
         self.arb_name_ch1 = "ARB1"
         self.debug = debug
+        self.write("*RST")
+        self.MAX_SAMPLE_RATE = 30e6
 
         print("Siglent SDG1062X: connected")
 
@@ -27,60 +29,63 @@ class SDG1062X:
         return self.inst.query(cmd).strip()
 
     def load_csv(self, csv_file):
-        data = np.genfromtxt(csv_file, delimiter=",")
-        waveform = np.asarray(data, dtype=np.float32)
-        return waveform
+        data = np.genfromtxt(csv_file, delimiter=",", skip_header=1)
+        ch1 = np.asarray(data[:, 1], dtype=np.float32)
+        return ch1
 
     def upload_waveform(self, waveform, arb_name=None, ch=1):
-
         if arb_name is None:
             arb_name = self.arb_name_ch1
 
-        # normalize to [-1, 1]
-        waveform = waveform / np.max(np.abs(waveform))
-
-        # convert to int16
-        waveform_i16 = np.int16(waveform * 32767)
-
-        # delete old waveform
+        waveform = waveform * 32767
         self.write(f"C{ch}:WVDT DEL,{arb_name}")
-
-        # upload waveform
         self.inst.write_binary_values(
-            f"C{ch}:WVDT WVNM,{arb_name},WAVEDATA,",
-            waveform_i16,
+            f"C{ch}:WVDT WVNM,{arb_name},WAVEDATA",
+            waveform,
             datatype='h',
             is_big_endian=False
         )
-
         print(f"Siglent SDG1062X: uploaded arb to channel {ch}")
 
     def upload_csv(self, csv_file):
         waveform = self.load_csv(csv_file)
         self.upload_waveform(waveform, ch=1)
 
-    def run(self, vpp=1.0, sample_rate=1e6):
+    def run(self, vpp=1.0, sample_rate=None):
+        if sample_rate is None:
+            sample_rate = self.MAX_SAMPLE_RATE
 
         ch = 1
 
-        # arbitrary waveform mode
         self.write(f"C{ch}:BSWV WVTP,ARB")
         self.write(f"C{ch}:ARWV NAME,{self.arb_name_ch1}")
-
-        # sample rate
-        self.write(f"C{ch}:SRATE MODE,TARB,VALUE,{sample_rate}")
-
-        # amplitude / offset
-        self.write(f"C{ch}:BSWV AMP,{vpp}")
+        self.write(f"C{ch}:BSWV AMP,{vpp/5}")
         self.write(f"C{ch}:BSWV OFST,0")
-
-        # external trigger burst
+        
         self.write(f"C{ch}:BTWV STATE,ON")
         self.write(f"C{ch}:BTWV TRSR,EXT")
         self.write(f"C{ch}:BTWV GATE_NCYC,NCYC")
         self.write(f"C{ch}:BTWV TIME,1")
-
-        # output on
+        self.write(f"C{ch}:BTWV EDGE,RISE")
+        self.write(f"C{ch}:BTWV PLRT,POS")
+        self.write(f"C{ch}:SRATE MODE,TARB,VALUE,{sample_rate}")
         self.write(f"C{ch}:OUTP ON")
 
+        # print(self.query(f"C{ch}:BTWV?"))
+        # print(self.query(f"C{ch}:ARWV?"))
+        # print(self.query(f"C{ch}:SRATE?"))
+
         print("Siglent SDG1062X: waiting for external trigger")
+
+    def test(self):
+        ch = 1
+        self.write("*RST")
+        self.write(f"C{ch}:BSWV WVTP,ARB")
+        self.write(f"C{ch}:ARWV NAME,{self.arb_name_ch1}")
+        self.write(f"C{ch}:BTWV STATE,OFF")
+        self.write(f"C{ch}:BSWV AMP,1")
+        self.write(f"C{ch}:BSWV OFST,0")
+        self.write(f"C{ch}:SRATE MODE,TARB,VALUE,30e6")
+        self.write(f"C{ch}:OUTP ON")
+        print(self.query(f"C{ch}:SRATE?"))
+

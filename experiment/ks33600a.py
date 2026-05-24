@@ -36,7 +36,6 @@ class KS33600A:
 
 
     def upload_waveform(self, waveform, arb_name, ch=1, sample_rate=None):
-
         if sample_rate is None:
             sample_rate = self.MAX_SAMPLE_RATE
 
@@ -61,7 +60,6 @@ class KS33600A:
 
 
     def run(self, vpp, channel_list=(1, 2), sample_rate=None):
-
         if sample_rate is None:
             sample_rate = self.MAX_SAMPLE_RATE
 
@@ -75,11 +73,9 @@ class KS33600A:
             self.write(f"SOUR{ch}:FUNC ARB")
             self.write(f"SOUR{ch}:FUNC:ARB {self.arb_name_prefix}{ch}")
             self.write(f"SOUR{ch}:FUNC:ARB:SRAT {sample_rate}")
-
-            # self.write(f"SOUR{ch}:FUNC ARB")
+            
             self.write(f"TRIG{ch}:SOUR EXT")
             self.write(f"TRIG{ch}:SLOP POS")
-
 
             # self.write(f"SOUR{ch}:FUNC:ARB:SRAT {sample_rate}")
             self.write(f"SOUR{ch}:BURST:MODE TRIG")
@@ -88,3 +84,19 @@ class KS33600A:
             self.write(f"OUTP{ch} ON")
 
         print("Keysight 33600A: waiting for external trigger")
+
+    def run_alignment(self, vpp=0.632, carrier_freq=77e6, mod_freq=1.0):
+
+        self.write("TRIG:SOUR IMM")
+        self.write("OUTP1:LOAD 50")
+        self.write("SOUR1:FUNC SIN")
+        self.write(f"SOUR1:FREQ {carrier_freq}")
+        self.write(f"SOUR1:VOLT {vpp} VPP") # 0 dBm
+
+        self.write("SOUR1:AM:STAT OFF")
+        self.write("SOUR1:AM:SOUR INT")
+        self.write("SOUR1:AM:INT:FUNC SQU")
+        self.write(f"SOUR1:AM:INT:FREQ {mod_freq}")
+        self.write("SOUR1:AM:DEPT 100")
+        self.write("SOUR1:AM:STAT ON")
+        self.write("OUTP1 ON")

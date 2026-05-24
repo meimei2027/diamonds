@@ -1,0 +1,54 @@
+import numpy as np
+
+def generate_waveforms(
+    n_segments=1000,
+    fs=1e9,          # 1 GHz sampling rate (1 ns resolution)
+    seed=42,
+    f_min=1e6,
+    f_max=50e6
+):
+    rng = np.random.default_rng(seed)
+
+    dt = 1 / fs
+    t_1us = int(1e-6 * fs)  # samples per 1 µs
+
+    # random integer frequencies (Hz)
+    freqs = rng.integers(f_min, f_max + 1, size=n_segments)
+
+    sine_wave = []
+    square_wave = []
+
+    for f in freqs:
+        t = np.arange(t_1us) * dt
+
+        # 1 µs sine wave
+        sine = np.sin(2 * np.pi * f * t)
+
+        # 1 µs zero
+        zeros = np.zeros(t_1us)
+
+        sine_wave.append(sine)
+        sine_wave.append(zeros)
+
+    sine_wave = np.concatenate(sine_wave)
+
+    # Square wave: 1 µs on, 1 µs off
+    one = np.ones(t_1us)
+    zero = np.zeros(t_1us)
+
+    for _ in range(n_segments):
+        square_wave.append(one)
+        square_wave.append(zero)
+
+    square_wave = np.concatenate(square_wave)
+
+    # Print frequencies
+    print("Frequencies used (Hz):")
+    print(freqs)
+
+    return sine_wave, square_wave, freqs
+
+
+# Example usage
+if __name__ == "__main__":
+    sine_wf, square_wf, freqs = generate_waveforms()
