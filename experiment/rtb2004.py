@@ -64,7 +64,7 @@ class RTB2004:
                 return
             if time.time() - start > timeout:
                 raise TimeoutError("Acquisition timeout")
-            time.sleep(0.1)
+            time.sleep(0.5)
 
 
     def get_segment_count(self):
@@ -111,4 +111,7 @@ class RTB2004:
         print(self.get_segment_count())
 
         for i in range(1, segments):
+            stopwatch = time.time()
             self.read_segment(i)
+            print("Segment", i, "acquired in", time.time() - stopwatch, "seconds, ETA: ", (segments - i) * (time.time() - stopwatch), "seconds")
+        # self.query("STOP")
