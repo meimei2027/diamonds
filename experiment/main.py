@@ -75,11 +75,14 @@ if __name__ == "__main__":
     # remember to set to 50 ohm later
     # amplitude is pretty accurate at high Z
     # idle after the waveform is done is at 700 mV
+    # unavoidable delay ~380ns from the trigger
     sdg = sdg1062x.SDG1062X("USB0::0xF4EC::0x1103::SDG1XDDX6R5043::INSTR")
     sdg.upload_csv("waveforms/sdg1062x.csv")
-    sdg.run(vpp=1)
+    sdg.run(vpp=2)
     sdg.close()
 
+    # hp: page 3-110
+    # high above 3V, low below 0.5V
 
 # 
 

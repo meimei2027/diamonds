@@ -104,6 +104,8 @@ class RTB2004:
 
         self.write("SINGle")
         self.wait_for_acquisition()
+        print(self.get_segment_count())
+
 
         # time.sleep(1)
 
