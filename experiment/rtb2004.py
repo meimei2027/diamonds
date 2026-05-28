@@ -38,7 +38,7 @@ class RTB2004:
             
 
 
-    def get_timetable(self, save=False, path="/USB_FRONT/DATA", ch=1):
+    def get_timetable(self, save=False, path="/USB_FRONT/data", ch=1):
         print(self.query(f"CHANnel{ch}:HISTory:TSRelative:ALL?"))
         if save: 
             self.write(f"CHANnel{ch}:HISTory:EXPort:NAME \"{path}\"")
@@ -51,7 +51,7 @@ class RTB2004:
 
     def set_trigger_edge(self, level=0.0):
         self.write("TRIGger:A:TYPE EDGE")
-        self.write(f"TRIGger:A:SOURce EXT")
+        self.write("TRIGger:A:SOURce EXT")
         self.write(f"TRIGger:A:LEVel {level}")
         self.write("TRIGger:A:MODE NORM")
 
@@ -64,19 +64,19 @@ class RTB2004:
                 return
             if time.time() - start > timeout:
                 raise TimeoutError("Acquisition timeout")
-            time.sleep(0.1)
+            time.sleep(0.5)
 
 
     def get_segment_count(self):
         return int(self.query("ACQuire:AVAilable?"))
 
     def read_segment(self, segment_index=1, ch=1):
-        self.write(f"CHANnel1:HISTory:CURRent {segment_index}")
+        self.write(f"CHANnel{ch}:HISTory:CURRent {segment_index}")
         self.write(f"EXPort:WAVeform:SOURce CH{ch}")
         self.write("FORMAT CSV")
-        self.write("EXPort:WFMSave:DEST \"/USB_FRONT/DATA\"")
+        self.write("EXPort:WFMSave:DEST \"/USB_FRONT/data\"")
         self.write(f"CHANnel{ch}:DATA:POINts MAX")
-        self.write(f"EXPort:WAVeform:NAME \"/USB_FRONT/DATA/WFMNEW0{segment_index}\"")
+        self.write(f"EXPort:WAVeform:NAME \"/USB_FRONT/data/WFM0{segment_index}\"")
         self.write("EXPort:WAVeform:SAVE")
 
         # self.write("WAVeform:FORMat BYTE")
@@ -101,11 +101,10 @@ class RTB2004:
         self.setup_segmented_mode(
             segments=segments
         )
+        self.set_trigger_edge(level=0.0)
 
         self.write("SINGle")
         self.wait_for_acquisition()
-        print(self.get_segment_count())
-
 
         # time.sleep(1)
 
@@ -113,4 +112,10 @@ class RTB2004:
         print(self.get_segment_count())
 
         for i in range(1, segments):
+            stopwatch = time.time()
             self.read_segment(i)
+            print("Segment", i, "acquired in", time.time() - stopwatch, "seconds, ETA: ", (segments - i) * (time.time() - stopwatch), "seconds")
+        # self.write("STOP")
+        # print("ACQuire:TYPE?", self.write("ACQuire:TYPE?"))
+
+        # self.query("STOP")
