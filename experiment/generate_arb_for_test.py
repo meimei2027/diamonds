@@ -6,13 +6,13 @@ def generate_waveforms(
     fs=50e6,
     seed=42,
     f_min=1e6,
-    f_max=50e6
+    f_max=50e6,
+    half_cycle=1e-3
 ):
     rng = np.random.default_rng(seed)
 
     dt = 1 / fs
-    # t_1us = int(1e-6 * fs)
-    t_1us = int(1e-3 * fs)  # samples per 1 µs
+    period = int(half_cycle * fs)  # samples per 1 µs
 
     # random integer frequencies (Hz)
     freqs = rng.integers(f_min, f_max + 1, size=n_segments)
@@ -21,10 +21,10 @@ def generate_waveforms(
     square_wave = []
 
     for f in freqs:
-        t = np.arange(t_1us) * dt
+        t = np.arange(period) * dt
 
         sine = np.sin(2 * np.pi * f * t)
-        zeros = np.zeros(t_1us)
+        zeros = np.zeros(period)
 
         sine_wave.append(sine)
         sine_wave.append(zeros)
@@ -32,8 +32,8 @@ def generate_waveforms(
     sine_wave = np.concatenate(sine_wave)
     print(sine_wave)
 
-    one = np.ones(t_1us)
-    zero = np.zeros(t_1us)
+    one = np.ones(period)
+    zero = np.zeros(period)
 
     for _ in range(n_segments):
         square_wave.append(one)
@@ -43,7 +43,7 @@ def generate_waveforms(
 
     print(freqs / 1e6)
     
-    t = np.arange(t_1us * 2 * n_segments) * dt
+    t = np.arange(period * 2 * n_segments) * dt
     return t, sine_wave, square_wave, freqs
 
 

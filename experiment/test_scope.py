@@ -8,7 +8,7 @@ generator.play_continuously(sample_rate=100e6)
 generator.close()
 
 scope = rtb2004.RTB2004("USB0::0x0AAD::0x01D6::108904::INSTR", timeout=10000, debug=True)
-scope.run(segments=10)
+scope.run(segments=15)
 scope.close()
 
 
