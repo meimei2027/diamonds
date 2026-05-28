@@ -64,7 +64,6 @@ class KS33600A:
             sample_rate = self.MAX_SAMPLE_RATE
 
         for ch in channel_list:
-
             # turn on smoothing filter so we can have 1 GSa/s, max sample rate 
             self.write(f"SOUR{ch}:FUNC:ARB:FILT NORM")
 
@@ -103,9 +102,8 @@ class KS33600A:
 
     def play_continuously(self, sample_rate, channel_list=(1, 2), vpp=1):
         for ch in channel_list:
-            self.write(f"SOUR{ch}:FUNC:ARBitrary:PTPeak {vpp}")
             self.write(f"SOUR{ch}:FUNC:ARB:FILT NORM")
-            self.write(f"SOUR{ch}:FUNC:ARB:PTP 1")
+            self.write(f"SOUR{ch}:FUNC:ARB:PTP 1") # doesn't seem to work for channel 2?
             self.write(f"SOUR{ch}:FUNC ARB")
             self.write(f"SOUR{ch}:FUNC:ARB {self.arb_name_prefix}{ch}")
             self.write(f"SOUR{ch}:FUNC:ARB:SRAT {sample_rate}")

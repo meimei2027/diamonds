@@ -76,32 +76,22 @@ class RTB2004:
 
     def read_segment(self, segment_index=1, ch=1):
         self.write(f"CHANnel{ch}:HISTory:CURRent {segment_index}")
-        self.write(f"EXPort:WAVeform:SOURce CH{ch}")
-        self.write("FORMAT CSV")
-        self.write("EXPort:WFMSave:DEST \"/USB_FRONT/data\"")
-        self.write(f"CHANnel{ch}:DATA:POINts MAX")
-        self.write(f"EXPort:WAVeform:NAME \"/USB_FRONT/data/WFM0{segment_index}\"")
-        self.write("EXPort:WAVeform:SAVE")
+        
+        # self.write(f"EXPort:WAVeform:NAME \"/USB_FRONT/data/WFM0{segment_index}\"")
+        # self.write("EXPort:WAVeform:SAVE")
 
-        # self.write("WAVeform:FORMat BYTE")
-        # raw = self.inst.query_binary_values(
-        #     "WAVeform:DATA?",
-        #     datatype='B',
-        #     container=np.array
-        # )
-        # y_origin = float(self.query("WAVeform:YORigin?"))
-        # y_ref = float(self.query("WAVeform:YREFerence?"))
-        # y_inc = float(self.query("WAVeform:YINCrement?"))
-
-        # voltage = (raw - y_ref) * y_inc + y_origin
-
-        # return voltage
+        raw = self.inst.query_binary_values(
+            f"CHANnel{ch}:DATA?",
+            datatype='f',
+            container=np.array,
+            is_big_endian=True
+        )
+        return raw
 
 
     def run(self, segments=1000, ch=1):
         sample_rate = self.set_timebase(1e-6)
         print("sample rate", sample_rate)
-        # print(self.get_timetable())
         self.setup_segmented_mode(
             segments=segments
         )
@@ -110,16 +100,22 @@ class RTB2004:
         self.write("SINGle")
         self.wait_for_acquisition()
 
-        # time.sleep(1)
-
         self.write("STOP")
         print(self.get_segment_count())
+        print(self.get_timetable())
 
+
+        self.write(f"EXPort:WAVeform:SOURce CH{ch}")
+        # self.write("FORMAT CSV")
+        # self.write("EXPort:WFMSave:DEST \"/USB_FRONT/data\"")
+        self.write("FORMat REAL")
+
+        self.write(f"CHANnel{ch}:DATA:POINts MAX")
+        segments_list = []
         for i in range(1, segments+1):
             stopwatch = time.time()
-            self.read_segment(i)
-            print("Segment", i, "acquired in", time.time() - stopwatch, "seconds, ETA: ", (segments - i) * (time.time() - stopwatch), "seconds")
-        # self.write("STOP")
-        # print("ACQuire:TYPE?", self.write("ACQuire:TYPE?"))
-
-        # self.query("STOP")
+            seg = self.read_segment(i)
+            segments_list.append(seg)
+            print("Segment", i, "saved in", time.time() - stopwatch, "seconds, ETA:", (segments - i) * (time.time() - stopwatch), "seconds")
+            np.save(f"./data_new/data-{i}.npy", seg)
+        print(segments_list)
