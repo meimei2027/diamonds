@@ -101,8 +101,9 @@ class KS33600A:
         self.write("SOUR1:AM:STAT ON")
         self.write("OUTP1 ON")
 
-    def play_continuously(self, sample_rate, channel_list=(1, 2)):
+    def play_continuously(self, sample_rate, channel_list=(1, 2), vpp=1):
         for ch in channel_list:
+            self.write(f"SOUR{ch}:FUNC:ARBitrary:PTPeak {vpp}")
             self.write(f"SOUR{ch}:FUNC:ARB:FILT NORM")
             self.write(f"SOUR{ch}:FUNC:ARB:PTP 1")
             self.write(f"SOUR{ch}:FUNC ARB")
@@ -111,3 +112,4 @@ class KS33600A:
             self.write(f"TRIG{ch}:SOUR IMM")
             self.write(f"SOUR{ch}:BURS:STAT OFF")
             self.write(f"OUTP{ch} ON")
+            # self.write(f"SOUR1:VOLT {vpp} VPP")

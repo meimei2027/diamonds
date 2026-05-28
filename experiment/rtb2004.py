@@ -5,14 +5,15 @@ from datetime import datetime
 import time
 
 class RTB2004:
-    def __init__(self, resource, timeout=100000):
+    def __init__(self, resource, timeout=100000, debug=False):
         self.rm = pyvisa.ResourceManager()
         self.inst = self.rm.open_resource(resource)
 
         self.inst.timeout = timeout
         self.inst.chunk_size = 10 * 1024 * 1024  # 10 MB chunks
-        self.debug = True
+        self.debug = debug
         self.reset()
+        print("RTB2004: connected")
 
     def reset(self):
         self.write("*RST")
@@ -25,7 +26,9 @@ class RTB2004:
     def write(self, cmd):
         self.inst.write(cmd)
         if self.debug: 
-            print(cmd + " => " + self.inst.query("SYST:ERR?"))
+            message = self.inst.query("SYST:ERR?")
+            if message[0] != "0":
+                print(cmd + " => " + message)
 
     def query(self, cmd):
         return self.inst.query(cmd).strip()
@@ -36,7 +39,6 @@ class RTB2004:
         self.write(f"ACQuire:NSINgle:COUNt {segments}")
         self.write("ACQuire:SEGMented:STATe ON")
             
-
 
     def get_timetable(self, save=False, path="/USB_FRONT/data", ch=1):
         print(self.query(f"CHANnel{ch}:HISTory:TSRelative:ALL?"))
@@ -49,10 +51,12 @@ class RTB2004:
         return self.query("ACQuire:SRATe?")
 
 
-    def set_trigger_edge(self, level=0.0):
+    def set_trigger_edge(self, level=0.0, ch=1):
+        self.write(f"CHANnel{ch}:SCALe 500e-3")
         self.write("TRIGger:A:TYPE EDGE")
         self.write("TRIGger:A:SOURce EXT")
-        self.write(f"TRIGger:A:LEVel {level}")
+        self.write("TRIGger:A:EDGE:SLOPe POS")
+        self.write(f"TRIGger:A:LEVel5 {level}")
         self.write("TRIGger:A:MODE NORM")
 
 
@@ -95,13 +99,13 @@ class RTB2004:
 
 
     def run(self, segments=1000, ch=1):
-        sample_rate = self.set_timebase(10e-6)
+        sample_rate = self.set_timebase(1e-6)
         print("sample rate", sample_rate)
         # print(self.get_timetable())
         self.setup_segmented_mode(
             segments=segments
         )
-        self.set_trigger_edge(level=0.0)
+        self.set_trigger_edge(level=200e-3)
 
         self.write("SINGle")
         self.wait_for_acquisition()
@@ -111,7 +115,7 @@ class RTB2004:
         self.write("STOP")
         print(self.get_segment_count())
 
-        for i in range(1, segments):
+        for i in range(1, segments+1):
             stopwatch = time.time()
             self.read_segment(i)
             print("Segment", i, "acquired in", time.time() - stopwatch, "seconds, ETA: ", (segments - i) * (time.time() - stopwatch), "seconds")
