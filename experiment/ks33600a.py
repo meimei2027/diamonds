@@ -14,6 +14,11 @@ class KS33600A:
         self.arb_name_ch2 = "ARB_CH2"
         self.debug = debug
         print("Keysight 33600A: connected")
+        self.reset()
+    
+    def reset(self):
+        self.write("*RST")
+        self.write("*CLS")
 
     def close(self):
         if self.inst is not None:
@@ -82,6 +87,7 @@ class KS33600A:
             self.write(f"SOUR{ch}:BURST:STAT ON")
             self.write(f"OUTP{ch} ON")
 
+
         print("Keysight 33600A: waiting for external trigger")
 
     def run_alignment(self, vpp=0.632, carrier_freq=77e6, mod_freq=1.0):
@@ -100,14 +106,45 @@ class KS33600A:
         self.write("SOUR1:AM:STAT ON")
         self.write("OUTP1 ON")
 
-    def play_continuously(self, sample_rate, channel_list=(1, 2), vpp=1):
+    def play_continuously(self, sample_rate, channel_list=[1, 2], vpp=1):
         for ch in channel_list:
+            self.write(f"OUTP{ch}:LOAD INF")
             self.write(f"SOUR{ch}:FUNC:ARB:FILT NORM")
-            self.write(f"SOUR{ch}:FUNC:ARB:PTP 1") # doesn't seem to work for channel 2?
+            self.write(f"SOUR{ch}:FUNC:ARB:PTP {vpp}") # doesn't seem to work for channel 2?
             self.write(f"SOUR{ch}:FUNC ARB")
             self.write(f"SOUR{ch}:FUNC:ARB {self.arb_name_prefix}{ch}")
             self.write(f"SOUR{ch}:FUNC:ARB:SRAT {sample_rate}")
             self.write(f"TRIG{ch}:SOUR IMM")
             self.write(f"SOUR{ch}:BURS:STAT OFF")
             self.write(f"OUTP{ch} ON")
-            # self.write(f"SOUR1:VOLT {vpp} VPP")
+
+            print(f"channel {ch}", self.query(f"SOUR{ch}:VOLT?"))
+            print(f"channel {ch}", self.query(f"SOUR{ch}:FUNC:ARB:PTPeak?"))
+
+            
+            # modulate by channel 2? on or off?
+            # impedance matching? => cannot change load when voltage limit on
+
+    def test(self):
+        self.write("SOUR1:FUNC SIN")
+        self.write("SOUR2:FUNC SIN")
+
+        self.write("SOUR1:FREQ 77000000")
+        self.write("SOUR2:FREQ 77000000")
+
+        self.write("OUTP1:LOAD INF")
+        self.write("OUTP2:LOAD INF")
+
+        self.write("SOUR1:VOLT:UNIT VPP")
+        self.write("SOUR2:VOLT:UNIT VPP")
+
+        self.write("SOUR1:VOLT 1")
+        self.write("SOUR2:VOLT 1")
+
+        self.write("OUTP1 ON")
+        self.write("OUTP2 ON")
+
+        print("ch1", self.query(f"SOUR1:VOLT?"))
+        print("ch2", self.query(f"SOUR2:VOLT?"))
+
+        # 950 mV channel 1, 730 mV channel 2

@@ -58,6 +58,7 @@ class RTB2004:
         self.write("TRIGger:A:EDGE:SLOPe POS")
         self.write(f"TRIGger:A:LEVel5 {level}")
         self.write("TRIGger:A:MODE NORM")
+        # self.write(f"CHANnel{ch}:COUPling ACLimit")
 
 
     def wait_for_acquisition(self, timeout=60):
@@ -76,10 +77,6 @@ class RTB2004:
 
     def read_segment(self, segment_index=1, ch=1):
         self.write(f"CHANnel{ch}:HISTory:CURRent {segment_index}")
-        
-        # self.write(f"EXPort:WAVeform:NAME \"/USB_FRONT/data/WFM0{segment_index}\"")
-        # self.write("EXPort:WAVeform:SAVE")
-
         raw = self.inst.query_binary_values(
             f"CHANnel{ch}:DATA?",
             datatype='f',
@@ -106,10 +103,7 @@ class RTB2004:
 
 
         self.write(f"EXPort:WAVeform:SOURce CH{ch}")
-        # self.write("FORMAT CSV")
-        # self.write("EXPort:WFMSave:DEST \"/USB_FRONT/data\"")
         self.write("FORMat REAL")
-
         self.write(f"CHANnel{ch}:DATA:POINts MAX")
         segments_list = []
         for i in range(1, segments+1):
@@ -117,5 +111,5 @@ class RTB2004:
             seg = self.read_segment(i)
             segments_list.append(seg)
             print("Segment", i, "saved in", time.time() - stopwatch, "seconds, ETA:", (segments - i) * (time.time() - stopwatch), "seconds")
-            np.save(f"./data_new/data-{i}.npy", seg)
+            np.save(f"./data/data-{i}.npy", seg)
         print(segments_list)

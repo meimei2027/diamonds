@@ -1,5 +1,11 @@
 import numpy as np
 import generate_arb
+def normalize(waveform):
+    max_abs = np.max(np.abs(waveform))
+    if max_abs > 0:
+        waveform /= max_abs
+    return waveform
+
 
 def generate_waveforms(
     n_segments=1000,
@@ -30,7 +36,7 @@ def generate_waveforms(
         sine_wave.append(zeros)
 
     sine_wave = np.concatenate(sine_wave)
-    print(sine_wave)
+    # print(sine_wave)
 
     one = np.ones(period)
     zero = np.zeros(period)
@@ -44,11 +50,9 @@ def generate_waveforms(
     print(freqs / 1e6)
     
     t = np.arange(period * 2 * n_segments) * dt
-    return t, sine_wave, square_wave, freqs
+    return t, normalize(sine_wave), square_wave, freqs
 
 
 if __name__ == "__main__":
-    # t, ch1, ch2, freqs = generate_waveforms(n_segments=10, fs=100e6)
-    t, ch1, ch2, freqs = generate_waveforms(n_segments=10, fs=100e6)
-
+    t, ch1, ch2, freqs = generate_waveforms(n_segments=5, fs=500e6, half_cycle=50e-6)
     generate_arb.write_csv("waveforms/test_scope_100.csv", t, ch1, ch2)

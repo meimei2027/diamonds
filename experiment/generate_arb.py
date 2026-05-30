@@ -49,7 +49,32 @@ def generate_sdg1062x(output_file, edges_ch, duration, sample_rate=1e9):
     waveform = normalize(mod)
     write_csv(output_file, t, waveform)
 
-# if __name__ == "__main__":
-    # generate("waveforms/test.csv", 77e6, [0e-6, 4e-6], 10e-6)
-    # generate("waveforms/test_sdg1062x.csv", 77e6, [0e-6, 4e-6], 10e-6)
+if __name__ == "__main__":
+    EXCITATION = 5e-6
+    PI = 60e-9
+    PI_2 = PI / 2
+    READOUT = 300e-9
+    AOM_DELAY = 1e-6
+    TAU = 60e-9
+    MICROWAVE = PI + TAU + PI_2 + TAU + PI
+    SINGLE_CYCLE = AOM_DELAY + EXCITATION + MICROWAVE + AOM_DELAY + READOUT
+    KS33600A_MAX_SAMPLE_RATE = 1e9
+    SDG1062X_MAX_SAMPLE_RATE = 30e6
+
+    # generate_ks33600a("waveforms/test.csv", 44e6, \
+    # [0, 100e-9, 300e-9, 1e-6
+    # ], [0, 100e-9, 300e-9, 1e-6
+    # ], 1e-6, sample_rate=KS33600A_MAX_SAMPLE_RATE)
+
+    generate_ks33600a("waveforms/test.csv", 77e6, \
+    [0, \
+        EXCITATION, \
+        AOM_DELAY + EXCITATION + MICROWAVE, \
+        AOM_DELAY + EXCITATION + MICROWAVE + READOUT, \
+        SINGLE_CYCLE, \
+        SINGLE_CYCLE + EXCITATION, \
+        SINGLE_CYCLE + AOM_DELAY + EXCITATION + MICROWAVE, \
+        SINGLE_CYCLE + AOM_DELAY + EXCITATION + MICROWAVE + READOUT, \
+    ], [0, 1e-6], SINGLE_CYCLE * 2, sample_rate=KS33600A_MAX_SAMPLE_RATE)
+
 
