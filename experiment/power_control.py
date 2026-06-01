@@ -35,13 +35,13 @@ class PowerSupply:
         self.write('OUTP CH1,OFF')
 
     def gauss_settings(self, g, direction):
-        filenames = ['./coil_data/X.xlsx', './coil_data/Y.xlsx', './coil_data/Z.xlsx']
+        filenames = ['./coil_data/X.csv', './coil_data/Y.csv', './coil_data/Z.csv']
         regressions_ig = []
         regression_iv = []
         for i in filenames:
-            temp = pd.read_excel(i)
-            regressions_ig.append(stats.linregress(temp.iloc[:, 0], temp.iloc[:, 1]))
-            regression_iv.append(stats.linregress(temp.iloc[:, 0], temp.iloc[:, 2]))
+            a, g, v = np.loadtxt(i, delimiter=',', skiprows=1, unpack=True)
+            regressions_ig.append(stats.linregress(a, g))
+            regression_iv.append(stats.linregress(a, v))
         if direction == 'x':
             return (g - regressions_ig[0].intercept) / regressions_ig[0].slope, (g - regression_iv[0].intercept) / regression_iv[0].slope
         elif direction == 'y':
