@@ -50,15 +50,15 @@ if __name__ == "__main__":
     if generate == True:
         prepare_files()
     # note there is a settling time of 2 seconds
-    dg = dg535.DG535("GPIB0::15::INSTR")
+    # dg = dg535.DG535("GPIB0::15::INSTR")
 
-    dg.configure_sequence(
-        t0_to_a=0,
-        a_to_b=AOM_DELAY + EXCITATION,
-        b_to_c=1e-6, # longer pulse to trigger on
-        t_cycle=SINGLE_CYCLE * 2
-    )
-    dg.close()
+    # dg.configure_sequence(
+    #     t0_to_a=0,
+    #     a_to_b=AOM_DELAY + EXCITATION,
+    #     b_to_c=1e-6, # longer pulse to trigger on
+    #     t_cycle=SINGLE_CYCLE * 2
+    # )
+    # dg.close()
 
     # trigger on A
     # ks = ks33600a.KS33600A("USB0::0x0957::0x5707::MY53800810::INSTR")
@@ -76,10 +76,10 @@ if __name__ == "__main__":
     # amplitude is pretty accurate at high Z
     # idle after the waveform is done is at 700 mV
     # unavoidable delay ~380ns from the trigger
-    sdg = sdg1062x.SDG1062X("USB0::0xF4EC::0x1103::SDG1XDDX6R5043::INSTR")
-    sdg.upload_csv("waveforms/sdg1062x.csv")
-    sdg.run(vpp=2)
-    sdg.close()
+    # sdg = sdg1062x.SDG1062X("USB0::0xF4EC::0x1103::SDG1XDDX6R5043::INSTR")
+    # sdg.upload_csv("waveforms/sdg1062x.csv")
+    # sdg.run(vpp=2)
+    # sdg.close()
 
     # hp: page 3-110
     # high above 3V, low below 0.5V

@@ -88,7 +88,7 @@ class RTB2004:
 
 
     def run(self, segments=1000, ch=1):
-        sample_rate = self.set_timebase(1e-6)
+        sample_rate = self.set_timebase(1e-7)
         print("sample rate", sample_rate)
         self.setup_segmented_mode(
             segments=segments
@@ -100,69 +100,33 @@ class RTB2004:
 
         self.write("STOP")
         print("acquired segements", self.get_segment_count())
+        # if segment count not what is expected, rerun?
         self.save_segments(segments, ch)
 
     
-    def save_segments(self, segments, ch=1):
+    def save_segments(self, segments, path="./data", name="waveform", ch=1):
         self.write(f"EXPort:WAVeform:SOURce CH{ch}")
         self.write("FORMat REAL")
         self.write(f"CHANnel{ch}:DATA:POINts MAX")
 
-        BATCH_SIZE = 100
         NUM_SAMPLES = 10000
 
         t0 = time.perf_counter()
+        all_segments = np.empty((segments, NUM_SAMPLES), dtype=np.float32)
 
-        # for i in range(1, segments+1):
-        #     # stopwatch = time.time()
-        #     seg = self.read_segment(i)
-        #     np.save(f"./data/data-{i}.npy", seg)
-        #     # print("Segment", i, "saved in", time.time() - stopwatch, "seconds, ETA:", (segments - i) * (time.time() - stopwatch), "seconds")
+        for i in range(segments):
+            if i == 1:
+                time0 = time.perf_counter()
+            if i == 2:
+                time1 = time.perf_counter()
+                print("ETA:", (time1 - time0) * segments, "s")        
+            all_segments[i] = self.read_segment(i + 1)
+            if i % 100 == 0:
+                print(i, "segments done")
 
-        # all_segments = np.empty((segments, NUM_SAMPLES), dtype=np.float32)
+        t1 = time.perf_counter()
+        np.save(path + f"/{name}.npy", all_segments)
+        t2 = time.perf_counter()
 
-        # for i in range(segments):
-        #     all_segments[i] = self.read_segment(i + 1)
-        # t1 = time.perf_counter()
-
-        # np.save("./data/waveforms.npy", all_segments)
-        # t2 = time.perf_counter()
-        # print("time acquire", t1 - t0)
-        # print("time save", t2 - t1)
-
-        self.write(f"CHANnel{ch}:HISTory:PALL OFF")
-        self.write(f"CHANnel{ch}:HISTory:STARt 1")
-        self.write(f"CHANnel{ch}:HISTory:STOP 5")
-        # didn't work
-
-        raw = self.inst.query_binary_values(
-            f"CHANnel{ch}:DATA?",
-            datatype='f',
-            container=np.array,
-            is_big_endian=True
-        )
-        np.save("./data/raw.npy", raw)
-
-
-# ----------------------
-        # t0 = time.perf_counter()
-
-        # with h5py.File("./data/waveforms.h5", "w") as f:
-        #     dset = f.create_dataset(
-        #         "waveforms",
-        #         shape=(segments, NUM_SAMPLES),
-        #         dtype=np.float32
-        #     )
-
-        #     batch = np.empty((BATCH_SIZE, NUM_SAMPLES), dtype=np.float32)
-        #     write_idx = 0
-        #     while write_idx < segments:
-        #         n_batch = min(BATCH_SIZE, segments - write_idx)
-        #         for j in range(n_batch):
-        #             batch[j] = self.read_segment(write_idx + j + 1)
-        #         dset[write_idx:write_idx + n_batch] = batch[:n_batch]
-
-        #         write_idx += n_batch
-
-        # t1 = time.perf_counter()
-        # print("time", t1 - t0)
+        print("time acquire", t1 - t0, "s")
+        print("time save", t2 - t1, "s")

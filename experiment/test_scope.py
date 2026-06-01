@@ -7,9 +7,8 @@ import numpy as np
 # generator.play_continuously(sample_rate=500e6, channel_list=[1, 2])
 # generator.close()
 
-
 scope = rtb2004.RTB2004("USB0::0x0AAD::0x01D6::108904::INSTR", timeout=10000, debug=True)
-scope.run(segments=100)
+scope.run(segments=6553)
 timetable = scope.get_timetable()
 
 scope.close()
