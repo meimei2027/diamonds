@@ -62,13 +62,15 @@ class RTB2004:
         # self.write(f"CHANnel{ch}:COUPling ACLimit")
 
 
-    def wait_for_acquisition(self, timeout=60):
+    def wait_for_acquisition(self, segments, timeout=60):
         start = time.time()
         while True:
             opc = self.inst.query("*OPC?").strip()
-            if opc == "1":
+            num_of_segments = self.get_segment_count()
+            if opc == "1" and segments == num_of_segments:
                 return
             if time.time() - start > timeout:
+                print(f"got {num_of_segments} segments")
                 raise TimeoutError("Acquisition timeout")
             time.sleep(0.5)
 
@@ -87,7 +89,7 @@ class RTB2004:
         return raw
 
 
-    def run(self, segments=1000, ch=1):
+    def run(self, segments=1000, ch=1, path="./data", name="waveform"):
         sample_rate = self.set_timebase(1e-7)
         print("sample rate", sample_rate)
         self.setup_segmented_mode(
@@ -96,15 +98,15 @@ class RTB2004:
         self.set_trigger_edge(level=200e-3)
 
         self.write("SINGle")
-        self.wait_for_acquisition()
+        self.wait_for_acquisition(segments)
 
         self.write("STOP")
-        print("acquired segements", self.get_segment_count())
+        print("acquired segments", self.get_segment_count())
         # if segment count not what is expected, rerun?
-        self.save_segments(segments, ch)
+        self.save_segments(segments, ch, path=path, name=name)
 
     
-    def save_segments(self, segments, path="./data", name="waveform", ch=1):
+    def save_segments(self, segments, ch, path, name):
         self.write(f"EXPort:WAVeform:SOURce CH{ch}")
         self.write("FORMat REAL")
         self.write(f"CHANnel{ch}:DATA:POINts MAX")

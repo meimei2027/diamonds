@@ -7,8 +7,8 @@ import numpy as np
 # generator.play_continuously(sample_rate=500e6, channel_list=[1, 2])
 # generator.close()
 
-scope = rtb2004.RTB2004("USB0::0x0AAD::0x01D6::108904::INSTR", timeout=10000, debug=True)
-scope.run(segments=6553)
+scope = rtb2004.RTB2004("USB0::0x0AAD::0x01D6::108904::INSTR", timeout=100000, debug=True)
+scope.run(segments=6553, path="D:/data_test", name="first_ten") #
 timetable = scope.get_timetable()
 
 scope.close()
@@ -22,3 +22,5 @@ def check_timetable(arr, expected_diff, tol=1e-6):
     return np.all(np.isclose(diffs, expected_diff, atol=tol, rtol=0))
 
 print(check_timetable(str_to_arr(timetable), 20e-6))
+
+# turn stuff off during data collection
