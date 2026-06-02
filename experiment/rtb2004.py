@@ -95,7 +95,7 @@ class RTB2004:
         self.setup_segmented_mode(
             segments=segments
         )
-        self.set_trigger_edge(level=200e-3)
+        self.set_trigger_edge(level=100e-3)
 
         self.write("SINGle")
         self.wait_for_acquisition(segments)

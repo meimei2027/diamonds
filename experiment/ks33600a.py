@@ -15,6 +15,11 @@ class KS33600A:
         self.debug = debug
         print("Keysight 33600A: connected")
         self.reset()
+        # clear volatile memory
+        self.write(f"SOUR1:DATA:VOL:CLE")
+        self.write(f"SOUR2:DATA:VOL:CLE")
+
+
     
     def reset(self):
         self.write("*RST")
@@ -33,19 +38,20 @@ class KS33600A:
         return self.inst.query(cmd).strip()
 
 
-    def load_csv(self, csv_file):
+    def load_csv(self, csv_file, ch2_exists=True):
         data = np.genfromtxt(csv_file, delimiter=",", skip_header=1)
         ch1 = np.asarray(data[:, 1], dtype=np.float32)
-        ch2 = np.asarray(data[:, 2], dtype=np.float32)
-        return ch1, ch2
+        if ch2_exists:
+            ch2 = np.asarray(data[:, 2], dtype=np.float32)
+            return ch1, ch2
+        else:
+            return ch1
 
 
     def upload_waveform(self, waveform, arb_name, ch=1, sample_rate=None):
         if sample_rate is None:
             sample_rate = self.MAX_SAMPLE_RATE
 
-        # clear volatile memory
-        self.write(f"SOUR{ch}:DATA:VOL:CLE")
         # binary format
         self.write("FORM:BORD SWAP")
 
@@ -58,10 +64,18 @@ class KS33600A:
 
         print(f"Keysight 33600A: uploaded arb to channel {ch}")
 
-    def upload_csv(self, csv_file, sample_rate=None):
-        ch1, ch2 = self.load_csv(csv_file)
-        self.upload_waveform(ch1, arb_name=self.arb_name_ch1, ch=1, sample_rate=sample_rate)
-        self.upload_waveform(ch2, arb_name=self.arb_name_ch2, ch=2, sample_rate=sample_rate)
+    def upload_csv(self, csv_file, sample_rate=None, ch2_exists=True, arb_name_1=None, arb_name_2=None):
+        if arb_name_1 == None:
+            arb_name_1 = self.arb_name_ch1
+        if arb_name_2 == None:
+            arb_name_2 = self.arb_name_ch1
+        if ch2_exists:
+            ch1, ch2 = self.load_csv(csv_file)
+        else:
+            ch1 = self.load_csv(csv_file, ch2_exists=False)
+        self.upload_waveform(ch1, arb_name=arb_name_1, ch=1, sample_rate=sample_rate)
+        if ch2_exists:
+            self.upload_waveform(ch2, arb_name=arb_name_2, ch=2, sample_rate=sample_rate)
 
 
     def run(self, vpp, channel_list=(1, 2), sample_rate=None):
@@ -128,7 +142,7 @@ class KS33600A:
     def test(self):
         self.write("SOUR1:FUNC SIN")
         self.write("SOUR2:FUNC SIN")
-
+        
         self.write("SOUR1:FREQ 77000000")
         self.write("SOUR2:FREQ 77000000")
 

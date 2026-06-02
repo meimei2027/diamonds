@@ -10,7 +10,6 @@ import numpy as np
 scope = rtb2004.RTB2004("USB0::0x0AAD::0x01D6::108904::INSTR", timeout=100000, debug=True)
 scope.run(segments=6553, path="D:/data_test", name="first_ten") #
 timetable = scope.get_timetable()
-
 scope.close()
 
 def str_to_arr(str):
