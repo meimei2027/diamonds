@@ -16,7 +16,7 @@ def build_block_descriptor(sequence_name, segments):
     return f"#{n}{payload_len}{payload}"
 
     
-generate = False
+generate = True
 if generate == True:
 
     awg = ks33600a.KS33600A("USB0::0x0957::0x5707::MY53800810::INSTR", debug=True)
@@ -34,7 +34,7 @@ if generate == True:
 
     t_polarization, ch_polarization = rf(77e6, 10e-6)
     t_readout, ch_readout = rf(77e6, 300e-9)
-    t_dark, ch_dark = zeros(10e-6) # x2000 = 20e-3
+    t_dark, ch_dark = zeros(1e-6) # x2000 = 20e-3
 
     generate_arb.write_csv("waveforms/polarization.csv", t_polarization, ch_polarization)
     generate_arb.write_csv("waveforms/readout.csv", t_readout, ch_readout)
@@ -47,11 +47,37 @@ if generate == True:
 
     # print(awg.query("SOURce1:DATA:VOLatile:CATalog?"))
     block = build_block_descriptor("test", [["polarize", "1", "once", "lowAtStart", 10],
-                                            ["dark", "2000", "repeat", "lowAtStart", 10],
+                                            ["dark", "5", "repeat", "lowAtStart", 10], # 1 ms
                                             ["readout", "1", "once", "highAtStart", 10],
-                                            ["polarize", "1", "once", "lowAtStart", 10],
-                                            ["readout", "1", "once", "highAtStart", 10],
+                                            # ["polarize", "1", "once", "lowAtStart", 10],
+                                            # ["dark", "200", "repeat", "lowAtStart", 10], # 2 ms
+                                            # ["readout", "1", "once", "highAtStart", 10],
+                                            # ["polarize", "1", "once", "lowAtStart", 10],
+                                            # ["dark", "300", "repeat", "lowAtStart", 10], # 3 ms
+                                            # ["readout", "1", "once", "highAtStart", 10],
+                                            # ["polarize", "1", "once", "lowAtStart", 10],
+                                            # ["dark", "400", "repeat", "lowAtStart", 10], # 4 ms
+                                            # ["readout", "1", "once", "highAtStart", 10],
+                                            # ["polarize", "1", "once", "lowAtStart", 10], # calibration measurement
+                                            # ["readout", "1", "once", "highAtStart", 10],
                                             ])
+
+
+    # block = build_block_descriptor("test", [["polarize", "1", "once", "lowAtStart", 10],
+    #                                         ["dark", "1000", "repeat", "lowAtStart", 10], # 1 ms
+    #                                         ["readout", "1", "once", "highAtStart", 10],
+    #                                         ["polarize", "1", "once", "lowAtStart", 10],
+    #                                         ["dark", "2000", "repeat", "lowAtStart", 10], # 2 ms
+    #                                         ["readout", "1", "once", "highAtStart", 10],
+    #                                         ["polarize", "1", "once", "lowAtStart", 10],
+    #                                         ["dark", "3000", "repeat", "lowAtStart", 10], # 3 ms
+    #                                         ["readout", "1", "once", "highAtStart", 10],
+    #                                         ["polarize", "1", "once", "lowAtStart", 10],
+    #                                         ["dark", "4000", "repeat", "lowAtStart", 10], # 4 ms
+    #                                         ["readout", "1", "once", "highAtStart", 10],
+    #                                         ["polarize", "1", "once", "lowAtStart", 10], # calibration measurement
+    #                                         ["readout", "1", "once", "highAtStart", 10],
+    #                                         ])
 
     awg.write(f"DATA:SEQ {block}")
 
@@ -71,10 +97,11 @@ if generate == True:
 def str_to_arr(str):
     return np.fromstring(str, sep=',')
 
-scope = rtb2004.RTB2004("USB0::0x0AAD::0x01D6::108904::INSTR", timeout=100000, debug=True)
-scope.run(segments=10, path="./data", name="test") #
-timetable = scope.get_timetable()
-np.save("./data/timetable.npy", str_to_arr(timetable))
-print(timetable)
-scope.close()
+# name = "100us_200us_300us_400us_calib"
+# scope = rtb2004.RTB2004("USB0::0x0AAD::0x01D6::108904::INSTR", timeout=100000, debug=True)
+# scope.run(segments=5000, path="D:\\t1_data_2", name=name) #
+# timetable = scope.get_timetable()
+# np.save(f"D:\\t1_data_2/timetable_{name}.npy", str_to_arr(timetable))
+# print(timetable)
+# scope.close()
 
