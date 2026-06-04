@@ -49,6 +49,7 @@ class RTB2004:
 
     def set_timebase(self, scale_seconds):
         self.write(f"TIMebase:SCALe {scale_seconds}")
+        self.write(f"TIMebase:POSition 3e-6")
         return self.query("ACQuire:SRATe?")
 
 
@@ -77,6 +78,15 @@ class RTB2004:
 
     def get_segment_count(self):
         return int(self.query("ACQuire:AVAilable?"))
+
+    def read_segment_old(self, segment_index=1, ch=1):
+        self.write(f"CHANnel{ch}:HISTory:CURRent {segment_index}")
+        self.write(f"EXPort:WAVeform:SOURce CH{ch}")
+        self.write("FORMAT CSV")
+        self.write("EXPort:WFMSave:DEST \"/USB_FRONT/data\"")
+        self.write(f"CHANnel{ch}:DATA:POINts MAX")
+        self.write(f"EXPort:WAVeform:NAME \"/USB_FRONT/data/TEST{segment_index}\"")
+        self.write("EXPort:WAVeform:SAVE")
 
     def read_segment(self, segment_index=1, ch=1):
         self.write(f"CHANnel{ch}:HISTory:CURRent {segment_index}")
@@ -107,6 +117,9 @@ class RTB2004:
 
     
     def save_segments(self, segments, ch, path, name):
+        read_segment_old = False
+        if read_segment_old: 
+            self.read_segment_old(1)
         self.write(f"EXPort:WAVeform:SOURce CH{ch}")
         self.write("FORMat REAL")
         self.write(f"CHANnel{ch}:DATA:POINts MAX")
