@@ -1,0 +1,1 @@
+All data was collected using a 1Hz on off pulse on a 532nm laser, which was focused onto the diamond using a microscope objective, then filtered out by a DMLP550 dichroric mirror as well. The spectra was taken using a CCS200 thorlabs optical spectrometer, with the lights off.
