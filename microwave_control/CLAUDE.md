@@ -109,7 +109,9 @@ change either setting.
 
 - All sweep results live in `data/*.csv` (two columns: `frequency_hz,power_dbm`).
   Every notebook loads/saves there, not the top-level directory.
-- `frequency_sweep_demo.ipynb` -- first fine sweep, 2.5-3.0 GHz, 1 MHz steps.
+- `data/frequency_sweep_2.5-3.0GHz_1MHz.csv` -- first fine sweep (2.5-3.0 GHz,
+  1 MHz steps) kept as a historical reference; its source notebook
+  (`frequency_sweep_demo.ipynb`) has since been deleted.
 - `full_trace_sweep_demo.ipynb` -- noise floor measurement (RF off) + coarse
   100 MHz-step sweep capturing full analyzer traces per step.
 - `resonance_sweep_demo.ipynb` -- coarse (2-3 GHz, 1 MHz) + fine (±5 MHz,
@@ -123,14 +125,14 @@ change either setting.
   repeatability before trusting a single sweep's dip/peak.
 - `plot_real_resonance.ipynb` -- re-plots the confirmed 2.0443 GHz resonance
   from already-saved data, no hardware involved.
-- `isolator_comparison_demo.ipynb` -- forward-port sweeps (2-3 GHz, 1 MHz)
-  with and without an isolator before the coupler, overlaid against the
-  original baseline. Found roughly 1.4 dB mean difference with vs. without
-  the isolator -- small, within run-to-run variation seen elsewhere.
+- `isolator.ipynb` -- forward-port sweeps (2-3 GHz, 1 MHz)
+  with and without an isolator before the coupler, overlaid against each
+  other. Found roughly 1.4 dB mean difference with vs. without the isolator
+  -- small, within run-to-run variation seen elsewhere.
 
 **Caution**: several of these notebooks have cells that open real hardware
 connections and run multi-minute sweeps. Do NOT `jupyter nbconvert --execute`
-a notebook like `isolator_comparison_demo.ipynb` just to refresh a plot from
+a notebook like `isolator.ipynb` just to refresh a plot from
 already-saved data -- it re-runs every cell top to bottom, including the live
 sweep cells. To regenerate a plot/analysis cell from existing CSVs without
 touching the instruments, either run just that cell interactively, or patch
