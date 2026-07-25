@@ -21,10 +21,16 @@ resulting spectrum on the analyzer.
   ```
   before assuming an address. The E4403B's address (`18`) has stayed fixed on
   `GPIB0` so far.
-- **Always keep generator output power low** (we've used -20 dBm) whenever
-  its output is connected into the analyzer input through the coupler --
-  even with a load/coupler in place, high output power risks reflections and
-  overloading the analyzer's front end.
+- **Always keep generator output power low** (we've used -20 to -25 dBm)
+  whenever its output is connected into the analyzer input through the
+  coupler -- even with a load/coupler in place, high output power risks
+  reflections and overloading the analyzer's front end. Be extra
+  conservative (lower power) for full-reflection (no-load/open) setups.
+- **Bidirectional coupler: Mini-Circuits ZABDC20-322H-S+** (1700-3200 MHz,
+  50Ω). Port map: **1 = INPUT, 4 = OUTPUT, 2 = COUPLED (forward), 3 = COUPLED
+  (reverse)**. Directivity spec across 2-3 GHz is 13-30 dB (worse at the low
+  end of the band). Whichever coupled port (2 or 3) isn't being measured
+  must be terminated in 50Ω or directivity collapses.
 
 ## Files
 
@@ -114,32 +120,76 @@ change either setting.
   (`frequency_sweep_demo.ipynb`) has since been deleted.
 - `full_trace_sweep_demo.ipynb` -- noise floor measurement (RF off) + coarse
   100 MHz-step sweep capturing full analyzer traces per step.
-- `resonance_sweep_demo.ipynb` -- coarse (2-3 GHz, 1 MHz) + fine (±5 MHz,
-  20 kHz) sweep that found the confirmed resonance at 2.0443 GHz. This was
-  taken with the analyzer on the coupler's REVERSE (reflected) port.
-- `resonance_2.3ghz_demo.ipynb` / `resonance_2.3ghz_demo_repeat.ipynb` --
-  checked a coarse dip that appeared near 2.3 GHz; two independent fine
-  sweeps of the same region showed zero correlation with each other
-  (dip location moved, values uncorrelated) -- confirmed to be noise, not a
-  real feature. Worth remembering as a cautionary example: always check
-  repeatability before trusting a single sweep's dip/peak.
-- `plot_real_resonance.ipynb` -- re-plots the confirmed 2.0443 GHz resonance
-  from already-saved data, no hardware involved.
-- `isolator.ipynb` -- forward-port sweeps (2-3 GHz, 1 MHz)
-  with and without an isolator before the coupler, overlaid against each
-  other. Found roughly 1.4 dB mean difference with vs. without the isolator
-  -- small, within run-to-run variation seen elsewhere.
+- `isolator.ipynb` -- reflected-power testing via the coupler's REVERSE port
+  (isolator in/out, open/terminated output, etc.). Rewritten from scratch
+  after an entire day's worth of data turned out to be invalid (see below) --
+  now leads with a mandatory connection sanity-check cell before any real
+  sweep, and saves each run's data as `data/reflected_<label>_2-3GHz_1MHz.csv`
+  so multiple configurations can be compared.
 
-**Caution**: several of these notebooks have cells that open real hardware
-connections and run multi-minute sweeps. Do NOT `jupyter nbconvert --execute`
-a notebook like `isolator.ipynb` just to refresh a plot from
-already-saved data -- it re-runs every cell top to bottom, including the live
-sweep cells. To regenerate a plot/analysis cell from existing CSVs without
-touching the instruments, either run just that cell interactively, or patch
-the `.ipynb` JSON directly (set `cell["outputs"]` by matching cell content,
-not by the `cell-N` label the Read tool displays -- notebooks written by hand
-via the Write tool don't necessarily have real `id` fields, so `cell-N` is
-just a display placeholder, not something you can match on in the JSON).
+### Verified isolator/coupler findings (real data, connection confirmed)
+
+Three reflected-power sweeps (2-3 GHz, 1 MHz steps, -25 dBm, coupler reverse
+port, each preceded by a passing connection sanity check):
+
+| Configuration | Median reflected power |
+|---|---|
+| Open, no isolator (full reflection) | -23.5 dBm |
+| Open, with isolator (D3I2040, port 1 -> coupler output, port 2 open) | -29.6 dBm |
+| Terminated 50Ω, no isolator (near-zero reflection) | -37.8 dBm |
+
+- **Coupler directivity floor**: 14.3 dB (open vs. terminated) -- matches the
+  ZABDC20-322H-S+ datasheet's minimum spec (13 dB) for this band almost
+  exactly. Confirms the coupler behaves per spec once genuinely connected.
+- **Isolator's measured effect**: 6.1 dB reduction in reflected power
+  (open, with vs. without isolator).
+- **Isolator vs. terminated floor**: still an 8.2 dB gap -- some real
+  reflection gets through even with the isolator. Since the coupler's own
+  directivity ceiling is ~14 dB, if the isolator's true isolation exceeds
+  that, this measurement chain can't resolve it -- the coupler itself
+  becomes the limiting factor once reflected signal approaches its floor.
+  So 6.1 dB is a lower bound on the isolator's real performance, not
+  necessarily the whole story.
+
+## Previously invalidated data
+
+**A full day of resonance-finding and isolator-testing data (and the
+notebooks that produced it: `resonance_sweep_demo.ipynb`,
+`resonance_2.3ghz_demo.ipynb` + repeat, `plot_real_resonance.ipynb`, and the
+first version of the isolator notebook) was deleted.** Root cause: the
+analyzer's cable was never actually connected to the coupler's reverse port
+during that session. The resulting readings were plausible-looking (flat,
+consistent to within 0.2 dB across many completely different physical
+configurations -- open, terminated, isolator in/out) but were actually just
+the E4403B's own floating-input response: on this analyzer, a disconnected
+input reads a flat ~-45 to -48 dBm across 2-3 GHz, **independent of the
+generator's power level and even independent of RF on/off**. That
+independence from RF state is the tell -- a real measurement always drops
+when RF is turned off; this didn't.
+
+The apparent 2.0443 GHz "resonance" found that session looked real (clean,
+smooth, frequency-selective, reproducible in shape) and even survived
+casual scrutiny, but given the whole reverse-port measurement chain that
+session is now known to have been compromised, it was discarded along with
+everything else rather than assumed valid. If that resonance is real, a
+fresh, verified measurement should reproduce it.
+
+**Always run a connection sanity check before trusting a new reflected-power
+setup**: fix the generator frequency, sweep its power over a wide range
+(e.g. -25 to -50 dBm), and confirm the analyzer's reading actually tracks
+it, then confirm the reading drops further with RF entirely off. `isolator.ipynb`
+has this as its second cell -- run it first on any new physical configuration.
+
+**Caution**: notebooks with hardware cells open real connections and run
+multi-minute sweeps. Do NOT `jupyter nbconvert --execute` a notebook like
+`isolator.ipynb` just to refresh a plot from already-saved data -- it re-runs
+every cell top to bottom, including the live sweep cells. To regenerate a
+plot/analysis cell from existing CSVs without touching the instruments,
+either run just that cell interactively, or patch the `.ipynb` JSON directly
+(set `cell["outputs"]` by matching cell content, not by the `cell-N` label
+the Read tool displays -- notebooks written by hand via the Write tool don't
+necessarily have real `id` fields, so `cell-N` is just a display placeholder,
+not something you can match on in the JSON).
 
 To run notebooks with the project's dependencies: they use a Jupyter kernel
 named `diamonds` (registered via `python -m ipykernel install --user --name
