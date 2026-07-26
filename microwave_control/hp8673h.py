@@ -89,4 +89,5 @@ class HP8673H:
         self.write("W0")
 
     def go_to_local(self):
+        """Return the instrument to front-panel (local) control."""
         self.inst.control_ren(pyvisa.constants.VI_GPIB_REN_ADDRESS_GTL)

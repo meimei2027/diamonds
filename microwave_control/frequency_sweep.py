@@ -2,7 +2,8 @@ import time
 import numpy as np
 
 
-def frequency_sweep(gen, sa, start_hz, stop_hz, step_hz, power_dbm=-20, settle_s=0.0):
+def frequency_sweep(gen, sa, start_hz, stop_hz, step_hz, power_dbm=-20, settle_s=0.0,
+                     initial_settle_s=1.0):
     """
     Step the HP8673H's CW frequency from start_hz to stop_hz (inclusive) in
     step_hz increments, reading the E4403B's marker amplitude at each point.
@@ -10,13 +11,24 @@ def frequency_sweep(gen, sa, start_hz, stop_hz, step_hz, power_dbm=-20, settle_s
     Assumes the generator output is fed into the analyzer input (e.g. via a
     coupler) and that the analyzer's span already covers [start_hz, stop_hz].
 
+    initial_settle_s is a one-time delay after jumping to the sweep's start
+    frequency, before any measurement is taken. The HP8673H's manual notes
+    that AUTO PEAK re-leveling triggers on any frequency change > 50 MHz --
+    the initial jump from wherever the generator was previously set to
+    start_hz is almost always >50 MHz, and needs much more time to settle
+    than the small step-to-step increments during the sweep itself. Without
+    this, the first few points of a sweep can show a spurious dip that has
+    nothing to do with whatever is connected to the generator.
+
     Returns (freqs_hz, power_dbm_array).
     """
     freqs_hz = np.arange(start_hz, stop_hz + step_hz / 2, step_hz)
 
     gen.preset()
     gen.set_power_dbm(power_dbm)
+    gen.set_frequency_hz(start_hz)
     gen.rf_on()
+    time.sleep(initial_settle_s)
 
     sa.write("TRAC1:MODE WRITE")
     sa.write("AVER:STATE OFF")

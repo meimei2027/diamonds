@@ -33,6 +33,10 @@ class E4403B:
         if self.inst is not None:
             self.inst.close()
 
+    def go_to_local(self):
+        """Return the instrument to front-panel (local) control."""
+        self.inst.control_ren(pyvisa.constants.VI_GPIB_REN_ADDRESS_GTL)
+
     def write(self, cmd):
         def _do():
             self.inst.write(cmd)

@@ -37,10 +37,13 @@ resulting spectrum on the analyzer.
 - `hp8673h.py` -- `HP8673H` driver class.
 - `e4403b.py` -- `E4403B` driver class.
 - `frequency_sweep.py` -- sweep helpers that combine the two:
-  - `frequency_sweep(gen, sa, start_hz, stop_hz, step_hz, power_dbm=-20)`:
+  - `frequency_sweep(gen, sa, start_hz, stop_hz, step_hz, power_dbm=-20, settle_s=0.0, initial_settle_s=1.0)`:
     steps the generator's CW frequency, reads a single marker amplitude off
     the analyzer at each point. Good for fine-grained sweeps (kHz-MHz steps)
-    where a single number per point is enough.
+    where a single number per point is enough. `initial_settle_s` (default
+    1 s) is a one-time delay after jumping to `start_hz`, before any
+    measurement -- see "The sweep-start artifact" below for why this exists
+    and matters. `settle_s` is an additional per-step delay if needed.
   - `frequency_sweep_full_trace(gen, sa, start_hz, stop_hz, step_hz, power_dbm=-20, rbw_hz=None)`:
     steps the generator, and at each step retunes the analyzer to center on
     that frequency with span = step_hz (so adjacent windows tile with no
@@ -111,6 +114,51 @@ a real reading at those specific settings, not a datasheet spec -- narrower
 RBW and/or lower attenuation will push it lower (better). Re-measure if you
 change either setting.
 
+### Amplitude calibration fault (found and fixed)
+
+The E4403B had a genuine internal amplitude calibration fault for an entire
+session's worth of measurements. Symptom: readings were consistently and
+massively too high, but by a *different* amount depending on frequency --
++20 dB high at 2.5 GHz (HP8673H direct into the analyzer, checked across a
+30 dB range of commanded power, error consistent to within ~1 dB at every
+level), and +36.75 dB high at 50 MHz (checked with a second, independent
+signal generator set to a known 0 dBm). A frequency-dependent error like
+this rules out a simple fixed offset, wrong units, or a settings mistake --
+all of the analyzer's own settings checked out normal (`POW:ATT?` = 10 dB,
+`POW:GAIN?`/`POW:GAIN:STATE?` = 0 (preamp off), `UNIT:POW?` = DBM,
+`DISP:WIND:TRAC:Y:RLEV:OFFS?` = 0 dB, `CORR:OFFSET?` = 0 dB). This pointed
+to a real hardware/calibration problem, e.g. an attenuator relay not
+actually switching to the value it reports.
+
+**What fixed it: running Align Now -> RF from the front panel (NOT Align Now
+-> All), with an external cable connected to the input.** After that
+alignment, the same direct-connection test (HP8673H -> analyzer, no coupler)
+gave a consistent **-4.4 dB** offset across the full power range tested
+(-4.3 to -4.5 dB from -40 to -10 dBm commanded) -- small, uniform, and
+consistent with ordinary cable/connector loss at these frequencies, not a
+calibration error. This -4.4 dB is a real, physical cable-loss number for
+whatever specific cable was used in that test, not a general constant --
+re-measure if the cable changes.
+
+**Implication for everything measured before the alignment fix**: any
+absolute dBm value from that period (noise floor, resonance dip depths,
+isolator/coupler power levels) should be treated as unreliable -- readings
+were tens of dB off in a frequency-dependent way. Relative comparisons taken
+within a single sweep at the same frequencies (e.g. the coupler directivity
+floor, the isolator's dB effect) are more likely to have survived, since a
+consistent per-frequency error mostly cancels in a before/after difference,
+but this was not independently re-verified after the fix.
+
+Also worth remembering from this same investigation: `SYST:ERR?` reporting
+"Query UNTERMINATED" on the front panel display (and the display appearing
+frozen) was caused by leaving an unread response in the analyzer's output
+buffer -- some exploratory SCPI queries (`POW:GAIN:BAND?`, `AMPL:UNIT?`,
+`AMPL:REPR?`, `CALC:MARK1:Y:UNIT?` -- none of these are valid commands on
+this instrument) timed out on the controller side without ever reading a
+response, leaving the instrument's output queue in a pending state. Fixed
+by draining any stale response (`inst.read()` in a loop until it raises),
+then `inst.clear()` (GPIB device clear) followed by `*CLS`.
+
 ## Data and notebooks
 
 - All sweep results live in `data/*.csv` (two columns: `frequency_hz,power_dbm`).
@@ -150,6 +198,60 @@ port, each preceded by a passing connection sanity check):
   becomes the limiting factor once reflected signal approaches its floor.
   So 6.1 dB is a lower bound on the isolator's real performance, not
   necessarily the whole story.
+
+### The sweep-start artifact: fake dips at the start of every sweep
+
+A second round of resonance-finding (after the port-disconnection incident
+below was fixed) kept finding "resonances" that fell apart under scrutiny:
+2.1/2.3/2.5 GHz in coarse sweeps, then 2.4901, 2.4801, and 2.4601 GHz in
+narrower "settled" sweeps. Every one of these was the SAME artifact:
+**the first few points of any sweep read anomalously low, regardless of
+what frequency the sweep happens to start at.** Proof: shifting the sweep
+window (e.g. 2.49-2.51 -> 2.48-2.50 -> 2.46-2.49 GHz) made the "resonance"
+jump to match the new start frequency each time instead of staying fixed --
+a real resonance can't do that.
+
+**Root cause**: `frequency_sweep()` originally had zero delay between
+commanding a new frequency and triggering the analyzer read. Fine for the
+small step-to-step jumps within a sweep, but the very first point of every
+sweep is a large jump (from wherever the generator was previously sitting
+to the new start frequency). The HP8673H manual notes that **AUTO PEAK
+re-leveling triggers automatically on any frequency change > 50 MHz**, and
+that operation takes much longer to settle than normal step-to-step timing.
+A 150 ms per-step settle time is fine for 50 kHz steps but nowhere near
+enough for that initial >50 MHz jump.
+
+**Fix**: added `initial_settle_s` (default 1.0 s) to `frequency_sweep()` --
+jump to `start_hz`, wait, then begin the timed per-step loop. After this
+fix, sweeps starting at 2.46, 2.48, 2.5 GHz etc. all read flat/artifact-free
+at their start, confirming none of the earlier "candidates" were real.
+
+### Confirmed resonance: ~2.5246 GHz
+
+After the sweep-start fix, several bands (2.35-2.45, 2.5-2.7, 2.46-2.49 GHz)
+were rescanned and showed no resonance -- only a broad, slow ripple
+(~60-100 MHz period) consistent with **uncalibrated cable/connector
+standing waves**, not resonator physics. (A real VNA's S11 calibration
+removes exactly this; our raw coupler + spectrum analyzer chain has no such
+calibration, so this ripple is baked into every measurement.)
+
+The real resonance had been getting missed because **-15 dBm was too close
+to the noise floor**. An independent network analyzer (and a manual sweep
+by eye) placed a clear dip around 2.52 GHz with baseline around -33 dBm --
+well above what the automated sweeps were reading at -15 dBm. Bumping the
+source to **0 dBm** (isolator in place for safety) revealed a clean,
+smooth, symmetric ~18-20 dB deep notch, reproduced across two independent
+sweeps taken minutes apart (correlation 0.991, dip frequencies within
+0.25 MHz of each other: 2.52455 GHz and 2.5248 GHz). See
+`resonance_sweep_demo.ipynb` for the full plot and the whole debugging
+narrative.
+
+**Lesson for next time**: if a sweep shows the expected feature only near
+the start of its range, be suspicious regardless of how smooth it looks --
+shift the window and see if the feature moves with it before trusting it.
+Also, always sanity-check that the source power is actually high enough to
+clear the noise floor by a healthy margin (10+ dB) before concluding a
+feature isn't there.
 
 ## Previously invalidated data
 
