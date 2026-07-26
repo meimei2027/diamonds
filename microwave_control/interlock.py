@@ -16,11 +16,12 @@ immediately kills RF output if either:
 This script owns turning RF on/off once monitoring starts -- don't drive
 RF on/off from anywhere else while it's running.
 """
+import os
 import sys
 import time
 import argparse
 
-sys.path.insert(0, r"C:\Users\codin\Documents\projects\diamonds\microwave_control")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from hp8673h import HP8673H
 from e4403b import E4403B
 

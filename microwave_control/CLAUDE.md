@@ -108,11 +108,18 @@ nearest 1 kHz.
   after connecting (done automatically in `E4403B.__init__`).
 
 **Measured noise floor** (generator RF off, so only the analyzer's own
-noise): **-64.2 dBm median** (range -67.8 to -60.4 dBm) at the settings used
-during that test -- 1 MHz RBW, 10 dB input attenuation, no averaging. This is
-a real reading at those specific settings, not a datasheet spec -- narrower
-RBW and/or lower attenuation will push it lower (better). Re-measure if you
-change either setting.
+noise): **-64.3 dBm median** (range -68.0 to -61.1 dBm) at 1 MHz RBW, 10 dB
+input attenuation, no averaging. This is a real reading at those specific
+settings, not a datasheet spec -- narrower RBW and/or lower attenuation will
+push it lower (better). Re-measure if you change either setting. Note the
+analyzer's auto-RBW coupling doesn't always pick 1 MHz for a 500 MHz span
+(it chose 3 MHz on one remeasurement, giving a higher -60.9 dBm reading) --
+set `BAND` explicitly if you need a result comparable to this one.
+
+Re-verified after the calibration fix below and confirmed still accurate:
+median -64.34 dBm, essentially unchanged from the original -64.2 dBm
+reading taken before the fault was found -- the noise floor itself was
+never affected by the calibration fault (only signal readings were).
 
 ### Amplitude calibration fault (found and fixed)
 
@@ -149,6 +156,15 @@ floor, the isolator's dB effect) are more likely to have survived, since a
 consistent per-frequency error mostly cancels in a before/after difference,
 but this was not independently re-verified after the fix.
 
+**Re-verified later and still holding**: repeated the direct-connection
+commanded-vs-measured check (HP8673H -> analyzer, 2.5 GHz, -30 to 0 dBm) --
+6 of 7 points gave a consistent -4.50 to -4.56 dB offset (essentially
+identical to the -4.4 dB found right after the fix). One point read -11.88 dB
+off; repeating that single measurement 5x gave -4.46 to -4.48 dB every time,
+confirming it was a one-off glitch (consistent with the intermittent
+USB-GPIB dropouts noted elsewhere in this file), not a real calibration
+drift. The fix has held.
+
 Also worth remembering from this same investigation: `SYST:ERR?` reporting
 "Query UNTERMINATED" on the front panel display (and the display appearing
 frozen) was caused by leaving an unread response in the analyzer's output
@@ -177,27 +193,40 @@ then `inst.clear()` (GPIB device clear) followed by `*CLS`.
 
 ### Verified isolator/coupler findings (real data, connection confirmed)
 
-Three reflected-power sweeps (2-3 GHz, 1 MHz steps, -25 dBm, coupler reverse
-port, each preceded by a passing connection sanity check):
+Three reflected-power sweeps (2-3 GHz, 1 MHz steps, coupler reverse port,
+each preceded by a passing connection sanity check). **Redone at -20 dBm
+after the amplitude calibration fault (see below) was found and fixed** --
+the original run was at -25 dBm before the fault was known about, so its
+absolute numbers are superseded by this one. Old data kept as
+`data/precal/reflected_*_precal.csv` for reference.
 
-| Configuration | Median reflected power |
-|---|---|
-| Open, no isolator (full reflection) | -23.5 dBm |
-| Open, with isolator (D3I2040, port 1 -> coupler output, port 2 open) | -29.6 dBm |
-| Terminated 50Ω, no isolator (near-zero reflection) | -37.8 dBm |
+| Configuration | Median reflected power (original, -25 dBm, pre-cal-fix) | Median reflected power (redone, -20 dBm, post-cal-fix) |
+|---|---|---|
+| Open, no isolator (full reflection) | -23.5 dBm | -46.85 dBm |
+| Open, with isolator (D3I2040, port 1 -> coupler output, port 2 open) | -29.6 dBm | -54.02 dBm |
+| Terminated 50Ω, no isolator (near-zero reflection) | -37.8 dBm | -60.08 dBm |
 
-- **Coupler directivity floor**: 14.3 dB (open vs. terminated) -- matches the
-  ZABDC20-322H-S+ datasheet's minimum spec (13 dB) for this band almost
-  exactly. Confirms the coupler behaves per spec once genuinely connected.
-- **Isolator's measured effect**: 6.1 dB reduction in reflected power
-  (open, with vs. without isolator).
-- **Isolator vs. terminated floor**: still an 8.2 dB gap -- some real
-  reflection gets through even with the isolator. Since the coupler's own
-  directivity ceiling is ~14 dB, if the isolator's true isolation exceeds
-  that, this measurement chain can't resolve it -- the coupler itself
-  becomes the limiting factor once reflected signal approaches its floor.
-  So 6.1 dB is a lower bound on the isolator's real performance, not
-  necessarily the whole story.
+Absolute levels shifted a lot (expected -- different power, and the pre-fix
+numbers were affected by the calibration fault), but the *relative* findings
+held up well:
+
+- **Coupler directivity floor**: 13.2 dB (was 14.3 dB) -- even closer to the
+  ZABDC20-322H-S+ datasheet's minimum spec (13 dB) for this band. Confirms
+  the coupler behaves per spec.
+- **Isolator's measured effect**: 7.2 dB reduction in reflected power (was
+  6.1 dB).
+- **Isolator vs. terminated floor**: 6.1 dB gap remains (was 8.2 dB) --
+  some real reflection still gets through even with the isolator. Since the
+  coupler's own directivity ceiling is ~13 dB, if the isolator's true
+  isolation exceeds that, this measurement chain can't resolve it -- the
+  coupler itself becomes the limiting factor once reflected signal
+  approaches its floor. So this is a lower bound on the isolator's real
+  performance, not necessarily the whole story.
+- At -20 dBm the terminated case (-60.08 dBm) sits right at the analyzer's
+  own RF-off noise floor (~-62 dBm) -- expected, since a well-terminated
+  load should show almost no real reflection, so the coupler's own leakage
+  floor and the analyzer's noise floor become the limiting factors
+  simultaneously.
 
 ### The sweep-start artifact: fake dips at the start of every sweep
 
