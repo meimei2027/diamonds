@@ -63,22 +63,6 @@ if generate == True:
                                             ])
 
 
-    # block = build_block_descriptor("test", [["polarize", "1", "once", "lowAtStart", 10],
-    #                                         ["dark", "1000", "repeat", "lowAtStart", 10], # 1 ms
-    #                                         ["readout", "1", "once", "highAtStart", 10],
-    #                                         ["polarize", "1", "once", "lowAtStart", 10],
-    #                                         ["dark", "2000", "repeat", "lowAtStart", 10], # 2 ms
-    #                                         ["readout", "1", "once", "highAtStart", 10],
-    #                                         ["polarize", "1", "once", "lowAtStart", 10],
-    #                                         ["dark", "3000", "repeat", "lowAtStart", 10], # 3 ms
-    #                                         ["readout", "1", "once", "highAtStart", 10],
-    #                                         ["polarize", "1", "once", "lowAtStart", 10],
-    #                                         ["dark", "4000", "repeat", "lowAtStart", 10], # 4 ms
-    #                                         ["readout", "1", "once", "highAtStart", 10],
-    #                                         ["polarize", "1", "once", "lowAtStart", 10], # calibration measurement
-    #                                         ["readout", "1", "once", "highAtStart", 10],
-    #                                         ])
-
     awg.write(f"DATA:SEQ {block}")
 
 
