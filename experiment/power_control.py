@@ -39,15 +39,21 @@ class PowerSupply:
         regressions_ig = []
         regression_iv = []
         for i in filenames:
-            a, g, v = np.loadtxt(i, delimiter=',', skiprows=1, unpack=True)
-            regressions_ig.append(stats.linregress(a, g))
+            a, b, v = np.loadtxt(i, delimiter=',', skiprows=1, unpack=True)
+            regressions_ig.append(stats.linregress(a, b))
             regression_iv.append(stats.linregress(a, v))
         if direction == 'x':
-            return (g - regressions_ig[0].intercept) / regressions_ig[0].slope, (g - regression_iv[0].intercept) / regression_iv[0].slope
+            current = (g - regressions_ig[0].intercept) / regressions_ig[0].slope
+            voltage = (current - regression_iv[0].intercept) / regression_iv[0].slope
+            return current, voltage
         elif direction == 'y':
-            return (g - regressions_ig[1].intercept) / regressions_ig[1].slope, (g - regression_iv[1].intercept) / regression_iv[1].slope
+            current = (g - regressions_ig[1].intercept) / regressions_ig[1].slope
+            voltage = (current - regression_iv[1].intercept) / regression_iv[1].slope
+            return current, voltage
         elif direction == 'z':
-            return (g - regressions_ig[2].intercept) / regressions_ig[2].slope, (g - regression_iv[2].intercept) / regression_iv[2].slope
+            current = (g - regressions_ig[2].intercept) / regressions_ig[2].slope
+            voltage = (current - regression_iv[2].intercept) / regression_iv[2].slope
+            return current, voltage
         else:
             raise ValueError("Invalid direction. Must be 'x', 'y', or 'z'.")
 
@@ -79,7 +85,8 @@ class PowerSupply:
 # Comment this out when you're using this as a module, this is just for testing
 if __name__ == "__main__":
     # ip = 'USB0::0xF4EC::0x1410::SPD13DCD7R1877::INSTR'
-    ip2 = 'ASRL4::INSTR'
+    # ip = 'USB0::0xF4EC::0x1410::SPD13DCQ7R0986::INSTR'
+    ip2 = 'USB0::0xF4EC::0x1410::SPD13DCQ7R0986::INSTR'
     g = 15 # Gauss
     direction = 'x' # 'x', 'y', or 'z'
     ps = PowerSupply(ip2)
