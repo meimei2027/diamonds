@@ -3,7 +3,74 @@ import numpy as np
 import os
 from datetime import datetime
 import time
-import h5py
+
+
+def make_t(sample_rate_hz, num_points, t0_s=0.0):
+    """
+    Build a time axis for a waveform of num_points samples acquired at
+    sample_rate_hz, starting at t0_s seconds (relative to the trigger).
+
+    sample_rate_hz is used directly, with no correction factor. An earlier
+    version of this function divided the reported rate by 4, which happened
+    to be right for whatever acquisition settings it was written against,
+    but is wrong under this driver's actual settings (ACQuire:MEMory MANual
+    + ACQuire:POINts + segmented mode): verified against a known 80 MHz
+    reference signal, where using the reported rate directly (no /4) gave
+    the correct frequency. ACQuire:SRATe?'s relationship to the real
+    per-sample spacing appears to depend on acquisition mode/point
+    count/channel count, so don't assume a fixed correction factor applies
+    across different settings -- see notes.md.
+
+    This does NOT center the axis on t=0 by default -- an earlier version
+    did (`np.arange(-N/2, N/2) * dt`), which assumed the acquisition window
+    is centered on the trigger point. It isn't: set_timebase() configures a
+    nonzero TIMebase:POSition (currently 3e-6), and the acquired buffer
+    (ACQuire:MEMory MANual + ACQuire:POINts) is wider than what's shown on
+    the display, so TIMebase:RANGe (the display width) is not the buffer's
+    width either. The real relationship, verified against 5 independent
+    (points, position, scale) configurations on this unit:
+
+        t0_s = TIMebase:POSition - num_points / (2 * sample_rate_hz)
+
+    i.e. TIMebase:POSition is the time (relative to the trigger) of the
+    *center* of the full acquired buffer, not of the display window --
+    TIMebase:RANGe/TIMebase:REFerence describe a narrower sub-window
+    centered on that same point, for display/panning purposes only. Get
+    t0_s from RTB2004.get_time_origin(ch), which queries
+    CHANnel<n>:DATA:XORigin? directly (the authoritative source -- prefer
+    it over recomputing this formula yourself). See notes.md.
+    """
+    dt = 1 / sample_rate_hz
+    return t0_s + np.arange(num_points) * dt
+
+
+def parse_metadata(metadata_path):
+    """
+    Parse a `{name}_metadata.txt` file written by RTB2004.save_metadata()
+    into a dict: {"sample_rate_hz": float, "t0_s": float, "num_points": int}.
+    """
+    values = {}
+    with open(metadata_path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            key, _, value = line.partition("=")
+            values[key] = float(value)
+    values["num_points"] = int(values["num_points"])
+    return values
+
+
+def make_t_from_metadata(metadata_path):
+    """
+    Read a `{name}_metadata.txt` file written by RTB2004.save_metadata()
+    and return the corresponding time axis via make_t() -- so later
+    analysis of `{name}.npy` only needs that .npy plus its metadata file,
+    not a live connection to the scope.
+    """
+    meta = parse_metadata(metadata_path)
+    return make_t(meta["sample_rate_hz"], meta["num_points"], t0_s=meta["t0_s"])
+
 
 class RTB2004:
     def __init__(self, resource, timeout=100000, debug=False):
@@ -47,9 +114,9 @@ class RTB2004:
             self.write(f"CHANnel{ch}:HISTory:EXPort:NAME \"{path}\"")
             self.write(f"CHANnel{ch}:HISTory:EXPort:SAVE")
 
-    def set_timebase(self, scale_seconds):
+    def set_timebase(self, scale_seconds, position):
         self.write(f"TIMebase:SCALe {scale_seconds}")
-        self.write(f"TIMebase:POSition 3e-6")
+        self.write(f"TIMebase:POSition {position}")
         return self.query("ACQuire:SRATe?")
 
 
@@ -98,10 +165,25 @@ class RTB2004:
         )
         return raw
 
+    def get_time_origin(self, ch=1):
+        """
+        Query the instrument directly for the true time axis of the most
+        recently read-out waveform on channel ch: (t0_s, dt_s) -- the time
+        of the first sample relative to the trigger event, and the sample
+        interval. Use with make_t(). Equivalent to
+        TIMebase:POSition - num_points / (2 * sample_rate) (see make_t()'s
+        docstring and notes.md), but queries the instrument directly rather
+        than recomputing it, since that's one less place to get out of sync
+        if settings change.
+        """
+        t0_s = float(self.query(f"CHANnel{ch}:DATA:XORigin?"))
+        dt_s = float(self.query(f"CHANnel{ch}:DATA:XINCrement?"))
+        return t0_s, dt_s
+
 
     def run(self, segments=1000, ch=1, path="./data", name="waveform"):
-        sample_rate = self.set_timebase(1e-7)
-        print("sample rate", sample_rate)
+        sample_rate_hz = float(self.set_timebase(1e-7, 3e-6))
+        print("sample rate", sample_rate_hz)
         self.setup_segmented_mode(
             segments=segments
         )
@@ -114,8 +196,39 @@ class RTB2004:
         print("acquired segments", self.get_segment_count())
         # if segment count not what is expected, rerun?
         self.save_segments(segments, ch, path=path, name=name)
+        self.save_timetable(ch, path, name)
+        self.save_metadata(ch, path, name, sample_rate_hz)
 
-    
+    def save_timetable(self, ch, path, name):
+        raw = self.get_timetable(ch=ch)
+        timestamps_s = np.array([float(x) for x in raw.split(",")])
+        np.save(f"{path}/{name}_timetable.npy", timestamps_s)
+        return timestamps_s
+
+    def save_metadata(self, ch, path, name, sample_rate_hz):
+        """
+        Write `{path}/{name}_metadata.txt` with everything needed to
+        reconstruct the time axis for `{path}/{name}.npy` later via
+        make_t_from_metadata() -- sample_rate_hz, the true trigger-relative
+        start time (t0_s, queried directly via CHANnel<n>:DATA:XORigin? --
+        see make_t()'s docstring and notes.md for why this can't just be
+        computed from TIMebase:POSition alone), and the number of points
+        per segment (from CHANnel<n>:DATA:HEADer?, the actual returned
+        record length -- see notes.md, this can differ from what
+        ACQuire:POINts was set to).
+        """
+        t0_s, _dt_s = self.get_time_origin(ch)
+        header = self.query(f"CHANnel{ch}:DATA:HEADer?")
+        num_points = int(header.split(",")[2])
+
+        metadata_path = f"{path}/{name}_metadata.txt"
+        with open(metadata_path, "w") as f:
+            f.write(f"sample_rate_hz={sample_rate_hz}\n")
+            f.write(f"t0_s={t0_s}\n")
+            f.write(f"num_points={num_points}\n")
+        return metadata_path
+
+
     def save_segments(self, segments, ch, path, name):
         read_segment_old = False
         if read_segment_old: 

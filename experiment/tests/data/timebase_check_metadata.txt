@@ -1,0 +1,3 @@
+sample_rate_hz=2500000000.0
+t0_s=1e-06
+num_points=10000
