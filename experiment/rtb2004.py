@@ -130,11 +130,19 @@ class RTB2004:
         # self.write(f"CHANnel{ch}:COUPling ACLimit")
 
 
-    def wait_for_acquisition(self, segments, timeout=60):
+    def wait_for_acquisition(self, segments, timeout=60, on_poll=None):
+        """
+        on_poll(num_of_segments), if given, is called once per poll with the
+        current segment count -- lets a caller monitor progress (e.g. to
+        detect an external event like an interlock trip mid-acquisition)
+        without needing its own polling loop.
+        """
         start = time.time()
         while True:
             opc = self.inst.query("*OPC?").strip()
             num_of_segments = self.get_segment_count()
+            if on_poll is not None:
+                on_poll(num_of_segments)
             if opc == "1" and segments == num_of_segments:
                 return
             if time.time() - start > timeout:
@@ -181,7 +189,7 @@ class RTB2004:
         return t0_s, dt_s
 
 
-    def run(self, segments=1000, ch=1, path="./data", name="waveform"):
+    def run(self, segments=1000, ch=1, path="./data", name="waveform", on_poll=None):
         sample_rate_hz = float(self.set_timebase(1e-7, 3e-6))
         print("sample rate", sample_rate_hz)
         self.setup_segmented_mode(
@@ -190,7 +198,7 @@ class RTB2004:
         self.set_trigger_edge(level=100e-3)
 
         self.write("SINGle")
-        self.wait_for_acquisition(segments)
+        self.wait_for_acquisition(segments, on_poll=on_poll)
 
         self.write("STOP")
         print("acquired segments", self.get_segment_count())
@@ -198,6 +206,49 @@ class RTB2004:
         self.save_segments(segments, ch, path=path, name=name)
         self.save_timetable(ch, path, name)
         self.save_metadata(ch, path, name, sample_rate_hz)
+
+    def save_available_segments(self, ch=1, path="./data", name="waveform", max_segments=None):
+        """
+        Read out and save whatever segments are currently sitting in the
+        scope's history buffer right now, rather than waiting for an exact
+        target count -- for salvaging partial data after an acquisition was
+        interrupted (e.g. wait_for_acquisition() raised a VisaIOError
+        partway through, on a *different*, now-dead connection -- call this
+        on a fresh RTB2004 connection instead). Sends STOP first to freeze
+        the count so it doesn't keep changing under us.
+
+        max_segments, if given, caps how many are read out (e.g. the
+        originally requested count, in case the scope kept triggering past
+        that while communication was down).
+
+        Returns the number of segments actually read out and saved (0 if
+        none were available).
+        """
+        self.write("STOP")
+        available = self.get_segment_count()
+        if max_segments is not None:
+            available = min(available, max_segments)
+        if available <= 0:
+            print(f"[rtb2004] no segments available to salvage")
+            return 0
+
+        self.save_segments(available, ch, path=path, name=name)
+        self.save_timetable(ch, path, name)
+
+        # ACQuire:SRATe? reflects the *current* live instrument setting --
+        # __init__()'s *RST (this is a fresh connection, reconnected after
+        # the original one died) resets that to some default, NOT the rate
+        # the buffered data was actually captured at. CHANnel<n>:DATA:
+        # XINCrement? (via get_time_origin(), queried after save_segments()
+        # above has read real data) is frozen to the actual captured
+        # waveform instead, and is what we want here. Confirmed this bug
+        # for real: a salvaged run's metadata once claimed 109 MSa/s when
+        # the true rate (and the one baked into the raw samples) was
+        # 2.5 GSa/s -- see notes.md.
+        _t0_s, dt_s = self.get_time_origin(ch)
+        sample_rate_hz = 1 / dt_s
+        self.save_metadata(ch, path, name, sample_rate_hz)
+        return available
 
     def save_timetable(self, ch, path, name):
         raw = self.get_timetable(ch=ch)

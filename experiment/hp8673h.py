@@ -109,7 +109,7 @@ class HP8673H:
     # -- Frequency sweeps (against an E4403B on the analyzer side) ----------
 
     def frequency_sweep(self, sa, start_hz, stop_hz, step_hz, power_dbm=-20,
-                         settle_s=0.0, initial_settle_s=1.0):
+                         settle_s=0.05, initial_settle_s=1.0):
         """
         Step CW frequency from start_hz to stop_hz (inclusive) in step_hz
         increments, reading the E4403B's marker amplitude at each point.
@@ -126,6 +126,19 @@ class HP8673H:
         small step-to-step increments during the sweep itself. Without this,
         the first few points of a sweep can show a spurious dip that has
         nothing to do with whatever is connected to the generator.
+
+        settle_s defaults to a small nonzero value -- don't set it to 0.
+        With settle_s=0, `if settle_s:` below skips the sleep entirely, and
+        the analyzer's INIT:IMM fires essentially immediately after the
+        frequency-change command is sent, racing the GPIB bus/generator
+        before it's finished processing that command. This produced a real,
+        reproducible false "dip" of >13 dB at specific frequencies (~2.10 and
+        ~2.30 GHz on our unit) that looked exactly like a resonance or a
+        generator hardware defect -- it was neither. Confirmed empirically:
+        the same sweep with settle_s=0 shows the false dip every time;
+        settle_s as low as 0.02 already fully eliminates it. This is why
+        `coarse_sweep()`'s dip-finding used to occasionally lock onto ~2.1 or
+        ~2.3 GHz instead of the real resonance -- see notes.md.
 
         Returns (freqs_hz, power_dbm_array).
         """
@@ -382,13 +395,21 @@ class HP8673H:
             print(f"[interlock] WARNING: failed to turn off RF output cleanly: {e}")
 
     def monitor_interlock(self, sa_resource, freq_hz, threshold_dbm,
-                           poll_interval_s=1.0, max_missed_reads=1):
+                           poll_interval_s=1.0, max_missed_reads=1, stop_event=None):
         """
         Continuously monitor reflected power at freq_hz. Trips (shuts off RF
         and returns a reason string) if:
           (a) the analyzer can't be reached (at startup, or for
               max_missed_reads consecutive polls), or
           (b) reflected power exceeds threshold_dbm.
+
+        stop_event (a threading.Event, optional) allows cooperative shutdown
+        from another thread once whatever it's protecting has finished
+        normally -- e.g. run alongside a scope acquisition in a background
+        thread, then call stop_event.set() when the acquisition completes.
+        Checked once per poll (so shutdown latency is up to poll_interval_s),
+        does NOT turn off RF (a clean stop is not a fault) -- the caller
+        still owns RF state after a clean "stopped" return.
         """
         print(f"[interlock] monitoring {freq_hz/1e9:.4f} GHz, "
               f"threshold {threshold_dbm} dBm, polling every {poll_interval_s}s")
@@ -401,6 +422,10 @@ class HP8673H:
         missed = 0
         try:
             while True:
+                if stop_event is not None and stop_event.is_set():
+                    print("[interlock] stopped (requested)")
+                    return "stopped"
+
                 power_dbm = self.read_reflected_power_dbm(sa, freq_hz)
 
                 if power_dbm is None:
@@ -496,12 +521,17 @@ def main():
     )
     interlock_p.add_argument("--gen-resource", default="GPIB1::19::INSTR")
     interlock_p.add_argument("--sa-resource", default="GPIB0::18::INSTR")
-    interlock_p.add_argument("--freq-hz", type=float, default=2.51e9,
-                              help="operating (resonance) frequency in Hz")
+    interlock_p.add_argument("--freq-hz", type=float, default=2.68725e9,
+                              help="operating (resonance) frequency in Hz -- "
+                                   "measured f0 with the amplifier in the path "
+                                   "at -40 dBm drive; see notes.md")
     interlock_p.add_argument("--power-dbm", type=float, default=0.0,
-                              help="generator output power in dBm")
-    interlock_p.add_argument("--threshold-dbm", type=float, default=-40.0,
-                              help="reflected power trip threshold in dBm")
+                              help="generator output power in dBm -- 0 dBm drive "
+                                   "for max amplifier output (~20 dBm)")
+    interlock_p.add_argument("--threshold-dbm", type=float, default=-10.0,
+                              help="reflected power trip threshold in dBm -- see "
+                                   "notes.md for the -15 to -25 dBm expected normal "
+                                   "range this margin is based on")
     interlock_p.add_argument("--poll-interval-s", type=float, default=1.0)
 
     args = parser.parse_args()

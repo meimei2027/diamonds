@@ -23,6 +23,55 @@ See `CLAUDE.md` for the full investigation history behind each of these.
 - **GPIB bus number isn't stable.** Has shown up as both `GPIB0::19::INSTR`
   and `GPIB1::19::INSTR` depending on adapter enumeration order. Always
   `pyvisa.ResourceManager().list_resources()` before assuming an address.
+- **`frequency_sweep()` with `settle_s=0` (the old default) produces a false,
+  >13 dB deep "dip" of >13 dB at specific frequencies (we hit it at ~2.10 GHz
+  and ~2.30 GHz) that looks exactly like a real resonance or a generator
+  hardware defect -- it's neither.** First suspected this was a genuine
+  defect in the generator itself: reproduced it with the generator connected
+  directly into the E4403B, nothing else in the chain (ruling out the
+  resonator and the amplifier). But holding the generator at those exact
+  frequencies directly (bypassing the sweep's per-step logic) showed no dip
+  at all, at any settle time up to 2s -- so it isn't a permanent property of
+  the generator's steady-state output either. Root cause: `frequency_sweep()`
+  does `if settle_s: time.sleep(settle_s)` -- with `settle_s=0` that's falsy
+  and the sleep is skipped entirely, so the analyzer's `INIT:IMM` fires
+  essentially immediately after the frequency-change command is sent, racing
+  the GPIB bus/generator before it's finished processing that command.
+  Confirmed by reproducing the exact sweep grid with `settle_s=0` (dip
+  reappears every time, sometimes even deeper) vs `settle_s=0.02`-`0.3`
+  (completely gone, at every value tested). **Fixed**: `frequency_sweep()`'s
+  default `settle_s` is now `0.05` (was `0.0`) -- never pass `settle_s=0`
+  intentionally. `coarse_sweep()` (and therefore `resonance_sweep()`'s coarse
+  stage) never passed `settle_s` explicitly, so it silently inherited the old
+  buggy default -- this is almost certainly what produced an earlier spurious
+  result of `f0 ~= 2.09 GHz, Q ~= 5227` that had nothing to do with the real
+  resonator. `fine_sweep()`'s existing `settle_s=0.15` was always safe.
+- **Interlock operating point, as configured in `hp8673h.py`'s CLI defaults:**
+  `--freq-hz 2.68725e9` (measured f0, amplifier in the path, -40 dBm drive --
+  reproduced across 3 independent sweeps within ~1 MHz), `--power-dbm 0.0`
+  (drives the amplifier to its measured max output, ~20 dBm -- see the
+  amplifier gain/max-output notes above), `--threshold-dbm -10.0`.
+  Reasoning for the threshold: at 0 dBm drive / ~20 dBm amplifier output,
+  assuming ~15 dB return loss for a "detuned but still connected" resonator,
+  reflected power (coupled at the established 20 dB coupling factor) is
+  expected in the -15 to -25 dBm range during normal operation; -10 dBm
+  gives 5-10 dB of margin above that before tripping. For a full-disconnect
+  fault (near-total reflection), the coupled reading would be closer to
+  0 dBm -- comfortably above the -10 dBm threshold, so it still catches that
+  case with margin.
+  **Open safety question, not resolved:** in that same full-disconnect fault,
+  after the isolator's tested ~7 dB isolation (tested against an open),
+  ~13 dBm would reach the HP8347A amplifier's output stage. The HP8347A
+  datasheet (Keysight literature 5091-0370E) does not publish a maximum
+  safe reflected/reverse power rating for the output port -- "Output SWR"
+  in that datasheet describes the amplifier's own output port match (S22),
+  and "Reverse isolation >60 dB" describes output-to-input leakage, neither
+  of which is a load-mismatch damage rating. The full service manual
+  (Keysight part 08347-90023) that might document this is gated behind a
+  login and wasn't accessible. Decided to proceed with the -10 dBm
+  threshold anyway without empirically fault-testing at reduced power
+  first -- if the amplifier is later found to be damaged or behaving
+  oddly, revisit this open question first.
 
 ## E4403B spectrum analyzer
 
@@ -40,6 +89,49 @@ See `CLAUDE.md` for the full investigation history behind each of these.
   All), with a cable connected to the input.** After a real cal fault, don't
   trust *any* absolute dBm reading until this has been done and reverified
   with a known source.
+  **Reconfirmed, with the generator connected directly to the analyzer
+  (known power in, no cable/amplifier/coupler in between):** the analyzer
+  itself reported `SYST:ERR?` = `652, "Connect Calibration Output to Input"`
+  on several unrelated commands (`FORM REAL,32`, `FREQ:CENT`, `FREQ:SPAN`)
+  -- it's asking for its own internal alignment. Measured error is NOT a
+  constant offset -- it grows with input power, i.e. this isn't only a
+  calibration fault but likely front-end compression/overload stacked on
+  top of it:
+
+      set (dBm)   measured (dBm)   delta (dB)
+        -40.0         -19.92          +20.08
+        -30.0          -9.82          +20.18
+        -20.0           0.11          +20.11
+        -10.0          11.09          +21.09
+         -5.0          26.55          +31.55
+          0.0          36.51          +36.51
+
+  Roughly constant ~+20 dB from -40 to -10 dBm, then jumps to +31.5 and
+  +36.5 dB at -5 and 0 dBm.
+  **This fault arose recently -- confirmed the earlier amplifier
+  gain/max-output and resonance-sweep measurements were NOT affected by
+  it** (taken before this developed). What it does explain: the 4th
+  interlock test's immediate trip (`-17.07 dBm` displayed on the very
+  first reading, no baseline period, no physical disturbance) was most
+  likely a **false trip caused by this fault**, not real resonance drift as
+  first guessed -- a true baseline around -40 dBm (consistent with the
+  -42 to -50 dBm baselines seen in the earlier, uncompromised interlock
+  tests) plus this fault's +20 dB offset would display right around -20
+  dBm, over the -30 dBm threshold with no real cause. Re-verify with a
+  fresh interlock test once the analyzer is realigned, rather than trusting
+  that 4th test's "resonance drifted" explanation.
+  **Resolved.** First `Align Now -> RF` attempt (with `AMPTD REF OUT`
+  correctly cabled to `INPUT 50` Ohm) was run immediately after power-on
+  and did NOT fix it -- `652` errors and the ~+20 dB fault persisted
+  essentially unchanged. **The missing step was the ~5 minute warm-up**
+  (the E4403B's own spec: meets spec "5 minutes after the analyzer is
+  turned on, and after ALIGN NOW [RF] has been run" -- aligning cold
+  doesn't count). After warming up and re-running the align: zero `652`
+  errors, and the offset came back as a rock-solid constant -4.4 to -4.5 dB
+  across the entire -40 to 0 dBm range tested -- exactly the healthy
+  "residual cable loss" figure below, confirming the analyzer is fully
+  healthy again. If this recurs, warm up for 5 min *before* aligning, not
+  just before measuring.
 - **Even when calibration is healthy, expect a small residual offset** from
   ordinary cable loss (we consistently see ~-4.4 to -4.5 dB direct
   generator-to-analyzer). This is normal, not a fault -- re-measure if the
@@ -66,12 +158,21 @@ See `CLAUDE.md` for the full investigation history behind each of these.
   twice in a row under the same conditions. **A full power cycle (not just
   USB replug) was required to recover both times** -- unplugging/replugging
   the USB cable alone was not enough to bring the port back.
-- Root cause untested -- plausible that `recall` triggers a full
-  synth/mixer/display reinit that briefly (or permanently, on this
-  firmware) drops the USB peripheral. Not root-caused yet; treat any
-  `recall`/state-restore command as **crash-risk** until proven otherwise
-  on this unit, and don't call it from an unattended script without a
-  human present to power-cycle if it hangs.
+- **Confirmed this is a genuine firmware hang, not a clean USB reset**: after
+  sending `recall 0`, polled Windows' USB enumeration (`vid=0x0483,
+  pid=0x5740`) every 0.2s for 25s -- the device stayed listed/enumerated the
+  entire time (never disappeared and re-enumerated), yet every attempt to
+  actually communicate with it (even just opening a fresh serial handle)
+  failed with "a device attached to the system is not functioning." That
+  combination -- descriptor still registered, but the USB transfer layer
+  dead -- points to the MCU's firmware locking up (e.g. in an interrupt
+  handler or the main loop) rather than doing any kind of USB reset/reboot.
+  Waiting longer or reconnecting differently does not help; this has now
+  crashed 3 times, always needing the same physical power cycle. Likely
+  needs a firmware fix on the NanoVNA side, not a driver-side workaround.
+  Treat any `recall`/state-restore command as **crash-risk** until this
+  firmware is updated/fixed, and don't call it from an unattended script
+  without a human present to power-cycle if it hangs.
 - The bare `cal` command (no arguments) also does not return to the `ch> `
   prompt in any reasonable time -- it appears to expect a further
   interactive step rather than just printing usage and returning like most
@@ -83,6 +184,45 @@ See `CLAUDE.md` for the full investigation history behind each of these.
   command from `cal`**: `save {id}` / `recall {id}` persist/restore a full
   state slot (frequency plan + cal coefficients + display settings), not
   just the calibration coefficients alone.
+- **Tried `reset` (full device reboot) as a `recall`-avoiding way to load a
+  saved calibration** -- some docs for other NanoVNA firmware forks say
+  `save 0` auto-restores at power-on, so a clean reboot should apply
+  whatever's in slot 0 without ever touching the buggy `recall` path.
+  **Verdict: not reliable enough to use.** Across 3 attempts: 1 self-recovered
+  cleanly within ~25s; 2 got stuck with the port still listed in Windows'
+  device list (`vid=0x0483, pid=0x5740`) but never actually openable --
+  one of those needed only a USB replug, the other needed a full power
+  cycle even though the device's own screen looked normal/responsive the
+  whole time. That's a 2-in-3 rate of needing physical intervention --
+  meaningfully less catastrophic-looking than `recall`'s 100% hard hang,
+  but not meaningfully safer to actually rely on. **Conclusion: there is no
+  known reliable way to (re)load a saved calibration on this unit without
+  physical intervention.** For now, treat calibration as something you set
+  once per session from the front panel (or accept running uncalibrated,
+  as `nanovna.py` currently does) rather than something a script loads
+  automatically -- don't add a `reset`-based `load_calibration()` path
+  without addressing this reliability problem first.
+- **The real fix is almost certainly to stop trying to use the device's
+  `cal`/`save`/`recall` state machine at all, and calibrate on the host
+  instead -- this is what NanoVNA-Saver itself does.** Checked its source
+  (`Calibration.py`, `Windows/CalibrationSettings.py`): it measures OPEN/
+  SHORT/LOAD standards via ordinary sweeps (the same `sweep`/`data 0`
+  commands we already use -- no special device-side "cal open" state is
+  involved), computes the standard vector error-correction terms
+  (directivity/port-match/tracking, the classic 3-term one-port OSL model)
+  entirely in Python, applies that correction to data after reading it, and
+  saves/loads the calibration as a plain file on the PC's disk -- never the
+  device's internal flash slots. Their own code comment on the manual
+  cal-standard buttons says outright: "The buttons do not sweep for you nor
+  do they interact with the NanoVNA calibration... If you are trying to do
+  a calibration of the NanoVNA, do so on the device itself instead" -- i.e.
+  even NanoVNA-Saver's authors treat the device's own `cal`/`recall`
+  mechanism as something for the front panel, not for scripting.
+  **Not implemented yet** -- `nanovna.py` still runs uncalibrated. When we
+  do this, it should be a from-scratch one-port OSL calibration routine in
+  `nanovna.py` (sweep with OPEN/SHORT/LOAD connected in turn, compute the
+  3-term correction, apply to subsequent sweeps), entirely independent of
+  the crash-prone `recall`/`reset`/`cal` device commands above.
 - `nanovna.py`'s `exec_command()` (borrowed from NanoVNA-Saver) assumes
   every command eventually re-emits a `ch> ` prompt line. Both gotchas
   above break that assumption -- a command that never returns to the
@@ -145,6 +285,57 @@ See `CLAUDE.md` for the full investigation history behind each of these.
   up to 10000 (confirmed via `ACQuire:POINts?` readback); requesting more
   (e.g. 20000, 50000) is honored exactly. Always check `ACQuire:POINts?`
   after setting it if the exact record length matters.
+- **The scope has gone unresponsive (`pyvisa.errors.VisaIOError: VI_ERROR_TMO`
+  on `*OPC?` inside `wait_for_acquisition()`) right around an interlock trip,
+  3 out of 3 times** when running `cw_odmr.py run` with the interlock active
+  in a background thread. Not root-caused -- plausible causes include the
+  documented shared-USB-hub disruption (see "General" below) triggered by
+  the generator's RF switching off at that exact moment, or some VISA-level
+  contention between the interlock thread closing its own E4403B session and
+  the main thread's concurrent scope query, but neither is confirmed.
+  **Immediately retrying with a fresh connection does NOT help** -- tested
+  this directly: a brand new `RTB2004` object, reconfigured from scratch,
+  hit the identical `VI_ERROR_TMO` again within seconds of the first
+  failure. But a plain aliveness check (`*IDN?`) run manually a couple of
+  minutes later always succeeded instantly, both times -- so the scope
+  isn't wedged the way the NanoVNA's `recall` crash wedges it (no power
+  cycle/replug needed), it just needs real wall-clock time to recover, not
+  just a new VISA session. `cw_odmr.py`'s scope-acquisition step now waits
+  45s after the failure, then reconnects fresh and tries
+  `RTB2004.save_available_segments()` to salvage whatever segments the
+  scope's history buffer actually captured before the connection died --
+  that buffer is independent of the dead connection, so reading it out on a
+  new one is safe. Only if salvage comes back empty does it fall back to
+  retrying the full acquisition from scratch (up to 3 attempts total,
+  discarding partial progress each time it does). The 45s figure is a
+  guess, not something bisected -- revisit if it's still failing after a
+  full round of retries with waits. Note: a salvaged partial save has fewer
+  segments than requested, saved as-is with no special marker in the
+  filename -- check `.npy` shape / the printed "salvaged N of M" line if
+  the exact count matters downstream.
+- **First working salvage run (`interlock_test5`) saved a wrong
+  `sample_rate_hz` in its metadata (`109000000.0` instead of the true
+  `2500000000.0`), even though the actual waveform data was completely
+  correct.** Root cause: `save_available_segments()` originally computed
+  `sample_rate_hz` from a fresh `ACQuire:SRATe?` query -- but that reflects
+  the scope's *current live* setting, and `RTB2004.__init__()` always sends
+  `*RST` on connect (this is a brand-new connection, reconnected after the
+  original one died), which resets that live setting to some default. It
+  does NOT reset `CHANnel<n>:DATA:XINCrement?`/`XORigin?`, which stay
+  frozen to whatever the buffered waveform was actually captured at (this
+  is the same distinction noted above for `get_time_origin()`). Confirmed
+  by recomputing the saved data's FFT peak with the true 2.5 GSa/s instead
+  of the metadata's bogus 109 MSa/s: went from a nonsense 3.488 MHz to a
+  clean 80.0000 MHz on every segment -- the data was fine, only the
+  recorded rate was wrong. **Fixed**: `save_available_segments()` now
+  computes `sample_rate_hz` from `get_time_origin()`'s `dt_s` (queried
+  after `save_segments()` has read real data), never from `ACQuire:SRATe?`.
+  `interlock_test5`'s existing metadata file was hand-corrected to
+  `2500000000.0` after verifying against the raw data. If you find another
+  salvaged file with a suspicious `sample_rate_hz`, cross-check it the same
+  way (a known-frequency signal's FFT peak, or just compare against
+  whatever rate every non-salvaged run in the same session used) before
+  trusting it.
 
 ## General
 
