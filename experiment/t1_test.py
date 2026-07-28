@@ -58,8 +58,8 @@ if generate == True:
                                             # ["polarize", "1", "once", "lowAtStart", 10],
                                             # ["dark", "400", "repeat", "lowAtStart", 10], # 4 ms
                                             # ["readout", "1", "once", "highAtStart", 10],
-                                            # ["polarize", "1", "once", "lowAtStart", 10], # calibration measurement
-                                            # ["readout", "1", "once", "highAtStart", 10],
+                                            ["polarize", "1", "once", "lowAtStart", 10], # calibration measurement
+                                            ["readout", "1", "once", "highAtStart", 10],
                                             ])
 
 
@@ -81,11 +81,11 @@ if generate == True:
 def str_to_arr(str):
     return np.fromstring(str, sep=',')
 
-# name = "100us_200us_300us_400us_calib"
-# scope = rtb2004.RTB2004("USB0::0x0AAD::0x01D6::108904::INSTR", timeout=100000, debug=True)
-# scope.run(segments=5000, path="D:\\t1_data_2", name=name) #
-# timetable = scope.get_timetable()
-# np.save(f"D:\\t1_data_2/timetable_{name}.npy", str_to_arr(timetable))
-# print(timetable)
-# scope.close()
+name = "100us_200us_300us_400us_calib"
+scope = rtb2004.RTB2004("USB0::0x0AAD::0x01D6::108904::INSTR", timeout=100000, debug=True)
+scope.run(segments=5000, path="D:\\t1_data_2", name=name) #
+timetable = scope.get_timetable()
+np.save(f"D:\\t1_data_2/timetable_{name}.npy", str_to_arr(timetable))
+print(timetable)
+scope.close()
 
