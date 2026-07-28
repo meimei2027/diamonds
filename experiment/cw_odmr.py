@@ -31,7 +31,7 @@ Usage:
           poll_interval_s=1.0    interlock polling interval, in seconds
           awg_carrier_freq_hz=80e6  AWG CH1 carrier frequency (into scope Channel 1)
           awg_carrier_vpp=0.632     AWG CH1 amplitude
-          awg_trigger_freq_hz=1.0  AWG CH2 trigger frequency (into scope EXT TRIG)
+          awg_trigger_freq_hz=10.0  AWG CH2 trigger frequency (into scope EXT TRIG)
           awg_trigger_vpp=2.0      AWG CH2 amplitude
 
     python cw_odmr.py run_background <file_name> [segments=1000]
@@ -69,10 +69,10 @@ SA_RESOURCE = "GPIB0::18::INSTR"
 SCOPE_RESOURCE = "USB0::0x0AAD::0x01D6::108904::INSTR"
 AWG_RESOURCE = "USB0::0x0957::0x5707::MY53800810::INSTR"
 
-DATA_DIR = "data"
+DATA_DIR = "D:\\cw_odmr"
 
 
-def setup_awg(carrier_freq_hz=80e6, carrier_vpp=0.632, trigger_freq_hz=1.0, trigger_vpp=2.0):
+def setup_awg(carrier_freq_hz=80e6, carrier_vpp=0.632, trigger_freq_hz=10.0, trigger_vpp=2.0):
     """
     Configure the AWG's CH1 (continuous carrier -- currently standing in for
     the real laser/PL signal during dry-run testing, straight into scope
@@ -230,7 +230,7 @@ def cmd_run(file_name, **kw):
     poll_interval_s = float(kw.get("poll_interval_s", 1.0))
     awg_carrier_freq_hz = float(kw.get("awg_carrier_freq_hz", 80e6))
     awg_carrier_vpp = float(kw.get("awg_carrier_vpp", 0.632))
-    awg_trigger_freq_hz = float(kw.get("awg_trigger_freq_hz", 1.0))
+    awg_trigger_freq_hz = float(kw.get("awg_trigger_freq_hz", 10.0))
     awg_trigger_vpp = float(kw.get("awg_trigger_vpp", 2.0))
 
     os.makedirs(DATA_DIR, exist_ok=True)
@@ -350,7 +350,7 @@ def cmd_run_background(file_name, **kw):
     segments = int(kw.get("segments", 1000))
     awg_carrier_freq_hz = float(kw.get("awg_carrier_freq_hz", 80e6))
     awg_carrier_vpp = float(kw.get("awg_carrier_vpp", 0.632))
-    awg_trigger_freq_hz = float(kw.get("awg_trigger_freq_hz", 1.0))
+    awg_trigger_freq_hz = float(kw.get("awg_trigger_freq_hz", 10.0))
     awg_trigger_vpp = float(kw.get("awg_trigger_vpp", 2.0))
 
     os.makedirs(DATA_DIR, exist_ok=True)
