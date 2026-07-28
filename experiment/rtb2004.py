@@ -73,6 +73,9 @@ def make_t_from_metadata(metadata_path):
 
 
 class RTB2004:
+    NUM_SAMPLES = 10000  # ACQuire:POINts -- single source of truth, also
+                          # used by run() to convert start_s -> TIMebase:POSition
+
     def __init__(self, resource, timeout=100000, debug=False):
         self.rm = pyvisa.ResourceManager()
         self.inst = self.rm.open_resource(resource)
@@ -103,7 +106,7 @@ class RTB2004:
 
     def setup_segmented_mode(self, segments=1000):
         self.write("ACQuire:MEMory MANual")
-        self.write("ACQuire:POINts 10000")
+        self.write(f"ACQuire:POINts {self.NUM_SAMPLES}")
         self.write(f"ACQuire:NSINgle:COUNt {segments}")
         self.write("ACQuire:SEGMented:STATe ON")
             
@@ -190,7 +193,7 @@ class RTB2004:
 
 
     def run(self, segments=1000, ch=1, path="./data", name="waveform", on_poll=None,
-            on_acquired=None):
+            on_acquired=None, start_s=1e-6, scale_s=1e-7):
         """
         on_acquired(), if given, is called once triggering is done (right
         after STOP, before the segment-by-segment history readout starts) --
@@ -198,12 +201,49 @@ class RTB2004:
         collecting (e.g. RF drive), since reading out already-captured
         history doesn't need it anymore and the readout of many segments can
         take just as long as the acquisition itself.
+
+        start_s is where the acquired segment should START, in seconds
+        relative to the trigger -- NOT the same thing as TIMebase:POSition,
+        which is the *center* of the acquired buffer (see make_t()'s
+        docstring / notes.md). Converted internally via that same formula,
+        inverted:
+
+            TIMebase:POSition = start_s + NUM_SAMPLES / (2 * sample_rate_hz)
+
+        start_s=1e-6 (the default) reproduces the previous hardcoded
+        TIMebase:POSition=3e-6 default exactly, at this driver's fixed
+        2.5 GSa/s / 10000-point configuration (1e-6 + 10000/(2*2.5e9) = 3e-6).
+
+        scale_s (TIMebase:SCALe) defaults to the same 1e-7 this driver has
+        always used (giving ~4us total window at 2.5 GSa/s / 10000 points),
+        but can be set coarser to widen the total captured window (at the
+        cost of per-sample resolution) -- e.g. for a diagnostic scan looking
+        for a signal somewhere in a wider span than 4us allows.
+
+        Returns (sample_rate_hz, window_start_s, window_end_s) -- the last
+        two are exactly start_s and start_s + NUM_SAMPLES/sample_rate_hz,
+        provided as a convenience since sample_rate_hz (and therefore the
+        window's real duration) isn't known until the instrument is queried.
         """
-        sample_rate_hz = float(self.set_timebase(1e-7, 3e-6))
+        # ACQuire:SRATe? depends on acquisition MODE (normal vs
+        # ACQuire:MEMory MANual + fixed ACQuire:POINts), not just
+        # TIMebase:SCALe -- so setup_segmented_mode() (which switches into
+        # manual mode) must run BEFORE the sample-rate query, or the query
+        # reflects normal mode's rate instead of what the real acquisition
+        # will actually use. Confirmed for real: at scale_s=2e-6, querying
+        # before manual mode gave the same 2.5 GSa/s as the well-tested
+        # default scale_s=1e-7 (unaffected by the scale change at all),
+        # but the real captured data (per the live-queried, authoritative
+        # CHANnel<n>:DATA:XORigin? in get_time_origin()) was consistent with
+        # a ~20x lower rate and correspondingly ~20x wider window -- i.e.
+        # the early query was measuring the wrong regime. See notes.md.
+        self.write(f"TIMebase:SCALe {scale_s}")
+        self.setup_segmented_mode(segments=segments)
+        sample_rate_hz = float(self.query("ACQuire:SRATe?"))
+
+        position = start_s + self.NUM_SAMPLES / (2 * sample_rate_hz)
+        self.write(f"TIMebase:POSition {position}")
         print("sample rate", sample_rate_hz)
-        self.setup_segmented_mode(
-            segments=segments
-        )
         self.set_trigger_edge(level=100e-3)
 
         self.write("SINGle")
@@ -217,6 +257,9 @@ class RTB2004:
         self.save_segments(segments, ch, path=path, name=name)
         self.save_timetable(ch, path, name)
         self.save_metadata(ch, path, name, sample_rate_hz)
+
+        window_end_s = start_s + self.NUM_SAMPLES / sample_rate_hz
+        return sample_rate_hz, start_s, window_end_s
 
     def save_available_segments(self, ch=1, path="./data", name="waveform", max_segments=None):
         """
@@ -299,7 +342,7 @@ class RTB2004:
         self.write("FORMat REAL")
         self.write(f"CHANnel{ch}:DATA:POINts MAX")
 
-        NUM_SAMPLES = 10000
+        NUM_SAMPLES = self.NUM_SAMPLES
 
         t0 = time.perf_counter()
         all_segments = np.empty((segments, NUM_SAMPLES), dtype=np.float32)
