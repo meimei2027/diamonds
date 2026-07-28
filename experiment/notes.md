@@ -336,6 +336,31 @@ See `CLAUDE.md` for the full investigation history behind each of these.
   way (a known-frequency signal's FFT peak, or just compare against
   whatever rate every non-salvaged run in the same session used) before
   trusting it.
+- **Same `VI_ERROR_TMO` also happens with no interlock trip at all, during
+  history readout (`save_segments()`'s per-segment `read_segment()` loop),
+  not during acquisition** -- confirmed on a `first.npy` run at a 10 Hz
+  trigger (1000 segments = ~100s to actually trigger): the salvage step
+  recovered "1000 of 1000 requested segments", meaning all 1000 had already
+  finished triggering and were sitting in the scope's history buffer before
+  the connection died reading them out. So this isn't only the
+  interlock-adjacent failure documented above -- it's a more general
+  "scope goes unresponsive reading out a long segmented history" failure,
+  with at least two different phases it can strike in (mid-acquisition vs.
+  mid-readout). Since the readout-phase case means the scope is fully idle
+  with everything already captured (not still busy mid-acquisition), it
+  doesn't need the 45s wall-clock recovery wait that the mid-acquisition
+  case needed -- `acquire_segments()` now tracks whether
+  `RTB2004.run()`'s `on_acquired` callback fired before the crash and, if
+  so, salvages immediately with no wait. Also: RF drive is no longer left on
+  during any history readout window (normal post-acquisition readout, or
+  the wait-then-salvage sequence after an error) -- `RTB2004.run()` calls
+  `on_acquired()` right after triggering finishes and before readout
+  starts, and `cw_odmr.py`'s `cmd_run()` uses that (via `acquire_segments()`'s
+  `on_rf` callback) to turn RF off for the readout window and only back on
+  when a fresh acquisition attempt actually starts. Root cause of the
+  timeout itself is still not identified -- this only shortens the
+  recovery time and removes the unnecessary RF exposure, it doesn't prevent
+  the readout hang from happening.
 
 ## General
 

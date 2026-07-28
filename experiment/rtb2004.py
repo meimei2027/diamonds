@@ -189,7 +189,16 @@ class RTB2004:
         return t0_s, dt_s
 
 
-    def run(self, segments=1000, ch=1, path="./data", name="waveform", on_poll=None):
+    def run(self, segments=1000, ch=1, path="./data", name="waveform", on_poll=None,
+            on_acquired=None):
+        """
+        on_acquired(), if given, is called once triggering is done (right
+        after STOP, before the segment-by-segment history readout starts) --
+        lets a caller release anything that's only needed while actively
+        collecting (e.g. RF drive), since reading out already-captured
+        history doesn't need it anymore and the readout of many segments can
+        take just as long as the acquisition itself.
+        """
         sample_rate_hz = float(self.set_timebase(1e-7, 3e-6))
         print("sample rate", sample_rate_hz)
         self.setup_segmented_mode(
@@ -202,6 +211,8 @@ class RTB2004:
 
         self.write("STOP")
         print("acquired segments", self.get_segment_count())
+        if on_acquired is not None:
+            on_acquired()
         # if segment count not what is expected, rerun?
         self.save_segments(segments, ch, path=path, name=name)
         self.save_timetable(ch, path, name)
