@@ -6,25 +6,30 @@ Sequence per trigger (played on AWG channel 1, arb waveforms "polarize",
 
     polarize (10us)  ->  dark x N (1us each)  ->  readout (300ns)
                                                        |
-                                          (dark-time signal: fluorescence
-                                           after evolving in the dark for
-                                           N * 1us, weaker for larger N as
-                                           population relaxes out of ms=0)
+                                          (fluorescence after evolving in
+                                           the dark for N * 1us)
 
-    -> polarize (10us) -> readout (300ns)
-                              |
-                 (calibration/reference: fluorescence right after a fresh
-                  polarization, i.e. at ~zero dark time -- the "fully
-                  bright" reference to normalize the dark-time signal
-                  against)
+Sweeps N (the "dark" arb's repeat count -- total dark time = N * 1us, the
+dark arb's fixed atomic duration) log-spaced from 1us to 1ms, saving each
+point as its own `data/<N>us.npy` (+ _timetable.npy, _metadata.txt from
+RTB2004.run()) for SEGMENTS segments. Fit an exponential to fluorescence vs.
+dark time to get T1.
 
-Both readouts are captured within the same scope trace/segment. Sweeps N
-(the "dark" arb's repeat count -- total dark time = N * 1us, the dark arb's
-fixed atomic duration) log-spaced from 1us to 100us, saving each point as its
-own `data/<N>us_calib.npy` (+ _timetable.npy, _metadata.txt from
-RTB2004.run()) for 5000 segments. Fit an exponential to the dark-time signal
-(normalized by the calibration reading, segment by segment) vs. dark time to
-get T1.
+An earlier version added a second polarize+readout ("calibration") stage
+after the main readout, meant as a fresh-polarization "fully bright"
+reference to normalize the dark-time signal against. Removed -- turned out
+not to be a useful reference: the calibration readout fires ~10.3us after
+the main readout, by which point the laser has already been continuously on
+for a while (through the rest of the main readout and all of the second
+polarize segment), so it was actually measuring saturated steady-state
+fluorescence, not a comparable fresh bright transient (confirmed for real:
+the calibration trace showed no detectable pulse in the same window the
+main readout's pulse was clearly visible in -- see notes.md). Since it
+wasn't a valid reference anyway, each dark time is now just its own
+single-readout measurement -- equivalent to what run_sweep() used to get
+from only half its segments (the other half went to the now-removed
+calibration reads), hence SEGMENTS dropping from 5000 to 2500 to keep the
+same real per-point sample count.
 """
 import sys
 import time
@@ -34,11 +39,12 @@ import numpy as np
 import ks33600a
 import rtb2004
 import generate_arb
+from cw_odmr import parse_kv_args
 
 AWG_RESOURCE = "USB0::0x0957::0x5707::MY53800810::INSTR"
 SCOPE_RESOURCE = "USB0::0x0AAD::0x01D6::108904::INSTR"
 DATA_DIR = "D:\\t1"
-SEGMENTS = 5000
+SEGMENTS = 2500
 SCOPE_START_S = -0.5e-6  # passed through to RTB2004.run()'s start_s arg --
                           # where the acquired segment starts, relative to
                           # the trigger. Set from the diagnostic measurement
@@ -63,6 +69,22 @@ DIAGNOSTIC_SCALE_S = 2e-6    # ~20x coarser than the normal 1e-7, to widen
                               # pulse's own 300ns, at the cost of resolution
 DIAGNOSTIC_SEGMENTS = 100    # just enough to average out shot noise for a
                               # quick look -- not a real measurement
+
+# Falloff-diagnostic-mode-only settings -- see run_falloff_diagnostic(). A
+# constant turn-ON delay (measured by run_delay_diagnostic()) doesn't by
+# itself limit how short a meaningful dark time can be -- it's just where to
+# look for the signal. What actually matters is how fast the AOM stops
+# diffracting light once told to turn OFF, which is a different quantity
+# (same underlying acoustic-transit mechanism, but not necessarily the same
+# number). This diagnostic measures that instead.
+FALLOFF_DIAGNOSTIC_START_S = -2e-6  # a bit before turn-off, to see the
+                                     # steady bright level for reference
+FALLOFF_DIAGNOSTIC_OFF_US = 80      # total off-period length (repeat_count,
+                                     # in us) -- must comfortably exceed the
+                                     # ~32us window DIAGNOSTIC_SCALE_S gives,
+                                     # or the sequence loops back to
+                                     # "polarize" (turns back on) before the
+                                     # decay is fully captured
 
 
 def build_block_descriptor(sequence_name, segments):
@@ -127,8 +149,13 @@ def setup_awg_waveforms(awg):
 
 def upload_sequence(awg, dark_repeat_count, sequence_name="test"):
     """
-    Build and upload a sequence with the given dark-segment repeat count --
-    total dark time = dark_repeat_count * DARK_UNIT_S.
+    Build and upload a polarize -> dark -> readout sequence with the given
+    dark-segment repeat count -- total dark time = dark_repeat_count *
+    DARK_UNIT_S. Used by both run_sweep() and run_delay_diagnostic() --
+    there's no separate calibration stage to make them differ (see the
+    module docstring for why that was removed), so a single readout per
+    loop means every captured segment is unambiguously that one pulse, no
+    classification needed.
 
     sequence_name must be UNIQUE per distinct dark_repeat_count used within
     a single AWG session/connection -- re-uploading DATA:SEQ under a name
@@ -138,47 +165,38 @@ def upload_sequence(awg, dark_repeat_count, sequence_name="test"):
     matching only the first (1us) upload -- later "DATA:SEQ" calls silently
     had no effect. See notes.md. run_sweep() passes a name derived from the
     dark time to avoid this.
-
-    Both readout segments use the same "highAtStart" marker, so the scope's
-    EXT TRIG can't tell them apart -- fine for run_sweep() (both readouts
-    are captured, whichever it triggers on, and are told apart afterward by
-    their position within each segment's trace), but NOT fine for the
-    single-readout delay diagnostic -- see upload_diagnostic_sequence().
     """
     block = build_block_descriptor(sequence_name, [
         ["polarize", "1", "once", "lowAtStart", 10],
         ["dark", str(dark_repeat_count), "repeat", "lowAtStart", 10],
-        ["readout", "1", "once", "highAtStart", 10],
-        ["polarize", "1", "once", "lowAtStart", 10],  # calibration measurement
         ["readout", "1", "once", "highAtStart", 10],
     ])
     awg.write(f"DATA:SEQ {block}")
 
 
-def upload_diagnostic_sequence(awg, dark_repeat_count, sequence_name="test_diagnostic"):
+def upload_falloff_diagnostic_sequence(awg, off_duration_us, sequence_name="test_falloff"):
     """
-    Simplified sequence for run_delay_diagnostic() only: polarize -> dark ->
-    readout, with NO second polarize+readout ("calibration") stage.
+    Build and upload a polarize -> dark sequence for run_falloff_diagnostic()
+    -- polarize (bright, 10us) then dark (off_duration_us total, OFF), with
+    the scope's trigger marker on the polarize->dark TRANSITION (t=0 = the
+    AOM/RF drive told to turn off) rather than on a readout. Measures how
+    long fluorescence actually takes to decay to baseline after turn-off --
+    see FALLOFF_DIAGNOSTIC_START_S's comment / the conversation this was
+    added for.
 
-    upload_sequence()'s full 5-part sequence has two readout events per
-    loop, both marked "highAtStart" -- the scope's EXT TRIG can't
-    distinguish which one it's capturing, and a real diagnostic capture's
-    timetable showed a perfectly uniform inter-trigger spacing that doesn't
-    match either "always the same readout" or "evenly alternating between
-    both" (see notes.md), so it's genuinely unclear which pulse(s) that data
-    represented. This sequence has only one readout, so every captured
-    segment is unambiguously that same pulse -- there's nothing else it
-    could be.
-
-    See upload_sequence()'s docstring re: sequence_name needing to be
-    unique per distinct dark_repeat_count -- not an issue for the
-    diagnostic today since it's only ever called once per AWG connection,
-    but named explicitly here to avoid colliding with run_sweep()'s "test".
+    The first 1us of the off period gets its own "once" segment carrying
+    the "highAtStart" marker (mirrors how "readout" carries the marker in
+    upload_sequence()) so the trigger fires exactly once per loop, right at
+    turn-off; the rest of the off period is additional "repeat" dark
+    segments with no marker, just extending how long the AOM stays off so
+    the sequence doesn't loop back to "polarize" (turn back on) before the
+    decay is fully captured.
     """
+    off_duration_us = int(off_duration_us)
     block = build_block_descriptor(sequence_name, [
         ["polarize", "1", "once", "lowAtStart", 10],
-        ["dark", str(dark_repeat_count), "repeat", "lowAtStart", 10],
-        ["readout", "1", "once", "highAtStart", 10],
+        ["dark", "1", "once", "highAtStart", 10],
+        ["dark", str(max(off_duration_us - 1, 1)), "repeat", "lowAtStart", 10],
     ])
     awg.write(f"DATA:SEQ {block}")
 
@@ -206,7 +224,7 @@ def run_sweep(dark_times_us, segments=SEGMENTS):
 
     try:
         for i, dark_time_us in enumerate(dark_times_us):
-            label = f"{dark_time_us}us_calib"
+            label = f"{dark_time_us}us"
             sequence_name = f"test_{dark_time_us}us"
             print(f"[t1_test] point {i + 1}/{len(dark_times_us)}: "
                   f"dark time = {dark_time_us} us -- saving as '{label}'")
@@ -239,15 +257,9 @@ def run_delay_diagnostic():
     this measurement, we're only locating where the readout pulse's optical
     response lands relative to its own trigger edge, not measuring T1.
 
-    Uses upload_diagnostic_sequence() (polarize -> dark -> readout, no
-    calibration stage) rather than the normal upload_sequence() -- the
-    normal sequence has two identically-marked readout events per loop, so
-    the scope's EXT TRIG can't tell which one it's capturing on any given
-    segment (confirmed for real: a capture using the normal sequence showed
-    a perfectly uniform inter-trigger spacing that doesn't match either
-    "always the same readout" or "evenly alternating between both" -- see
-    notes.md). With only one readout in the sequence, every captured
-    segment is unambiguously that same pulse.
+    Uses the same upload_sequence() as run_sweep() (a single readout per
+    loop, no calibration stage -- see the module docstring), so every
+    captured segment is unambiguously that one pulse.
 
     Saves data/diagnostic_delay.npy (+ _timetable.npy, _metadata.txt), and
     prints the exact window captured (start/end relative to the trigger).
@@ -262,7 +274,7 @@ def run_delay_diagnostic():
     print("[t1_test] configuring AWG")
     awg = ks33600a.KS33600A(AWG_RESOURCE, debug=True)
     setup_awg_waveforms(awg)
-    upload_diagnostic_sequence(awg, dark_repeat_count=1)
+    upload_sequence(awg, dark_repeat_count=1, sequence_name="test_diagnostic")
     setup_awg_output(awg)
     time.sleep(1.0)
 
@@ -290,15 +302,90 @@ def run_delay_diagnostic():
     print("[t1_test] diagnostic done")
 
 
+def run_falloff_diagnostic():
+    """
+    Capture a WIDE window around the polarize->dark TRANSITION (t=0 = the
+    AWG marker edge at the moment the RF drive to the AOM stops) to see how
+    long the fluorescence signal actually takes to decay to baseline
+    afterward -- the complementary measurement to run_delay_diagnostic()'s
+    turn-ON delay.
+
+    Why this, and not just the turn-on delay: a constant turn-on delay
+    doesn't by itself limit how short a meaningful dark time can be, it just
+    says where to look for the signal. What actually limits the shortest
+    meaningful dark time is how fast the AOM stops diffracting light once
+    told to turn off -- a dark period shorter than that turn-off transient
+    wouldn't actually be dark, regardless of anything about the readout
+    timing (see the conversation this was added for / notes.md).
+
+    Uses upload_falloff_diagnostic_sequence() -- polarize (bright) -> dark
+    (long enough to not loop back to polarize before the decay is fully
+    captured), triggered on the polarize->dark transition itself rather
+    than on a readout.
+
+    Saves data/diagnostic_falloff.npy (+ _timetable.npy, _metadata.txt), and
+    prints the exact window captured (start/end relative to the
+    transition). Look at the averaged trace afterward to find how long
+    after t=0 the signal actually settles back to (dark) baseline -- that's
+    the real minimum meaningful dark time, not anything derived from the
+    turn-on delay.
+    """
+    print("[t1_test] FALLOFF DIAGNOSTIC MODE: wide capture around the turn-off "
+          "transition, to measure how fast fluorescence decays after the AOM "
+          "is told to turn off -- not a T1 measurement")
+
+    print("[t1_test] configuring AWG")
+    awg = ks33600a.KS33600A(AWG_RESOURCE, debug=True)
+    setup_awg_waveforms(awg)
+    upload_falloff_diagnostic_sequence(awg, off_duration_us=FALLOFF_DIAGNOSTIC_OFF_US)
+    setup_awg_output(awg, sequence_name="test_falloff")
+    time.sleep(1.0)
+
+    print("[t1_test] connecting to scope")
+    scope = rtb2004.RTB2004(SCOPE_RESOURCE, timeout=100000, debug=True)
+
+    try:
+        sample_rate_hz, window_start_s, window_end_s = scope.run(
+            segments=DIAGNOSTIC_SEGMENTS, path=DATA_DIR, name="diagnostic_falloff",
+            start_s=FALLOFF_DIAGNOSTIC_START_S, scale_s=DIAGNOSTIC_SCALE_S,
+        )
+        print(f"[t1_test] captured {DATA_DIR}/diagnostic_falloff.npy: window "
+              f"{window_start_s*1e6:+.2f} us to {window_end_s*1e6:+.2f} us "
+              f"relative to the turn-off transition "
+              f"({(window_end_s - window_start_s)*1e6:.2f} us wide, "
+              f"{sample_rate_hz/1e9:.4f} GSa/s, {DIAGNOSTIC_SEGMENTS} segments)")
+        print("[t1_test] next: average the segments and find how long after "
+              "t=0 the signal actually settles back to (dark) baseline -- "
+              "that's the shortest dark time that's still meaningfully dark.")
+    finally:
+        scope.close()
+        awg.close()
+
+    print("[t1_test] falloff diagnostic done")
+
+
 def main():
     if len(sys.argv) > 1 and sys.argv[1] == "diagnostic":
         run_delay_diagnostic()
+    elif len(sys.argv) > 1 and sys.argv[1] == "falloff":
+        run_falloff_diagnostic()
     else:
-        # Optional segment-count override, e.g. `python t1_test.py 100` for
-        # a quick end-to-end check across all dark times before committing
-        # to the full SEGMENTS=5000 sweep.
-        segments = int(sys.argv[1]) if len(sys.argv) > 1 else SEGMENTS
-        run_sweep(dark_time_sweep_us(1, 100, num=14), segments=segments)
+        # e.g. `python t1_test.py segments=100` for a quick end-to-end check
+        # before committing to the full SEGMENTS=2500 sweep, or
+        # `python t1_test.py start_after_us=8` to resume a sweep partway
+        # through (skips every dark time <= 8us -- useful if earlier points
+        # already completed and you don't want to redo them).
+        kv = parse_kv_args(sys.argv[1:])
+        segments = int(kv.get("segments", SEGMENTS))
+        start_after_us = float(kv.get("start_after_us", 0))
+
+        dark_times_us = dark_time_sweep_us(1, 1000, num=30)
+        dark_times_us = dark_times_us[dark_times_us > start_after_us]
+        if len(dark_times_us) == 0:
+            raise SystemExit(f"start_after_us={start_after_us} excludes every dark time "
+                              f"in the sweep -- nothing to do")
+
+        run_sweep(dark_times_us, segments=segments)
 
 
 if __name__ == "__main__":
