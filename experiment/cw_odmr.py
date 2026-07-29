@@ -35,6 +35,44 @@ Usage:
           awg_trigger_freq_hz=10.0  AWG CH2 trigger frequency (into scope EXT TRIG)
           awg_trigger_vpp=2.0      AWG CH2 amplitude
 
+    python cw_odmr.py run_spectrum <file_name> [key=value ...]
+        Like `run`, but instead of acquiring many segments at a single fixed
+        resonance frequency, steps across the resonance's FWHM in fine
+        frequency increments, collecting a small number of segments at EACH
+        frequency (generator power held constant throughout) -- a frequency-
+        resolved dataset instead of a long time-domain acquisition at one
+        point. Safety is checked inline once per frequency point (reflected
+        power at the CURRENT frequency, right before acquiring there) rather
+        than via `run`'s background-thread interlock at one fixed frequency,
+        since that design doesn't apply when the frequency itself keeps
+        changing. Saves data/<file_name>/<file_name>_resonance_coarse.csv /
+        _fine.csv (from the resonance sweep, same as `run`), plus
+        data/<file_name>/<file_name>_spectrum.npy (shape (num_freq_points,
+        segments_per_point, 10000)), _spectrum_freqs_hz.npy,
+        _spectrum_reflected_dbm.npy, _spectrum_metadata.txt.
+
+        Recognized key=value overrides (all optional):
+          res_start_hz=2e9       resonance sweep start frequency
+          res_stop_hz=3e9        resonance sweep stop frequency
+          coarse_step_hz=6.7e6   coarse sweep step (track the expected FWHM -- notes.md)
+          fine_span_hz=20e6      fine sweep span around the coarse dip
+          fine_step_hz=50e3      fine sweep step
+          res_power_dbm=-40.0    drive power during the resonance sweep
+          drive_power_dbm=0.0    (constant) drive power during the spectrum scan
+          threshold_dbm=-10.0    interlock trip threshold, in dBm
+          freq_step_hz=10e3      frequency step across the FWHM
+          segments_per_point=10  scope segments captured at each frequency
+          fwhm_margin=1.0        scan span = FWHM * this margin
+          settle_s=0.05          settle time after each frequency change --
+                                 NEVER set to 0, see frequency_sweep()'s
+                                 docstring in hp8673h.py
+          awg_carrier_freq_hz=80e6  AWG CH1 carrier frequency (into scope Channel 1)
+          awg_carrier_vpp=0.632     AWG CH1 amplitude
+          awg_trigger_freq_hz=10.0  AWG CH2 trigger frequency (into scope EXT TRIG)
+          awg_trigger_vpp=2.0      AWG CH2 amplitude
+
+        NOT YET TESTED against real hardware.
+
     python cw_odmr.py run_background <file_name> [segments=1000]
         Background/baseline measurement: no resonance sweep, no microwave at
         all -- explicitly forces RF off first, then just acquires segments
@@ -59,6 +97,7 @@ import sys
 import time
 import threading
 
+import numpy as np
 import pyvisa
 
 from hp8673h import HP8673H
@@ -445,6 +484,201 @@ def cmd_run(file_name, **kw):
         print("[cw_odmr] done")
 
 
+def cmd_run_spectrum(file_name, **kw):
+    """
+    Like cmd_run(), but instead of acquiring many segments at a single fixed
+    resonance frequency, steps across the resonance's FWHM in fine frequency
+    increments, collecting a small number of segments at EACH frequency (the
+    generator's power held constant throughout) -- builds a frequency-
+    resolved dataset instead of a long time-domain acquisition at one point.
+
+    Safety: unlike cmd_run()'s monitor_interlock() (a background thread
+    watching reflected power at one FIXED frequency, which doesn't make
+    sense here since the operating frequency keeps changing), this reads
+    reflected power at the CURRENT frequency inline, once per point, right
+    before acquiring there -- reusing the same HP8673H.read_reflected_power_
+    dbm()/trip_interlock() primitives monitor_interlock() itself is built
+    from. On trip (or if the analyzer can't be reached), stops immediately
+    and saves whatever points were completed so far rather than the full
+    requested span.
+
+    NOT YET TESTED against real hardware.
+    """
+    res_start_hz = float(kw.get("res_start_hz", 2.0e9))
+    res_stop_hz = float(kw.get("res_stop_hz", 3.0e9))
+    coarse_step_hz = float(kw.get("coarse_step_hz", 6.7e6))
+    fine_span_hz = float(kw.get("fine_span_hz", 20e6))
+    fine_step_hz = float(kw.get("fine_step_hz", 50e3))
+    res_power_dbm = float(kw.get("res_power_dbm", -40.0))
+    drive_power_dbm = float(kw.get("drive_power_dbm", 0.0))
+    threshold_dbm = float(kw.get("threshold_dbm", -10.0))
+    freq_step_hz = float(kw.get("freq_step_hz", 10e3))
+    segments_per_point = int(kw.get("segments_per_point", 10))
+    fwhm_margin = float(kw.get("fwhm_margin", 1.0))
+    settle_s = float(kw.get("settle_s", 0.05))  # NEVER 0 -- see frequency_sweep()'s
+                                                  # docstring in hp8673h.py for the
+                                                  # race-condition bug a 0 default
+                                                  # caused there
+    awg_carrier_freq_hz = float(kw.get("awg_carrier_freq_hz", 80e6))
+    awg_carrier_vpp = float(kw.get("awg_carrier_vpp", 0.632))
+    awg_trigger_freq_hz = float(kw.get("awg_trigger_freq_hz", 10.0))
+    awg_trigger_vpp = float(kw.get("awg_trigger_vpp", 2.0))
+
+    run_path = f"{DATA_DIR}/{file_name}"
+    os.makedirs(run_path, exist_ok=True)
+    log_dir = f"{DATA_DIR}/logs"
+    os.makedirs(log_dir, exist_ok=True)
+    log_path = f"{log_dir}/{file_name}_spectrum.txt"
+
+    with _tee_stdout(log_path):
+        print("[cw_odmr] step 1/5: configuring AWG")
+        setup_awg(awg_carrier_freq_hz, awg_carrier_vpp, awg_trigger_freq_hz, awg_trigger_vpp)
+        print("[cw_odmr] step 1/5 done")
+
+        print("[cw_odmr] step 2/5: connecting to HP8673H + E4403B")
+        gen = HP8673H(GEN_RESOURCE)
+        sa = None
+        scope = None
+        try:
+            sa = E4403B(SA_RESOURCE)
+            print("[cw_odmr] step 2/5 done")
+
+            print(f"[cw_odmr] step 3/5: sweeping for resonance "
+                  f"({res_start_hz/1e9:.4f}-{res_stop_hz/1e9:.4f} GHz, {res_power_dbm} dBm)")
+            result = gen.resonance_sweep(
+                sa, res_start_hz, res_stop_hz, coarse_step_hz, fine_span_hz, fine_step_hz,
+                res_power_dbm, output_prefix=f"{run_path}/{file_name}_resonance",
+            )
+            f0_hz = result["f0_hz"]
+            fwhm_hz = result["fwhm_hz"]
+            print(f"[cw_odmr] step 3/5 done: f0 = {f0_hz/1e9:.5f} GHz, "
+                  f"FWHM = {fwhm_hz/1e6:.3f} MHz, Q ~= {result['Q']:.0f}")
+
+            span_hz = fwhm_hz * fwhm_margin
+            freqs_hz = np.arange(f0_hz - span_hz / 2, f0_hz + span_hz / 2 + freq_step_hz / 2,
+                                  freq_step_hz)
+            est_bytes = len(freqs_hz) * segments_per_point * RTB2004.NUM_SAMPLES * 4
+            print(f"[cw_odmr] step 4/5: spectrum scan {freqs_hz[0]/1e9:.5f}-"
+                  f"{freqs_hz[-1]/1e9:.5f} GHz ({len(freqs_hz)} points, {freq_step_hz/1e3:.1f} "
+                  f"kHz step), {segments_per_point} segments/point, drive {drive_power_dbm} dBm, "
+                  f"threshold {threshold_dbm} dBm, estimated size {est_bytes/1e6:.0f} MB")
+
+            # HP8673H.read_reflected_power_dbm() opens its own SA reads on
+            # the same resource used here -- release this connection first
+            # so they don't fight over the same GPIB address (same reasoning
+            # as cmd_run() releasing `sa` before monitor_interlock() starts).
+            sa.go_to_local()
+            sa.close()
+            sa = None
+
+            gen.preset()
+            gen.set_power_dbm(drive_power_dbm)
+            gen.rf_on()
+            time.sleep(1.0)  # let the initial frequency/level settle before scanning
+
+            ilock_sa = HP8673H.try_connect_analyzer(SA_RESOURCE)
+            if ilock_sa is None:
+                gen.trip_interlock("spectrum analyzer not reachable at startup")
+                return
+
+            scope = RTB2004(SCOPE_RESOURCE, timeout=100000)
+            combined = np.empty((len(freqs_hz), segments_per_point, RTB2004.NUM_SAMPLES),
+                                 dtype=np.float32)
+            reflected_dbm_arr = np.full(len(freqs_hz), np.nan)
+            sample_rate_hz = None
+            t0_s = None
+            n_completed = 0
+            point_start_time = None
+
+            try:
+                for i, f in enumerate(freqs_hz):
+                    if i == 0:
+                        point_start_time = time.perf_counter()
+
+                    gen.set_frequency_hz(f)
+                    time.sleep(settle_s)
+
+                    reflected_dbm = HP8673H.read_reflected_power_dbm(ilock_sa, f)
+                    reflected_dbm_arr[i] = reflected_dbm if reflected_dbm is not None else np.nan
+
+                    if reflected_dbm is None or reflected_dbm > threshold_dbm:
+                        reason = (
+                            "spectrum analyzer unreachable"
+                            if reflected_dbm is None else
+                            f"reflected power {reflected_dbm:.2f} dBm exceeds threshold "
+                            f"{threshold_dbm} dBm"
+                        )
+                        gen.trip_interlock(f"{reason} at {f/1e9:.5f} GHz "
+                                           f"(point {i + 1}/{len(freqs_hz)})")
+                        break
+
+                    segs, sample_rate_hz, t0_s = scope.acquire_segments_to_memory(
+                        segments=segments_per_point, ch=1,
+                    )
+                    combined[i] = segs
+                    n_completed = i + 1
+
+                    # segments_per_point full triggers are needed per point,
+                    # at whatever rate awg_trigger_freq_hz drives CH2 -- e.g.
+                    # at the default 10Hz, 10 segments takes >=1s of just
+                    # waiting for triggers, on top of per-point SCPI/readout
+                    # overhead, so a fine sweep across a wide span can easily
+                    # take tens of minutes. Print every point (not just every
+                    # N) so this doesn't look hung, plus an ETA after the
+                    # first point.
+                    if n_completed == 1:
+                        eta_s = (time.perf_counter() - point_start_time) * len(freqs_hz)
+                        print(f"[cw_odmr] first point took "
+                              f"{time.perf_counter() - point_start_time:.2f}s -- "
+                              f"ETA for all {len(freqs_hz)} points: {eta_s/60:.1f} min "
+                              f"(increase awg_trigger_freq_hz for a faster scan, since "
+                              f"segments_per_point full triggers are needed per point)")
+                    print(f"[cw_odmr] spectrum point {n_completed}/{len(freqs_hz)}: "
+                          f"f={f/1e9:.5f} GHz, reflected={reflected_dbm:.2f} dBm")
+            finally:
+                ilock_sa.close()
+
+            tripped = n_completed < len(freqs_hz)
+            combined = combined[:n_completed]
+            freqs_hz = freqs_hz[:n_completed]
+            reflected_dbm_arr = reflected_dbm_arr[:n_completed]
+
+            if n_completed == 0:
+                print("[cw_odmr] step 4/5 FAILED: no points completed -- nothing to save")
+            else:
+                np.save(f"{run_path}/{file_name}_spectrum.npy", combined)
+                np.save(f"{run_path}/{file_name}_spectrum_freqs_hz.npy", freqs_hz)
+                np.save(f"{run_path}/{file_name}_spectrum_reflected_dbm.npy", reflected_dbm_arr)
+                scope.save_metadata(ch=1, path=run_path, name=f"{file_name}_spectrum",
+                                     sample_rate_hz=sample_rate_hz)
+                print(f"[cw_odmr] step 4/5 done{' (PARTIAL -- interlock tripped)' if tripped else ''}: "
+                      f"saved {run_path}/{file_name}_spectrum.npy "
+                      f"({n_completed} of {len(freqs_hz) + (0 if not tripped else 1)} points), "
+                      f"_spectrum_freqs_hz.npy, _spectrum_reflected_dbm.npy, "
+                      f"_spectrum_metadata.txt")
+        finally:
+            print("[cw_odmr] step 5/5: shutting down")
+            try:
+                gen.rf_off()
+            except Exception as e:
+                print(f"[cw_odmr] WARNING: failed to turn off RF cleanly ({e})")
+            try:
+                gen.go_to_local()
+            except Exception:
+                pass
+            gen.close()
+            if sa is not None:
+                try:
+                    sa.go_to_local()
+                except Exception:
+                    pass
+                sa.close()
+            if scope is not None:
+                scope.close()
+
+    print("[cw_odmr] done")
+
+
 def cmd_run_background(file_name, **kw):
     segments = int(kw.get("segments", 1000))
     awg_carrier_freq_hz = float(kw.get("awg_carrier_freq_hz", 80e6))
@@ -497,11 +731,14 @@ def main():
         cmd_vna(file_name)
     elif command == "run":
         cmd_run(file_name, **extra)
+    elif command == "run_spectrum":
+        cmd_run_spectrum(file_name, **extra)
     elif command == "run_background":
         cmd_run_background(file_name, **extra)
     else:
         raise SystemExit(
-            f"unknown command {command!r} (expected 'vna', 'run', or 'run_background')"
+            f"unknown command {command!r} (expected 'vna', 'run', 'run_spectrum', "
+            f"or 'run_background')"
         )
 
 

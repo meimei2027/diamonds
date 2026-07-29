@@ -131,8 +131,8 @@ def setup_awg_waveforms(awg):
         t = np.arange(n) / fs
         return t, np.zeros(n, dtype=np.float32)
 
-    t_polarization, ch_polarization = rf(77e6, 10e-6)
-    t_readout, ch_readout = rf(77e6, 300e-9)
+    t_polarization, ch_polarization = rf(80e6, 10e-6)
+    t_readout, ch_readout = rf(80e6, 300e-9)
     t_dark, ch_dark = zeros(DARK_UNIT_S)
 
     generate_arb.write_csv("waveforms/polarization.csv", t_polarization, ch_polarization)
@@ -211,7 +211,14 @@ def setup_awg_output(awg, sequence_name="test"):
     awg.write("TRIG1:SOUR IMM")
 
 
-def run_sweep(dark_times_us, segments=SEGMENTS):
+def run_sweep(dark_times_us, segments=SEGMENTS, label_suffix=""):
+    """
+    label_suffix is appended to each point's filename (f"{dark_time_us}us
+    {label_suffix}") -- lets you re-measure a dark time you already have
+    data for (e.g. to confirm nothing changed after touching the physical
+    setup) without silently overwriting the original file. Defaults to ""
+    (the normal sweep naming) for backward compatibility.
+    """
     print(f"[t1_test] dark time sweep: {list(dark_times_us)} us "
           f"({len(dark_times_us)} points, {segments} segments each)")
 
@@ -224,7 +231,7 @@ def run_sweep(dark_times_us, segments=SEGMENTS):
 
     try:
         for i, dark_time_us in enumerate(dark_times_us):
-            label = f"{dark_time_us}us"
+            label = f"{dark_time_us}us{label_suffix}"
             sequence_name = f"test_{dark_time_us}us"
             print(f"[t1_test] point {i + 1}/{len(dark_times_us)}: "
                   f"dark time = {dark_time_us} us -- saving as '{label}'")
@@ -367,25 +374,47 @@ def run_falloff_diagnostic():
 def main():
     if len(sys.argv) > 1 and sys.argv[1] == "diagnostic":
         run_delay_diagnostic()
-    elif len(sys.argv) > 1 and sys.argv[1] == "falloff":
+        return
+
+    if len(sys.argv) > 1 and sys.argv[1] == "falloff":
         run_falloff_diagnostic()
-    else:
-        # e.g. `python t1_test.py segments=100` for a quick end-to-end check
-        # before committing to the full SEGMENTS=2500 sweep, or
-        # `python t1_test.py start_after_us=8` to resume a sweep partway
-        # through (skips every dark time <= 8us -- useful if earlier points
-        # already completed and you don't want to redo them).
-        kv = parse_kv_args(sys.argv[1:])
-        segments = int(kv.get("segments", SEGMENTS))
-        start_after_us = float(kv.get("start_after_us", 0))
+        return
 
-        dark_times_us = dark_time_sweep_us(1, 1000, num=30)
-        dark_times_us = dark_times_us[dark_times_us > start_after_us]
-        if len(dark_times_us) == 0:
-            raise SystemExit(f"start_after_us={start_after_us} excludes every dark time "
-                              f"in the sweep -- nothing to do")
+    kv = parse_kv_args(sys.argv[1:])
+    segments = int(kv.get("segments", SEGMENTS))
 
-        run_sweep(dark_times_us, segments=segments)
+    if "point_us" in kv:
+        # e.g. `python t1_test.py point_us=92` to re-measure a single dark
+        # time you already have data for -- to confirm nothing changed after
+        # touching the physical setup, without silently overwriting the
+        # original file. Defaults to saving as "<point_us>us_check"; pass
+        # label=<suffix> for a different name, e.g. label=recheck2 saves as
+        # "<point_us>us_recheck2".
+        point_us = int(float(kv["point_us"]))
+        label_suffix = "_" + str(kv.get("label", "check"))
+        run_sweep([point_us], segments=segments, label_suffix=label_suffix)
+        return
+
+    # e.g. `python t1_test.py segments=100` for a quick end-to-end check
+    # before committing to the full SEGMENTS=2500 sweep, or
+    # `python t1_test.py start_after_us=8` to resume a sweep partway through
+    # (skips every dark time <= 8us -- useful if earlier points already
+    # completed and you don't want to redo them), or
+    # `python t1_test.py start_us=1000 stop_us=10000 num=5` to sweep a
+    # different range entirely (e.g. extending past the default 1ms ceiling
+    # to look for real T1 decay further out).
+    start_after_us = float(kv.get("start_after_us", 0))
+    sweep_start_us = float(kv.get("start_us", 1))
+    sweep_stop_us = float(kv.get("stop_us", 1000))
+    sweep_num = int(kv.get("num", 30))
+
+    dark_times_us = dark_time_sweep_us(sweep_start_us, sweep_stop_us, num=sweep_num)
+    dark_times_us = dark_times_us[dark_times_us > start_after_us]
+    if len(dark_times_us) == 0:
+        raise SystemExit(f"start_after_us={start_after_us} excludes every dark time "
+                          f"in the sweep -- nothing to do")
+
+    run_sweep(dark_times_us, segments=segments)
 
 
 if __name__ == "__main__":

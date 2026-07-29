@@ -261,6 +261,48 @@ class RTB2004:
         window_end_s = start_s + self.NUM_SAMPLES / sample_rate_hz
         return sample_rate_hz, start_s, window_end_s
 
+    def acquire_segments_to_memory(self, segments=10, ch=1, start_s=1e-6, scale_s=1e-7):
+        """
+        Like run(), but returns the raw segment array in memory instead of
+        saving it to disk -- for building up ONE combined dataset across
+        many quick repeated acquisitions (e.g. one call per frequency point
+        in a spectrum scan) without creating a separate file per call.
+
+        Duplicates run()'s acquisition setup rather than calling it, since
+        run() always saves to disk as its last step -- kept as a separate
+        method instead of adding a "don't save" flag to run(), to avoid
+        touching that already-relied-upon method's behavior.
+
+        Returns (segments_array, sample_rate_hz, t0_s) -- segments_array has
+        shape (segments, NUM_SAMPLES). t0_s is read from the same
+        authoritative CHANnel<n>:DATA:XORigin? source save_metadata() uses,
+        so a caller doing many calls in a row (same start_s/scale_s each
+        time) can just use the LAST call's (sample_rate_hz, t0_s) to build a
+        shared time axis for the whole combined dataset.
+        """
+        self.write(f"TIMebase:SCALe {scale_s}")
+        self.setup_segmented_mode(segments=segments)
+        sample_rate_hz = float(self.query("ACQuire:SRATe?"))
+
+        position = start_s + self.NUM_SAMPLES / (2 * sample_rate_hz)
+        self.write(f"TIMebase:POSition {position}")
+        self.set_trigger_edge(level=100e-3)
+
+        self.write("SINGle")
+        self.wait_for_acquisition(segments)
+        self.write("STOP")
+
+        self.write(f"EXPort:WAVeform:SOURce CH{ch}")
+        self.write("FORMat REAL")
+        self.write(f"CHANnel{ch}:DATA:POINts MAX")
+
+        all_segments = np.empty((segments, self.NUM_SAMPLES), dtype=np.float32)
+        for i in range(segments):
+            all_segments[i] = self.read_segment(i + 1, ch=ch)
+
+        t0_s, _dt_s = self.get_time_origin(ch)
+        return all_segments, sample_rate_hz, t0_s
+
     def save_available_segments(self, ch=1, path="./data", name="waveform", max_segments=None):
         """
         Read out and save whatever segments are currently sitting in the
