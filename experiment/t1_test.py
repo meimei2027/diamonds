@@ -211,6 +211,11 @@ def setup_awg_output(awg, sequence_name="test"):
     awg.write("TRIG1:SOUR IMM")
 
 
+RESEQUENCE_INTERVAL = 20  # see run_sweep() -- reset the AWG this often to clear
+                           # out accumulated DATA:SEQ sequences before hitting
+                           # its "too many sequences defined" limit
+
+
 def run_sweep(dark_times_us, segments=SEGMENTS, label_suffix=""):
     """
     label_suffix is appended to each point's filename (f"{dark_time_us}us
@@ -218,6 +223,22 @@ def run_sweep(dark_times_us, segments=SEGMENTS, label_suffix=""):
     data for (e.g. to confirm nothing changed after touching the physical
     setup) without silently overwriting the original file. Defaults to ""
     (the normal sweep naming) for backward compatibility.
+
+    Each point uploads its own uniquely-named DATA:SEQ sequence (see
+    upload_sequence()'s docstring -- re-using a name doesn't actually replace
+    it), and nothing ever deletes an old one, so the AWG's sequence table
+    fills up over a long sweep -- confirmed for real: a 100-point sweep hit
+    "specified arb not loaded in waveform memory, arb: too many sequences
+    defined" around its 80th point. Worse, KS33600A.write() used to only
+    print SCPI errors when debug=True and never raised, so the sweep kept
+    running after that point with the AWG silently stuck outputting whatever
+    sequence it had last successfully loaded -- every subsequent file would
+    have been mislabeled with the WRONG dark time, not just the one that
+    failed to upload. write() now raises on any SCPI error, so that failure
+    mode stops the sweep immediately instead of silently corrupting data;
+    RESEQUENCE_INTERVAL avoids hitting it at all by periodically resetting
+    the AWG (clearing its sequence table) and re-uploading the arb waveforms
+    from scratch.
     """
     print(f"[t1_test] dark time sweep: {list(dark_times_us)} us "
           f"({len(dark_times_us)} points, {segments} segments each)")
@@ -231,6 +252,14 @@ def run_sweep(dark_times_us, segments=SEGMENTS, label_suffix=""):
 
     try:
         for i, dark_time_us in enumerate(dark_times_us):
+            if i > 0 and i % RESEQUENCE_INTERVAL == 0:
+                print(f"[t1_test] point {i + 1}/{len(dark_times_us)}: resetting AWG "
+                      f"to clear its sequence table (every {RESEQUENCE_INTERVAL} points)")
+                awg.reset()
+                awg.write("SOUR1:DATA:VOL:CLE")
+                awg.write("SOUR2:DATA:VOL:CLE")
+                setup_awg_waveforms(awg)
+
             label = f"{dark_time_us}us{label_suffix}"
             sequence_name = f"test_{dark_time_us}us"
             print(f"[t1_test] point {i + 1}/{len(dark_times_us)}: "

@@ -31,8 +31,11 @@ class KS33600A:
 
     def write(self, cmd):
         self.inst.write(cmd)
-        if self.debug: 
-            print(cmd + " => " + self.inst.query("SYST:ERR?"))
+        err = self.inst.query("SYST:ERR?").strip()
+        if self.debug:
+            print(cmd + " => " + err)
+        if not err.startswith("+0,"):
+            raise RuntimeError(f"KS33600A error after {cmd!r}: {err}")
 
     def query(self, cmd):
         return self.inst.query(cmd).strip()
