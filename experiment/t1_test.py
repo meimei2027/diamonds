@@ -381,6 +381,17 @@ def main():
         return
 
     kv = parse_kv_args(sys.argv[1:])
+
+    point_us_keys = {"point_us", "segments", "label"}
+    sweep_keys = {"segments", "start_after_us", "start_us", "stop_us", "num"}
+    recognized_keys = point_us_keys if "point_us" in kv else sweep_keys
+    unrecognized = set(kv) - recognized_keys
+    if unrecognized:
+        raise SystemExit(
+            f"unrecognized argument(s) {sorted(unrecognized)} -- recognized keys are "
+            f"{sorted(recognized_keys)} (typo? e.g. 'stop_us', not 'end_us')"
+        )
+
     segments = int(kv.get("segments", SEGMENTS))
 
     if "point_us" in kv:

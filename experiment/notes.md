@@ -362,6 +362,126 @@ See `CLAUDE.md` for the full investigation history behind each of these.
   recovery time and removes the unnecessary RF exposure, it doesn't prevent
   the readout hang from happening.
 
+## T1 measurement (t1_test.py)
+
+- **`RTB2004.run()`'s `start_s` -> `TIMebase:POSition` conversion needs
+  `sample_rate_hz` queried in the SAME acquisition mode the real acquisition
+  will use, not before.** `run()` added a `scale_s` parameter (coarser than
+  the driver's long-standing default `1e-7`, for `t1_test.py`'s wide
+  diagnostic capture) -- the sample-rate query used to happen right after
+  `TIMebase:SCALe`, before `setup_segmented_mode()` switches into
+  `ACQuire:MEMory MANual` + fixed `ACQuire:POINts`. `ACQuire:SRATe?` depends
+  on that mode, not just scale -- for the old fixed `scale_s=1e-7` the early
+  query coincidentally matched (both regimes apparently give 2.5 GSa/s
+  there), but for `scale_s=2e-6` it silently returned the *normal*-mode
+  rate (still 2.5 GSa/s, unaffected by the scale change), not the real
+  manual-mode rate. Confirmed for real: a diagnostic capture's authoritative
+  `t0_s` (from live `CHANnel<n>:DATA:XORigin?`) came out to `-1.9e-5`
+  instead of the requested `-5e-6`, and the true rate (inferred from where a
+  real signal feature landed) was consistent with ~20x lower than the
+  stored 2.5 GSa/s -- i.e. `ACQuire:MEMory MANual` mode really does use a
+  different (lower) rate for the same `TIMebase:SCALe`. **Fixed**: `run()`
+  now calls `setup_segmented_mode()` *before* querying `ACQuire:SRATe?`, so
+  the query reflects the mode actually used. Re-running the same diagnostic
+  after the fix gave `sample_rate_hz=312000000.0` and `t0_s=-4.9728e-6`
+  (closely matching the requested `-5e-6`) -- self-consistent and
+  trustworthy.
+- **The AWG sequence's two `readout` segments (dark-time signal +
+  calibration) both use the `"highAtStart"` marker, so the scope's EXT TRIG
+  can't tell which one it's capturing.** Fine for `run_sweep()` (both
+  readouts land in the same captured segment's trace, told apart by
+  position within it afterward), but NOT fine for a single-readout timing
+  diagnostic. Confirmed for real: a `run_delay_diagnostic()` capture using
+  the normal 5-part sequence showed a perfectly uniform 43.2us inter-trigger
+  spacing across all 99 gaps in the timetable -- but the two readouts within
+  one loop should be ~10.3us and ~11.3us apart (alternating), so a uniform
+  43.2us (≈ 2 full loop periods) doesn't match "always the same readout"
+  (would give a uniform ~21.6us) or "evenly alternating between both"
+  either. Root cause of that specific pattern was not chased down further --
+  instead, **fixed by removing the ambiguity entirely**:
+  `upload_diagnostic_sequence()` (used only by `run_delay_diagnostic()`) is
+  a simplified polarize -> dark -> readout sequence with no calibration
+  stage, so every captured segment is unambiguously that one pulse.
+- **`SCOPE_START_S` was set too late, missing the actual readout pulse.**
+  The real diagnostic measurement (after both fixes above) found the
+  readout pulse rises at ~0.39us after the trigger and peaks around ~0.6us
+  (with a brief AC-coupling-looking undershoot around ~1.9us before
+  settling back to baseline by ~8us) -- the old default `SCOPE_START_S =
+  1e-6` opened `run_sweep()`'s 4us capture window *after* the peak had
+  already passed, missing the rise entirely. **Fixed**: changed to
+  `SCOPE_START_S = -0.5e-6`, giving a window of roughly [-0.5, 3.5]us that
+  includes a bit of pre-trigger baseline, the full rise/peak, and most of
+  the decay. Re-check with `t1_test.py diagnostic` / `t1_test.ipynb` if the
+  optical alignment or AOM changes -- the delay is a property of that
+  physical chain, not something derivable from settings alone.
+- **Re-uploading `DATA:SEQ` under an already-used sequence name does not
+  actually replace it.** `run_sweep()` originally called `upload_sequence()`
+  with the same hardcoded name `"test"` for every dark-time point in the
+  sweep loop. Confirmed for real: a 100-segment test sweep across dark times
+  1/2/3/4us produced FOUR files whose timetables all showed the identical
+  `10.3us / 11.3us` inter-trigger gap pattern -- i.e. all four actually
+  captured a 1us dark time (the first point's value), regardless of the
+  filename. The `DATA:SEQ "test",...` calls for dark=2/3/4us silently had no
+  effect; only the very first upload under a given name actually takes.
+  **Fixed**: `upload_sequence()`/`upload_diagnostic_sequence()` now take a
+  `sequence_name` parameter, and `run_sweep()` uses a unique name per point
+  (`f"test_{dark_time_us}us"`) instead of reusing `"test"` -- avoids the
+  collision entirely rather than trying to find/use a "delete existing
+  sequence" command. If you see suspiciously identical timetable gap
+  patterns across different-dark-time files again, re-check this first.
+- **The "calibration" (fresh-polarization reference) stage was removed --
+  it wasn't measuring what it was meant to.** The original sequence was
+  polarize -> dark -> readout (signal) -> polarize -> readout
+  (calibration), meant to give a "fully bright" reference to normalize the
+  dark-time signal against. Confirmed for real (`1us_calib` sweep point,
+  segments separated by the gap-alternation pattern into signal vs.
+  calibration groups): the calibration trace showed NO detectable
+  fluorescence pulse anywhere in the capture window, while the signal trace
+  right next to it showed a clear one. Root cause: the calibration readout
+  fires ~10.3us after the signal readout's trigger, by which point the
+  laser has already been continuously on (through the rest of the signal
+  readout and the whole second polarize segment) -- so it's measuring
+  saturated steady-state fluorescence after the initial bright transient
+  has already decayed, not a comparable "fresh bright" reading. (Separately,
+  the initial signal-trace analysis also had a sign-convention bug: this
+  PMT's fluorescence is NEGATIVE-going, so the true onset is a negative-
+  going crossing, not `abs(deviation)` -- the latter picked up a positive-
+  going transient instead, most likely the AOM still ramping up to full
+  diffraction efficiency rather than real fluorescence.) **Fixed**:
+  `upload_sequence()` is now just polarize -> dark -> readout, used
+  identically by both `run_sweep()` and `run_delay_diagnostic()` (which
+  used to have its own near-identical `upload_diagnostic_sequence()`, now
+  removed as redundant). Every captured segment is now unambiguously the
+  one readout -- no more gap-pattern classification needed for new sweep
+  files (still needed for old ones captured before this fix, e.g. the
+  existing `1us`/`2us`/`3us`/`4us`/`6us` files in `D:/t1`, which used the
+  old 5-part sequence). Since half of every old sweep point's segments were
+  "wasted" on the now-removed calibration reads, `SEGMENTS` dropped from
+  5000 to 2500 to keep the same real per-point sample count.
+- **A constant AOM/PMT turn-ON delay does NOT by itself limit how short a
+  meaningful dark time can be -- that was a wrong inference.** Reasoning
+  from the Keysight 33600A's datasheet: the generator's own hardware floor
+  for an arb segment is 32 samples at 1 GSa/s = 32ns, far below anything the
+  sweep currently uses (`DARK_UNIT_S=1us` = 1000 samples, a design choice,
+  not a hardware limit). But a *fixed* turn-on delay (i.e. how long after
+  the readout trigger the fluorescence appears) only says where to look for
+  the signal -- it says nothing about how short the preceding dark period
+  can meaningfully be. The actual constraint is a different quantity: how
+  fast the AOM stops diffracting light once told to turn OFF. If that
+  turn-off transient takes some finite time, a nominal dark period shorter
+  than it wouldn't actually be dark, regardless of readout timing. Added
+  `run_falloff_diagnostic()` (`python t1_test.py falloff`) to measure this
+  directly -- polarize (bright) -> dark, triggered on the polarize->dark
+  TRANSITION itself (`upload_falloff_diagnostic_sequence()`: the first 1us
+  of the off period gets its own "once" segment carrying the "highAtStart"
+  marker, mirroring how "readout" carries the marker in the normal
+  sequence, so the trigger fires exactly once per loop right at turn-off),
+  with a wide (~32us) capture window (`FALLOFF_DIAGNOSTIC_START_S=-2e-6`,
+  same `DIAGNOSTIC_SCALE_S` as the turn-on diagnostic) and a long enough
+  off period (`FALLOFF_DIAGNOSTIC_OFF_US=80`) that the sequence doesn't
+  loop back to "polarize" before the decay is fully captured. Saves
+  `data/diagnostic_falloff.npy`. Not yet run against real hardware.
+
 ## General
 
 - **Two GPIB-USB adapters share a USB hub**, causing intermittent
