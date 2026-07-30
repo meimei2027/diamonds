@@ -86,10 +86,64 @@ Usage:
         trigger/timebase settings. Same awg_* overrides as `run` are
         recognized here too.
 
+    python cw_odmr.py contrast_check <file_name> [key=value ...]
+        Direct RF-on vs. RF-off comparison at a single FIXED frequency
+        (default 2.87 GHz, the NV zero-field splitting), with many more
+        segments than a `run_spectrum` point gets -- meant to settle whether
+        a real ODMR contrast is present at all above the noise/drift floor,
+        before trusting a frequency scan to resolve it as a function of
+        detuning. Unlike `run`/`run_spectrum`, freq_hz is given directly
+        rather than derived from the microwave resonator's own reflection
+        dip -- the antenna's resonance is a different physical quantity from
+        the NV transition and can drift several MHz between setups, so this
+        sidesteps that entirely by just parking at the frequency of
+        interest.
+
+        RF-on and RF-off segments are acquired in ALTERNATING blocks
+        (block_size each) rather than one long RF-on acquisition followed by
+        one long RF-off acquisition, so slow drift affects both conditions
+        similarly instead of concentrating in whichever one is measured
+        later. Safety uses an inline reflected-power check (like
+        `run_spectrum`, not `run`'s background-thread interlock, since RF
+        isn't continuously live here) once per RF-on block.
+
+        Saves data/<file_name>/<file_name>.npy (+ _timetable.npy,
+        _metadata.txt, RF ON) and data/<file_name>/<file_name>_bg.npy (+
+        _bg_timetable.npy, _bg_metadata.txt, RF OFF) -- same naming
+        convention as `run`/`run_background`, so existing
+        background-subtraction analysis (analyze_data.ipynb) works
+        unmodified. Note the timetables here are block-level (one shared
+        timestamp per block, elapsed seconds since the run started), not a
+        true per-trigger timestamp.
+
+        Recognized key=value overrides (all optional):
+          freq_hz=2.87e9         fixed drive frequency
+          segments=2000          total scope segments for EACH of RF-on and
+                                  RF-off, spread across alternating blocks
+          block_size=100         segments per RF-on/RF-off block -- smaller
+                                  means tighter interleaving (less drift per
+                                  condition) and faster interlock response,
+                                  at the cost of more per-block overhead
+          drive_power_dbm=0.0    drive power during RF-on blocks
+          threshold_dbm=-10.0    interlock trip threshold, in dBm, checked
+                                  once per RF-on block (after it settles)
+          rf_settle_s=5.0        wait after every RF on/off transition
+                                  before checking reflected power or
+                                  acquiring -- the generator/amplifier chain
+                                  doesn't respond instantaneously
+          awg_carrier_freq_hz=80e6  AWG CH1 carrier frequency (unused if CH1
+                                     is wired to the real PMT signal, but the
+                                     AWG still needs configuring for CH2's
+                                     scope trigger)
+          awg_carrier_vpp=0.632     AWG CH1 amplitude
+          awg_trigger_freq_hz=10.0  AWG CH2 trigger frequency (into scope EXT TRIG)
+          awg_trigger_vpp=2.0      AWG CH2 amplitude
+
 Example:
     python cw_odmr.py vna baseline
     python cw_odmr.py run trial1 segments=1000
     python cw_odmr.py run_background trial1 segments=1000
+    python cw_odmr.py contrast_check contrast1 freq_hz=2.87e9 segments=2000
 """
 import contextlib
 import os
@@ -179,10 +233,25 @@ def parse_kv_args(argv):
 
 
 def acquire_segments(path, name, segments, on_poll=None, on_rf=None, max_attempts=3,
-                      retry_wait_s=45.0):
+                      retry_wait_s=45.0, trigger_freq_hz=10.0):
     """
     Run a segmented scope acquisition (RTB2004.run()), saving
     <path>/<name>.npy, _timetable.npy, _metadata.txt.
+
+    trigger_freq_hz is the AWG CH2 trigger rate actually configured for this
+    run (see setup_awg()) -- used only to size the scope's VISA timeout
+    (below), not to configure anything itself. The scope needs `segments`
+    triggers before its blocking `*OPC?` query (inside
+    RTB2004.wait_for_acquisition()) will return, which takes segments /
+    trigger_freq_hz seconds at minimum -- if that exceeds the VISA
+    connection's own read timeout, pyvisa raises a VisaIOError (VI_ERROR_TMO)
+    on that query, not the more informative Python-level TimeoutError
+    wait_for_acquisition() would otherwise raise itself. Confirmed for real:
+    a hardcoded 100000ms (100s) timeout here was fine for the 1000-segment,
+    10Hz-trigger defaults elsewhere, but a 2000-segment run at the same 10Hz
+    (needing 200s minimum) hit exactly this VI_ERROR_TMO. `* 2` below is a
+    safety margin on top of the raw minimum, plus a fixed floor so short
+    acquisitions still get a reasonable timeout for genuine scope hangs.
 
     The scope has occasionally gone unresponsive (VisaIOError) both right
     around an interlock trip and with no trip at all -- not root-caused
@@ -209,6 +278,8 @@ def acquire_segments(path, name, segments, on_poll=None, on_rf=None, max_attempt
     restarting from scratch. Only if salvage comes back empty (or fails too)
     do we retry the full acquisition from zero. See notes.md.
     """
+    scope_timeout_ms = max(100000, int(segments / trigger_freq_hz * 2 * 1000) + 20000)
+
     last_known = {"count": 0}
 
     def _wrapped_on_poll(num_segments):
@@ -231,10 +302,11 @@ def acquire_segments(path, name, segments, on_poll=None, on_rf=None, max_attempt
             acquisition_done["flag"] = True
             _set_rf(False)
 
-        scope = RTB2004(SCOPE_RESOURCE, timeout=100000)
+        scope = RTB2004(SCOPE_RESOURCE, timeout=scope_timeout_ms)
         try:
             scope.run(segments=segments, ch=1, path=path, name=name,
-                      on_poll=_wrapped_on_poll, on_acquired=_mark_acquired)
+                      on_poll=_wrapped_on_poll, on_acquired=_mark_acquired,
+                      acquisition_timeout_s=scope_timeout_ms / 1000)
             scope.close()
             return
         except pyvisa.errors.VisaIOError as e:
@@ -264,7 +336,7 @@ def acquire_segments(path, name, segments, on_poll=None, on_rf=None, max_attempt
                 time.sleep(retry_wait_s)
 
             try:
-                salvage_scope = RTB2004(SCOPE_RESOURCE, timeout=100000)
+                salvage_scope = RTB2004(SCOPE_RESOURCE, timeout=scope_timeout_ms)
                 try:
                     saved = salvage_scope.save_available_segments(
                         ch=1, path=path, name=name, max_segments=segments,
@@ -444,7 +516,8 @@ def cmd_run(file_name, **kw):
                     gen.rf_off()
 
             print(f"[cw_odmr] step 5/6: acquiring {segments} segments on the scope")
-            acquire_segments(run_path, file_name, segments, on_poll=_on_poll, on_rf=_on_rf)
+            acquire_segments(run_path, file_name, segments, on_poll=_on_poll, on_rf=_on_rf,
+                              trigger_freq_hz=awg_trigger_freq_hz)
             tripped = trip_segment["count"] is not None
             stop_event.set()
             thread.join(timeout=poll_interval_s + 5)
@@ -711,11 +784,215 @@ def cmd_run_background(file_name, **kw):
 
         print(f"[cw_odmr] step 3/4: acquiring {segments} background segments on the "
               f"scope (RF off -- no interlock needed)")
-        acquire_segments(run_path, bg_name, segments)
+        acquire_segments(run_path, bg_name, segments, trigger_freq_hz=awg_trigger_freq_hz)
         print(f"[cw_odmr] step 3/4 done: saved {run_path}/{bg_name}.npy, "
               f"{bg_name}_timetable.npy, {bg_name}_metadata.txt")
 
         print("[cw_odmr] step 4/4: done")
+
+
+def cmd_contrast_check(file_name, **kw):
+    """
+    Direct RF-on vs. RF-off comparison at a single FIXED frequency (default
+    2.87 GHz) -- see the module docstring's `contrast_check` section for the
+    motivation (settling whether a real ODMR contrast exists above the
+    noise/drift floor, independent of the microwave resonator's own
+    reflection dip, which is a different physical quantity from the NV
+    transition frequency).
+
+    RF-on and RF-off segments are acquired in ALTERNATING blocks (default
+    100 segments each) rather than one long RF-on acquisition followed by
+    one long RF-off acquisition -- the two conditions are then interleaved
+    throughout the whole run instead of separated by (potentially many
+    minutes of) wall-clock time, so the slow drift already characterized
+    elsewhere in this project affects both conditions similarly rather than
+    concentrating in whichever one happens to be measured later (which would
+    otherwise masquerade as a fake "contrast").
+
+    No resonance sweep -- freq_hz is used directly. Safety here uses the
+    same INLINE reflected-power check as run_spectrum() (read power, compare
+    to threshold_dbm), not cmd_run()'s background-thread monitor_interlock()
+    -- a continuously-running background thread doesn't make sense when RF
+    is deliberately toggled off between blocks (there's no forward power to
+    reflect while it's off, so a poll landing during an off-block would
+    misread as a fault). The check runs AFTER turning RF on and letting it
+    settle (rf_settle_s), not before -- checking beforehand would always see
+    RF still off from the previous block and never catch a real fault.
+    Response latency to a real fault is roughly
+    `rf_settle_s + block_size / awg_trigger_freq_hz` seconds (e.g. ~15s at
+    the defaults) -- shrink block_size for a tighter margin if needed.
+    rf_settle_s is also applied after every RF-off transition, before the
+    RF-off block is acquired -- the generator/amplifier chain doesn't
+    respond instantaneously to either transition.
+
+    RF-on segments are saved as <file_name>.npy (+ _timetable.npy,
+    _metadata.txt) and RF-off segments as <file_name>_bg.npy (+
+    _bg_timetable.npy, _bg_metadata.txt) -- same naming convention as
+    run()/run_background(), so this can be analyzed with the same
+    background-subtraction helpers already written for those (e.g.
+    analyze_data.ipynb's _bg_waveform_stats()). The timetables here are
+    coarser than those helpers normally see, though: every segment in a
+    block shares one timestamp (elapsed seconds since this run started,
+    measured in Python right after that block was acquired), not a true
+    per-trigger timestamp from the scope -- enough to see drift across the
+    whole alternating sequence, not to resolve timing within a block.
+    """
+    freq_hz = float(kw.get("freq_hz", 2.87e9))
+    segments = int(kw.get("segments", 2000))          # total per condition
+    block_size = int(kw.get("block_size", 100))        # segments per RF-on/RF-off block
+    drive_power_dbm = float(kw.get("drive_power_dbm", 0.0))
+    threshold_dbm = float(kw.get("threshold_dbm", -10.0))
+    rf_settle_s = float(kw.get("rf_settle_s", 5.0))  # wait after every RF on/off
+                                                       # transition before checking
+                                                       # reflected power or acquiring --
+                                                       # the generator/amplifier chain
+                                                       # doesn't respond instantaneously
+    awg_carrier_freq_hz = float(kw.get("awg_carrier_freq_hz", 80e6))
+    awg_carrier_vpp = float(kw.get("awg_carrier_vpp", 0.632))
+    awg_trigger_freq_hz = float(kw.get("awg_trigger_freq_hz", 10.0))
+    awg_trigger_vpp = float(kw.get("awg_trigger_vpp", 2.0))
+
+    run_path = f"{DATA_DIR}/{file_name}"
+    os.makedirs(run_path, exist_ok=True)
+    log_dir = f"{DATA_DIR}/logs"
+    os.makedirs(log_dir, exist_ok=True)
+    log_path = f"{log_dir}/{file_name}_contrast_check.txt"
+
+    with _tee_stdout(log_path):
+        print("[cw_odmr] step 1/4: configuring AWG")
+        setup_awg(awg_carrier_freq_hz, awg_carrier_vpp, awg_trigger_freq_hz, awg_trigger_vpp)
+        print("[cw_odmr] step 1/4 done")
+
+        print("[cw_odmr] step 2/4: connecting to HP8673H + E4403B")
+        gen = HP8673H(GEN_RESOURCE)
+        ilock_sa = None
+        scope = None
+        num_blocks = -(-segments // block_size)  # ceil
+        block_timeout_ms = max(100000, int(block_size / awg_trigger_freq_hz * 2 * 1000) + 20000)
+        on_blocks = []   # list of (segments_array, elapsed_s)
+        off_blocks = []
+        sample_rate_hz = None
+        t0_s = None
+        n_on_done = 0
+        n_off_done = 0
+        tripped = False
+        run_start_time = None
+
+        try:
+            gen.preset()
+            gen.set_frequency_hz(freq_hz)
+            gen.set_power_dbm(drive_power_dbm)
+
+            ilock_sa = HP8673H.try_connect_analyzer(SA_RESOURCE)
+            if ilock_sa is None:
+                gen.trip_interlock("spectrum analyzer not reachable at startup")
+                return
+            print("[cw_odmr] step 2/4 done")
+
+            scope = RTB2004(SCOPE_RESOURCE, timeout=block_timeout_ms)
+            print(f"[cw_odmr] step 3/4: {num_blocks} alternating blocks of {block_size} "
+                  f"segments each ({segments} total per condition) at "
+                  f"{freq_hz/1e9:.5f} GHz, drive {drive_power_dbm} dBm, "
+                  f"threshold {threshold_dbm} dBm")
+            run_start_time = time.perf_counter()
+
+            for block_i in range(num_blocks):
+                this_on = min(block_size, segments - n_on_done)
+                this_off = min(block_size, segments - n_off_done)
+                if this_on <= 0 and this_off <= 0:
+                    break
+
+                reflected_dbm = None
+                if this_on > 0:
+                    # Check AFTER turning RF on (and letting it settle), not
+                    # before -- reflected power is only meaningful while
+                    # there's forward power to reflect. Checking beforehand
+                    # (while RF was still off from the previous block) would
+                    # always read near the noise floor and never actually
+                    # catch a real fault.
+                    gen.rf_on()
+                    time.sleep(rf_settle_s)
+                    reflected_dbm = HP8673H.read_reflected_power_dbm(ilock_sa, freq_hz)
+                    if reflected_dbm is None or reflected_dbm > threshold_dbm:
+                        reason = (
+                            "spectrum analyzer unreachable"
+                            if reflected_dbm is None else
+                            f"reflected power {reflected_dbm:.2f} dBm exceeds threshold "
+                            f"{threshold_dbm} dBm"
+                        )
+                        gen.trip_interlock(f"{reason} at block {block_i + 1}/{num_blocks} "
+                                            f"(RF-on)")
+                        tripped = True
+                        break
+
+                    segs_on, sample_rate_hz, t0_s = scope.acquire_segments_to_memory(
+                        segments=this_on, ch=1,
+                    )
+                    on_blocks.append((segs_on, time.perf_counter() - run_start_time))
+                    n_on_done += this_on
+
+                gen.rf_off()
+                time.sleep(rf_settle_s)
+                if this_off > 0:
+                    segs_off, sample_rate_hz, t0_s = scope.acquire_segments_to_memory(
+                        segments=this_off, ch=1,
+                    )
+                    off_blocks.append((segs_off, time.perf_counter() - run_start_time))
+                    n_off_done += this_off
+
+                reflected_str = f"{reflected_dbm:.2f} dBm" if reflected_dbm is not None else "n/a"
+                print(f"[cw_odmr] block {block_i + 1}/{num_blocks}: RF-on "
+                      f"{n_on_done}/{segments}, RF-off {n_off_done}/{segments}, "
+                      f"reflected={reflected_str}")
+
+            if tripped:
+                print(f"[cw_odmr] step 3/4: INTERLOCK TRIPPED -- {n_on_done}/{segments} "
+                      f"RF-on and {n_off_done}/{segments} RF-off segments completed")
+            print("[cw_odmr] step 3/4 done")
+        finally:
+            print("[cw_odmr] step 4/4: shutting down")
+            try:
+                gen.rf_off()
+            except Exception as e:
+                print(f"[cw_odmr] WARNING: failed to turn off RF cleanly ({e})")
+            try:
+                gen.go_to_local()
+            except Exception:
+                pass
+            gen.close()
+            if ilock_sa is not None:
+                ilock_sa.close()
+            if scope is not None:
+                scope.close()
+
+        if not on_blocks and not off_blocks:
+            print("[cw_odmr] nothing acquired -- not saving")
+            return
+
+        on_combined = (np.concatenate([b[0] for b in on_blocks])
+                       if on_blocks else np.empty((0, RTB2004.NUM_SAMPLES), dtype=np.float32))
+        off_combined = (np.concatenate([b[0] for b in off_blocks])
+                        if off_blocks else np.empty((0, RTB2004.NUM_SAMPLES), dtype=np.float32))
+        on_timetable = (np.concatenate([np.full(len(segs), elapsed_s) for segs, elapsed_s in on_blocks])
+                        if on_blocks else np.empty(0))
+        off_timetable = (np.concatenate([np.full(len(segs), elapsed_s) for segs, elapsed_s in off_blocks])
+                         if off_blocks else np.empty(0))
+
+        np.save(f"{run_path}/{file_name}.npy", on_combined)
+        np.save(f"{run_path}/{file_name}_timetable.npy", on_timetable)
+        np.save(f"{run_path}/{file_name}_bg.npy", off_combined)
+        np.save(f"{run_path}/{file_name}_bg_timetable.npy", off_timetable)
+        for suffix in ("", "_bg"):
+            with open(f"{run_path}/{file_name}{suffix}_metadata.txt", "w") as f:
+                f.write(f"sample_rate_hz={sample_rate_hz}\n")
+                f.write(f"t0_s={t0_s}\n")
+                f.write(f"num_points={RTB2004.NUM_SAMPLES}\n")
+
+        print(f"[cw_odmr] saved {n_on_done} RF-on segments to {run_path}/{file_name}.npy "
+              f"and {n_off_done} RF-off segments to {run_path}/{file_name}_bg.npy "
+              f"(interleaved in blocks of {block_size}){' -- PARTIAL' if tripped else ''}")
+
+    print("[cw_odmr] done")
 
 
 def main():
@@ -735,10 +1012,12 @@ def main():
         cmd_run_spectrum(file_name, **extra)
     elif command == "run_background":
         cmd_run_background(file_name, **extra)
+    elif command == "contrast_check":
+        cmd_contrast_check(file_name, **extra)
     else:
         raise SystemExit(
             f"unknown command {command!r} (expected 'vna', 'run', 'run_spectrum', "
-            f"or 'run_background')"
+            f"'run_background', or 'contrast_check')"
         )
 
 

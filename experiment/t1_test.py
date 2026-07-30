@@ -43,7 +43,7 @@ from cw_odmr import parse_kv_args
 
 AWG_RESOURCE = "USB0::0x0957::0x5707::MY53800810::INSTR"
 SCOPE_RESOURCE = "USB0::0x0AAD::0x01D6::108904::INSTR"
-DATA_DIR = "D:\\t1"
+DATA_DIR = "D:\\t1_new"
 SEGMENTS = 2500
 SCOPE_START_S = -0.5e-6  # passed through to RTB2004.run()'s start_s arg --
                           # where the acquired segment starts, relative to

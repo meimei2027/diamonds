@@ -193,8 +193,23 @@ class RTB2004:
 
 
     def run(self, segments=1000, ch=1, path="./data", name="waveform", on_poll=None,
-            on_acquired=None, start_s=1e-6, scale_s=1e-7):
+            on_acquired=None, start_s=1e-6, scale_s=1e-7, acquisition_timeout_s=60):
         """
+        acquisition_timeout_s is the ceiling wait_for_acquisition() uses
+        before giving up on a stuck scope -- the default (60s) is only
+        appropriate for acquisitions that finish comfortably inside that
+        window. A large `segments` at a slow external trigger rate can
+        legitimately take far longer than that just waiting for enough
+        triggers to arrive (e.g. 2000 segments at 10Hz needs >=200s) --
+        pass a generous value here (e.g. segments / trigger_freq_hz * 2,
+        plus margin) for those cases, or wait_for_acquisition() will give up
+        on a perfectly healthy acquisition that simply hasn't finished yet.
+        See also cw_odmr.py's acquire_segments(), which sizes its own VISA
+        connection timeout the same way -- both need to agree, since the
+        VISA-level timeout can trigger from inside a single blocking query
+        before this Python-level loop ever gets a chance to check elapsed
+        time itself.
+
         on_acquired(), if given, is called once triggering is done (right
         after STOP, before the segment-by-segment history readout starts) --
         lets a caller release anything that's only needed while actively
@@ -247,7 +262,7 @@ class RTB2004:
         self.set_trigger_edge(level=100e-3)
 
         self.write("SINGle")
-        self.wait_for_acquisition(segments, on_poll=on_poll)
+        self.wait_for_acquisition(segments, timeout=acquisition_timeout_s, on_poll=on_poll)
 
         self.write("STOP")
         print("acquired segments", self.get_segment_count())
