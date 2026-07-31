@@ -481,6 +481,180 @@ See `CLAUDE.md` for the full investigation history behind each of these.
   off period (`FALLOFF_DIAGNOSTIC_OFF_US=80`) that the sequence doesn't
   loop back to "polarize" before the decay is fully captured. Saves
   `data/diagnostic_falloff.npy`. Not yet run against real hardware.
+- **`KS33600A.write()` used to only print SCPI errors when `debug=True`, and
+  never raised** -- so a real AWG-side failure (e.g. `DATA:SEQ` hitting the
+  instrument's own limit on the number of distinct named sequences it can
+  hold) let a script keep running with the AWG silently stuck outputting
+  whatever sequence it last successfully loaded, while a sweep kept saving
+  files under the *intended* label regardless of what was actually being
+  generated. Confirmed for real: a `contrast_check` run hit "specified arb
+  not loaded in waveform memory, arb: too many sequences defined" partway
+  through, and a downloaded timetable for a supposedly-later file showed an
+  inter-trigger period matching an EARLIER, already-completed point --
+  multiple files in that run were silently corrupted this way, not just the
+  one that errored. **Fixed**: `write()` now always checks `SYST:ERR?` and
+  raises `RuntimeError` on any error, so this failure mode stops the run
+  immediately instead of silently corrupting data. The sequence-limit root
+  cause (each sweep point uploads a uniquely-named `DATA:SEQ`, needed per
+  the collision bug above, and nothing ever deletes an old one) is
+  mitigated in `run_sweep()` via `RESEQUENCE_INTERVAL=20` -- every 20
+  points, the AWG is reset (`*RST` + `DATA:VOL:CLE`) and the arb waveforms
+  re-uploaded from scratch, clearing the sequence table before it fills up.
+  The exact limit wasn't bisected -- one 100-point sweep hit it around its
+  80th point, another (same script, different session) as early as its
+  32nd -- don't assume a fixed number; re-validate any long-sweep dataset
+  against its own timetables (the dark-time-vs-filename check earlier in
+  this section) before trusting it.
+- **A from-scratch T1 re-measurement (`D:/t1_new`, 218 points) gave a
+  dramatically different fit than the original `D:/t1`: tau=378+/-19us vs.
+  tau=18.7+/-0.4us, ~20x longer, with ~9x smaller amplitude.** Checked
+  whether the SR445A output-impedance mismatch (see "General" below) could
+  explain this: it can't touch tau at all (a pure amplitude-scaling factor
+  multiplies `A` and `C` in `A*exp(-t/tau)+C` but can't appear in the
+  exponent -- no scaling error makes a decay look faster or slower), and it
+  can explain at most half the amplitude change (~2x from the impedance
+  fix, vs. ~9x actually observed) -- so most of both differences reflect a
+  real change in what's being measured, not an instrumentation artifact.
+  Plausibly consistent with the existing theory (above) that the original
+  ~18.7us figure was measuring fast shelving/charge-state recovery rather
+  than real spin-lattice T1 -- 378us is far more in line with expected real
+  T1 at room temperature.
+- **The `1us` dark-time point can show NO real fluorescence signal at all,
+  dominated instead by a ~1us-wide flat positive artifact** -- confirmed
+  reproducible with a 10x-larger retake (N=1000 segments, identical shape).
+  Checked across the rest of the `D:/t1_new` sweep: 217/218 points show the
+  expected significant negative-going dip; the artifact's duration does NOT
+  scale with labeled dark time (~1-1.2us at both 1us and 2us dark time,
+  then drops sharply by 3us) -- consistent with the pre-existing,
+  already-characterized AOM ramp-up transient (above) simply dominating the
+  entire visible window at the shortest dark time, not a new problem.
+  Already excluded from the exponential fit by the existing
+  `MIN_FIT_DARK_TIME_US=3` convention -- no code change needed, just don't
+  be alarmed by it in isolation; check the WHOLE sweep's dip-significance
+  and artifact-width-vs-dark-time (like this) before suspecting a bigger
+  problem from one point.
+
+## CW-ODMR contrast_check (cw_odmr.py)
+
+- **`acquire_segments()`'s scope VISA timeout was a hardcoded 100000ms,
+  independent of segment count or trigger rate** -- fine for the
+  1000-segment/10Hz defaults used elsewhere, but a 2000-segment
+  `contrast_check` run at the same 10Hz (needing >=200s of triggering
+  before the scope's blocking `*OPC?` query inside `wait_for_acquisition()`
+  can return) hit `pyvisa.errors.VisaIOError: VI_ERROR_TMO` well before the
+  acquisition could finish. **Fixed** in two places that need to agree
+  (fixing only one just converts one timeout into another):
+  `acquire_segments()` now computes a VISA timeout that scales with
+  `segments / trigger_freq_hz` (with margin), and `RTB2004.run()` gained an
+  `acquisition_timeout_s` parameter so its own Python-side polling-loop
+  ceiling (`wait_for_acquisition()`, previously a hardcoded 60s regardless
+  of segment count) matches the VISA-level one.
+- **A per-block interlock check that reads reflected power BEFORE turning
+  RF on isn't actually checking anything.** `cmd_contrast_check()`'s first
+  version read reflected power at the top of each loop iteration, right
+  after the previous block's `rf_off()` -- always saw the noise floor (no
+  forward power to reflect) and could never catch a real fault. **Fixed**:
+  the check now happens after `rf_on()` (plus an `rf_settle_s` delay,
+  default 5.0s, added after every RF on/off transition since the
+  generator/amplifier chain doesn't respond instantaneously), so the
+  reading reflects real drive conditions.
+- **Found a statistically strong (5-7 sigma), reproducible difference
+  between RF-on and RF-off segments at 2.87 GHz -- but with the WRONG SIGN
+  for real ODMR, and it isn't spin physics.** Given this PMT's established
+  sign convention (more negative = more fluorescence), a real ODMR
+  resonance (population pumped bright ms=0 -> dark ms=+-1) should make
+  RF-on LESS negative than RF-off; instead RF-on measured MORE negative in
+  two independent runs (`contrast1`: -0.274mV, 5.5 sigma; `contrast2`,
+  using an alternating-block design specifically to rule out drift:
+  -0.396mV, 7.3 sigma -- same sign, if anything larger). Two follow-up
+  tests ruled out the two most likely explanations:
+    1. Laser off (no photocurrent) -> effect vanishes (-0.057mV, 1.1 sigma,
+       not significant) -- rules out simple electrical pickup that doesn't
+       care about the optical signal.
+    2. Same test at 2.368 GHz (500+ MHz from any plausible NV resonance)
+       -> effect is STILL strong (+0.351mV, 6.6 sigma) and comparable in
+       size to the "on-resonance" runs, but with the OPPOSITE sign -- rules
+       out genuine NV spin resonance, which should be sharply peaked near
+       2.87 GHz and essentially absent 500 MHz away.
+  Conclusion: most consistent with a frequency-dependent artifact that
+  requires real photocurrent to manifest (e.g. RF leakage/standing-wave
+  effects coupling into the PMT's gain or amplifier chain in a way that
+  depends on drive frequency), NOT real ODMR contrast. **Any future ODMR
+  contrast measurement on this setup needs this ruled out first**
+  (laser-off + far-off-resonance controls, same as above) before trusting a
+  sign or magnitude. See `contrast_check_result.ipynb`.
+
+## Mini-Circuits ZYSWA-2-50DR+ RF switch (pulsed ODMR gating)
+
+- **Absorptive, not reflective -- RF always goes somewhere, there's no true
+  "off" state.** Truth table: control LOW -> RF IN routed to RF1; control
+  HIGH -> RF IN routed to RF2. Whichever port isn't selected still needs a
+  proper 50 ohm termination (a dummy load on RF1 if RF2 is the "sample"
+  path), or the unselected fraction of every cycle reflects back into the
+  switch/generator instead of being absorbed.
+- **Needs a separate +-5V DC power supply for its internal driver -- NOT
+  derivable from the AWG.** The TTL control signal (0-0.7V LOW / 2.1-5V
+  HIGH) and the +-5V driver power are electrically distinct; an AWG channel
+  is a signal source, not rated/protected to sustain the driver's operating
+  current as a power rail. Ground the supply's COM/return to the switch's
+  own ground (already tied to the AWG's ground via the control cable's
+  shield) -- a star topology through the switch, not a second independent
+  wire directly between the supply and the AWG (which would close a loop).
+- **Confirmed working via `rf_switch_test.ipynb`**: chopping a 2.5 GHz
+  carrier with a square wave on AWG CH2 (10% and 50% duty cycle, 1 kHz and
+  1 MHz) produces the expected AM sideband comb on the spectrum analyzer,
+  verified two independent ways -- visually (50% duty: sharp discrete peaks
+  at odd harmonics only, exact nulls at even harmonics, matching the
+  classic square-wave Fourier series) and quantitatively (FFT of the trace
+  itself shows a standout peak at the expected periodicity, 14-21x the
+  background level, robust to detrending).
+
+## SR830 lock-in amplifier
+
+- **Must send `OUTX 1` on connect, or query responses go out RS232 instead
+  of GPIB and `query()` hangs forever.** Not optional -- `sr830.py`'s
+  `__init__()` does this automatically.
+- **Use X (after nulling Y), not R, for weak signals where sign matters.**
+  R = sqrt(X^2+Y^2) is always >=0 and has a well-known positive bias for
+  small signals (rectifying symmetric noise), AND it discards sign entirely
+  -- both are a problem when (as in the contrast_check investigation above)
+  the sign of a small effect is the key diagnostic. X (with phase nulled
+  against a known strong signal at the same reference first) keeps sign
+  and has the best per-channel SNR.
+- **Phase calibration uses the SAME reference as the real measurement, just
+  a much stronger signal to null against** -- e.g. feed the reference
+  signal directly into the input temporarily, or drive a deliberately
+  large, real modulation at the reference rate, null Y, then switch back to
+  the real (weak) measurement without touching the phase setting. Don't
+  expect `auto_phase()` to work reliably on a signal too weak for it to get
+  a stable reading.
+
+## Pulsed ODMR (pulsed_odmr.py) -- NOT YET TESTED
+
+- Uses `[SOURce[1|2]:]PHASe:SYNChronize` (confirmed via Keysight's own
+  Trueform SCPI documentation) to align CH1 (laser sequence) and CH2 (MW
+  gate, via the ZYSWA switch) after both are independently started --
+  necessary since `OUTPUT1 ON`/`OUTPUT2 ON` are two separate SCPI writes
+  with no inherent timing guarantee between them. **Open item**: not
+  verified this actually holds the two channels in sync over a full
+  multi-minute scan on this specific firmware -- check by scoping CH1's
+  marker/sync output against CH2's gate simultaneously at the start and end
+  of a long run.
+- Confining the MW pulse to the dark period (never overlapping
+  polarize/readout) sidesteps the RF-pickup artifact found in
+  `contrast_check` (above), since that artifact needed RF and photocurrent
+  simultaneously present -- pulsed mode never has both at once by
+  construction. Validate this directly (e.g. a far-off-resonance pulsed
+  comparison, same idea as the CW contrast_check controls) before trusting
+  a pulsed ODMR result, in case sync drift (previous bullet) lets the pulse
+  creep toward the readout window over a long scan.
+- Dephasing (T2*) during the gap between the MW pulse and readout does NOT
+  matter for a population-based (single-pulse) measurement like this --
+  only T1 (population relaxation) does, since no coherence/interference
+  information is being read out. Keep the gap short relative to whatever
+  the relevant relaxation timescale is (the T1 sweep above suggests
+  order-100s of us, not the ~18.7us originally assumed) rather than
+  worrying about T2*.
 
 ## General
 
@@ -506,3 +680,24 @@ See `CLAUDE.md` for the full investigation history behind each of these.
   Our ZABDC20-322H-S+ has ~13 dB directivity in this band -- if whatever
   you're measuring reflects less than that relative to a matched load, you
   won't be able to tell it apart from the coupler's own leakage.
+- **The SR445A preamp's output impedance is 50 ohms, and its rated gain
+  assumes that output is terminated into 50 ohms** -- the amplifier's own
+  50 ohm output impedance and an external 50 ohm load form a voltage
+  divider that halves the swing, and that halving is already baked into
+  the datasheet's gain spec. Feed it into a high-impedance input instead
+  (the RTB2004 scope's default 1 Mohm channel impedance, or the SR830
+  lock-in's fixed 10 Mohm || 2pF input -- not user-switchable via any SCPI
+  command, unlike the scope) and you get the *undivided* output: roughly
+  2x the amplifier's spec'd gain. Confirmed for real: fed a 652 mVpp 1kHz
+  sine into the SR830 (0.2305 Vrms expected from a naive Vpp/(2*sqrt(2))
+  conversion), measured X = 0.4432V after nulling Y -- a ~1.92x ratio,
+  consistent with the missing termination. **Fixed** by adding a 50 ohm
+  pass-through terminator at the SR830's input. Also matters beyond
+  amplitude: the SR445A's fast rise/fall time (1.3ns typ.) means an
+  unterminated output can reflect/ring on fast edges too, not just scale
+  wrong -- proper 50 ohm termination fixes both at once. Caution if ever
+  splitting the SR445A's output to feed both the scope AND the SR830
+  simultaneously: terminating BOTH independently puts two 50 ohm loads in
+  parallel (~25 ohms combined), under-matching the amplifier further --
+  use a proper 50 ohm splitter (50 ohms at each output port) rather than a
+  plain T with two separate terminators.
