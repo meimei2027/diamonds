@@ -225,6 +225,13 @@ class SR830:
         result = self.query(f"SNAP? {arg}")
         return tuple(float(v) for v in result.split(","))
 
+    def get_sensitivity_v(self):
+        """Read back the currently-selected sensitivity range, in volts (or
+        amps for current-input modes) -- use this after auto_gain() to find
+        out what it actually picked."""
+        code = int(self.query("SENS?"))
+        return self.SENSITIVITY_V[code]
+
     def auto_gain(self):
         self.write("AGAN")
 

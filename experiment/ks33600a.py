@@ -14,16 +14,46 @@ class KS33600A:
         self.arb_name_ch2 = "ARB_CH2"
         self.debug = debug
         print("Keysight 33600A: connected")
+        # *RST does NOT clear the SCPI error queue (only *CLS does) -- drain
+        # any error left over from a PREVIOUS session/connection first, or
+        # write()'s post-command error check below would misattribute a
+        # stale, unrelated error to whatever the first real command happens
+        # to be (confirmed for real: a fresh connect after an earlier
+        # session hit a low-level VISA timeout raised "KS33600A error after
+        # '*RST': +785, Specified arb waveform does not exist" -- *RST
+        # itself didn't cause that, it was just the first command to expose
+        # an error that was already queued).
+        self.clear_error_queue()
         self.reset()
         # clear volatile memory
         self.write(f"SOUR1:DATA:VOL:CLE")
         self.write(f"SOUR2:DATA:VOL:CLE")
 
 
-    
+
     def reset(self):
         self.write("*RST")
         self.write("*CLS")
+
+    def clear_error_queue(self, max_errors=20):
+        """
+        Drain any errors already sitting in the instrument's error queue
+        (e.g. left over from a previous session) using the instrument
+        directly, bypassing write()'s own error-checking (which would
+        immediately raise on the first stale error it found instead of
+        clearing it). Caps at max_errors so a genuinely stuck instrument
+        doesn't loop forever.
+        """
+        for _ in range(max_errors):
+            err = self.inst.query("SYST:ERR?").strip()
+            if self.debug and not err.startswith("+0,"):
+                print(f"clear_error_queue: discarding stale error {err}")
+            if err.startswith("+0,"):
+                return
+        raise RuntimeError(
+            f"KS33600A: error queue still not empty after {max_errors} reads -- "
+            f"instrument may be stuck"
+        )
 
     def close(self):
         if self.inst is not None:

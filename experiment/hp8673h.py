@@ -248,6 +248,141 @@ class HP8673H:
         idx = np.argmin(power_dbm)
         return freqs_hz[idx], power_dbm[idx]
 
+    # -- Open-short-load scalar calibration ----------------------------------
+    #
+    # IMPORTANT LIMITATION: this is NOT a full vector (3-term) OSL
+    # calibration. That requires COMPLEX (magnitude + phase) reflection data
+    # to separate out directivity, source match, and reflection tracking
+    # error -- i.e. an actual VNA. This setup (generator + directional
+    # coupler + E4403B marker read) only measures scalar magnitude (dBm), so
+    # there's no phase to work with.
+    #
+    # What this DOES give you: a scalar "response calibration" -- open and
+    # short should both reflect ~100% (|Gamma|~=1) and set the "full
+    # reflection" reference at each frequency; a 50-ohm load should reflect
+    # ~0% (|Gamma|~=0) and sets the "zero reflection" reference. Normalizing
+    # a later measurement against these two curves removes the cable/
+    # coupler's own frequency-dependent insertion loss and coupling factor --
+    # which is almost certainly what's distorting dip DEPTH and baseline
+    # shape across a sweep. It does NOT correct source-match or directivity
+    # error (those need phase to separate from the real DUT response), and
+    # it doesn't move dip FREQUENCY, which doesn't depend on calibration.
+
+    def calibrate_osl(self, sa, start_hz, stop_hz, step_hz, cal_dir,
+                       drive_power_dbm=-40.0, settle_s=0.05, initial_settle_s=1.0):
+        """
+        Manual open-short-load scalar calibration (see limitation note
+        above). Prompts you to connect each of the three standards in turn
+        at the reference plane (wherever the resonator/DUT normally
+        connects), sweeping frequency and recording reflected power for
+        each. Saves {cal_dir}/osl_freqs_hz.npy, osl_open_dbm.npy,
+        osl_short_dbm.npy, osl_load_dbm.npy -- load later with
+        load_osl_calibration(cal_dir) and pass to resonance_sweep(cal_dir=...)
+        or apply_osl_calibration() directly.
+
+        Only needs to be redone if the cable/coupler chain between the
+        generator and the reference plane changes -- re-run it if you
+        swap/re-route cables.
+
+        SAFETY: open and short both present a near-total reflection
+        (|Gamma|~=1) at the reference plane. If that plane is downstream of
+        an amplifier (as it likely is, since the whole point is to
+        calibrate out the cable segment closest to the DUT), the amp's
+        output ends up looking into a full mismatch during this step. Not
+        every amplifier tolerates that -- check its datasheet's max VSWR/
+        mismatch rating before running this for real. drive_power_dbm
+        defaults to -40 dBm (matching resonance_sweep()'s own low-power
+        default for exactly this reason) specifically to keep this safe
+        regardless of amp tolerance -- don't raise it without confirming
+        the amp is rated for open/short loads at whatever power you pick.
+        """
+        import os
+        os.makedirs(cal_dir, exist_ok=True)
+
+        # Set the power level up front, with RF still OFF, so it's visible
+        # and confirmable on the front panel before anything is physically
+        # connected -- frequency_sweep() below would otherwise only set
+        # this (and turn RF on) after you've already been prompted to
+        # connect the first standard.
+        self.preset()
+        self.set_power_dbm(drive_power_dbm)
+        print(f"[calibrate_osl] generator power set to {drive_power_dbm} dBm "
+              f"(RF still OFF) -- confirm this on the front panel before "
+              f"connecting any standard")
+
+        freqs_hz = None
+        standard_power_dbm = {}
+        for standard in ("open", "short", "load"):
+            input(f"[calibrate_osl] connect the {standard.upper()} standard at "
+                  f"the reference plane, then press Enter to sweep...")
+            freqs_hz, power_dbm = self.frequency_sweep(
+                sa, start_hz, stop_hz, step_hz, power_dbm=drive_power_dbm,
+                settle_s=settle_s, initial_settle_s=initial_settle_s,
+            )
+            standard_power_dbm[standard] = power_dbm
+            print(f"[calibrate_osl] {standard}: recorded {len(power_dbm)} points")
+
+        np.save(f"{cal_dir}/osl_freqs_hz.npy", freqs_hz)
+        np.save(f"{cal_dir}/osl_open_dbm.npy", standard_power_dbm["open"])
+        np.save(f"{cal_dir}/osl_short_dbm.npy", standard_power_dbm["short"])
+        np.save(f"{cal_dir}/osl_load_dbm.npy", standard_power_dbm["load"])
+        print(f"[calibrate_osl] saved calibration to {cal_dir}")
+
+    @staticmethod
+    def load_osl_calibration(cal_dir):
+        """Load a calibration saved by calibrate_osl(), pre-computing the
+        linear-power reference curves used by apply_osl_calibration()."""
+        freqs_hz = np.load(f"{cal_dir}/osl_freqs_hz.npy")
+        open_dbm = np.load(f"{cal_dir}/osl_open_dbm.npy")
+        short_dbm = np.load(f"{cal_dir}/osl_short_dbm.npy")
+        load_dbm = np.load(f"{cal_dir}/osl_load_dbm.npy")
+
+        open_lin = 10 ** (open_dbm / 10)
+        short_lin = 10 ** (short_dbm / 10)
+        load_lin = 10 ** (load_dbm / 10)
+
+        return {
+            "freqs_hz": freqs_hz,
+            "full_lin": (open_lin + short_lin) / 2,
+            "load_lin": load_lin,
+        }
+
+    @staticmethod
+    def apply_osl_calibration(freqs_hz, power_dbm, cal, floor_db=-50.0):
+        """
+        Normalize raw reflected-power dBm readings against an open-short-
+        load scalar calibration (see calibrate_osl()'s limitation note).
+        cal is the dict returned by load_osl_calibration(). Interpolates the
+        calibration curves (in linear power) onto freqs_hz, since a
+        calibration sweep and a later sweep may use different step sizes.
+
+        Returns 10*log10(|Gamma_cal|^2) in dB -- a calibrated, cable/coupler-
+        corrected reflection level, NOT true absolute return loss/S11 (see
+        limitation note). Scale is directly comparable to raw reflected dBm:
+        ~0 dB = full reflection (matches open/short), very negative = well
+        absorbed (matches load) -- deeper dips are still deeper dips.
+
+        floor_db bounds how negative the output can go (default -50 dB).
+        Near the load reference, ordinary measurement noise can push a
+        point's raw power slightly BELOW the load's own reading -- the
+        ratio's numerator goes negative, and log(anything <=0) is
+        undefined. Flooring the OUTPUT dB value (rather than clipping the
+        linear ratio to some tiny-but-positive epsilon like 1e-12, which
+        maps to -120 dB) keeps these noise-driven points from swamping the
+        plot with meaningless deep spikes swinging across the full dynamic
+        range -- a scalar reflectometer at typical drive powers here
+        doesn't actually resolve much beyond a few tens of dB anyway, so
+        -50 dB is already past the setup's real noise floor, not an
+        arbitrary truncation of genuine signal.
+        """
+        full_lin = np.interp(freqs_hz, cal["freqs_hz"], cal["full_lin"])
+        load_lin = np.interp(freqs_hz, cal["freqs_hz"], cal["load_lin"])
+        meas_lin = 10 ** (power_dbm / 10)
+
+        gamma_sq = (meas_lin - load_lin) / (full_lin - load_lin)
+        gamma_sq = np.clip(gamma_sq, 10 ** (floor_db / 10), None)
+        return 10 * np.log10(gamma_sq)
+
     @staticmethod
     def estimate_q(freqs_hz, power_dbm, smooth_window=9):
         """
@@ -287,52 +422,91 @@ class HP8673H:
 
     def resonance_sweep(self, sa, start_hz, stop_hz, coarse_step_hz,
                          fine_span_hz, fine_step_hz, power_dbm,
-                         output_prefix=None):
+                         output_prefix=None, cal_dir=None):
         """
         Run the coarse-then-fine resonance sweep and return the estimate_q()
         result dict, augmented with the raw coarse/fine (freqs_hz, power_dbm)
         arrays. If output_prefix is given, also writes
         "{output_prefix}_coarse.csv" and "{output_prefix}_fine.csv".
 
+        cal_dir (optional): path to an open-short-load calibration folder
+        previously written by calibrate_osl(). If given, dip-finding and the
+        Q/depth estimate use the calibration-corrected power (see
+        apply_osl_calibration()'s limitation note -- this corrects cable/
+        coupler frequency response, not source-match/directivity error). Raw
+        (uncalibrated) power is still recorded everywhere alongside it --
+        CSV output gets an extra power_dbm_cal column, and the returned dict
+        gets coarse_power_dbm_cal/fine_power_dbm_cal keys. With cal_dir=None
+        (the default), behavior is unchanged from before calibration
+        support existed.
+
         Does not touch RF state or GPIB local/remote mode when finished --
         that's the caller's responsibility (see run_resonance_sweep() for the
         CLI's one-shot behavior).
         """
+        cal = self.load_osl_calibration(cal_dir) if cal_dir else None
+        if cal is not None:
+            print(f"[resonance_sweep] applying OSL calibration from {cal_dir}")
+
         print(f"[resonance_sweep] coarse sweep {start_hz/1e9:.4f}-{stop_hz/1e9:.4f} GHz, "
               f"step {coarse_step_hz/1e6:.2f} MHz, {power_dbm} dBm")
         coarse_freqs_hz, coarse_power_dbm = self.coarse_sweep(
             sa, start_hz, stop_hz, coarse_step_hz, power_dbm)
+        coarse_power_dbm_cal = (
+            self.apply_osl_calibration(coarse_freqs_hz, coarse_power_dbm, cal)
+            if cal is not None else None
+        )
         if output_prefix:
+            columns = [coarse_freqs_hz, coarse_power_dbm]
+            header = "frequency_hz,power_dbm"
+            if cal is not None:
+                columns.append(coarse_power_dbm_cal)
+                header += ",power_dbm_cal"
             np.savetxt(
                 f"{output_prefix}_coarse.csv",
-                np.column_stack((coarse_freqs_hz, coarse_power_dbm)),
-                delimiter=",", header="frequency_hz,power_dbm", comments="",
+                np.column_stack(columns),
+                delimiter=",", header=header, comments="",
             )
 
-        dip_freq_hz, dip_power_dbm = self.find_dip(coarse_freqs_hz, coarse_power_dbm)
+        dip_source = coarse_power_dbm_cal if cal is not None else coarse_power_dbm
+        dip_freq_hz, dip_power_dbm = self.find_dip(coarse_freqs_hz, dip_source)
         print(f"[resonance_sweep] coarse dip: {dip_freq_hz/1e9:.4f} GHz, {dip_power_dbm:.1f} dBm")
 
         print(f"[resonance_sweep] fine sweep around {dip_freq_hz/1e9:.4f} GHz, "
               f"span {fine_span_hz/1e6:.2f} MHz, step {fine_step_hz/1e3:.1f} kHz")
         fine_freqs_hz, fine_power_dbm = self.fine_sweep(
             sa, dip_freq_hz, fine_span_hz, fine_step_hz, power_dbm)
+        fine_power_dbm_cal = (
+            self.apply_osl_calibration(fine_freqs_hz, fine_power_dbm, cal)
+            if cal is not None else None
+        )
         if output_prefix:
+            columns = [fine_freqs_hz, fine_power_dbm]
+            header = "frequency_hz,power_dbm"
+            if cal is not None:
+                columns.append(fine_power_dbm_cal)
+                header += ",power_dbm_cal"
             np.savetxt(
                 f"{output_prefix}_fine.csv",
-                np.column_stack((fine_freqs_hz, fine_power_dbm)),
-                delimiter=",", header="frequency_hz,power_dbm", comments="",
+                np.column_stack(columns),
+                delimiter=",", header=header, comments="",
             )
 
-        result = self.estimate_q(fine_freqs_hz, fine_power_dbm)
+        fine_source = fine_power_dbm_cal if cal is not None else fine_power_dbm
+        result = self.estimate_q(fine_freqs_hz, fine_source)
         result["coarse_freqs_hz"] = coarse_freqs_hz
         result["coarse_power_dbm"] = coarse_power_dbm
         result["fine_freqs_hz"] = fine_freqs_hz
         result["fine_power_dbm"] = fine_power_dbm
+        if cal is not None:
+            result["coarse_power_dbm_cal"] = coarse_power_dbm_cal
+            result["fine_power_dbm_cal"] = fine_power_dbm_cal
 
         depth_db = result["baseline_dbm"] - result["dip_dbm"]
         print(f"[resonance_sweep] f0 = {result['f0_hz']/1e9:.5f} GHz, "
               f"depth = {depth_db:.1f} dB, FWHM = {result['fwhm_hz']/1e6:.2f} MHz, "
-              f"Q ~= {result['Q']:.0f}")
+              f"Q ~= {result['Q']:.0f}"
+              f"{' (calibrated)' if cal is not None else ''}")
 
         return result
 
@@ -458,7 +632,7 @@ class HP8673H:
 
 def run_resonance_sweep(gen_resource, sa_resource, start_hz, stop_hz,
                          coarse_step_hz, fine_span_hz, fine_step_hz,
-                         power_dbm, output_prefix):
+                         power_dbm, output_prefix, cal_dir=None):
     from e4403b import E4403B
 
     gen = HP8673H(gen_resource)
@@ -467,10 +641,27 @@ def run_resonance_sweep(gen_resource, sa_resource, start_hz, stop_hz,
     try:
         return gen.resonance_sweep(
             sa, start_hz, stop_hz, coarse_step_hz, fine_span_hz, fine_step_hz,
-            power_dbm, output_prefix=output_prefix,
+            power_dbm, output_prefix=output_prefix, cal_dir=cal_dir,
         )
     finally:
         gen.rf_off()
+        gen.go_to_local()
+        gen.close()
+        sa.go_to_local()
+        sa.close()
+
+
+def run_calibrate_osl(gen_resource, sa_resource, start_hz, stop_hz, step_hz,
+                       power_dbm, cal_dir):
+    from e4403b import E4403B
+
+    gen = HP8673H(gen_resource)
+    sa = E4403B(sa_resource)
+
+    try:
+        gen.calibrate_osl(sa, start_hz, stop_hz, step_hz, cal_dir,
+                           drive_power_dbm=power_dbm)
+    finally:
         gen.go_to_local()
         gen.close()
         sa.go_to_local()
@@ -515,6 +706,32 @@ def main():
     resonance_p.add_argument("--fine-step-hz", type=float, default=50e3)
     resonance_p.add_argument("--power-dbm", type=float, default=0.0)
     resonance_p.add_argument("--output-prefix", default="data/resonance_sweep")
+    resonance_p.add_argument("--cal-dir", default=None,
+                              help="path to an open-short-load calibration "
+                                   "folder from the 'calibrate-osl' subcommand "
+                                   "-- omit to use uncalibrated raw power "
+                                   "(the previous default behavior)")
+
+    calibrate_p = sub.add_parser(
+        "calibrate-osl", help="manual open-short-load scalar calibration "
+                               "(see HP8673H.calibrate_osl's docstring)",
+    )
+    calibrate_p.add_argument("--gen-resource", default="GPIB1::19::INSTR")
+    calibrate_p.add_argument("--sa-resource", default="GPIB0::18::INSTR")
+    calibrate_p.add_argument("--start-hz", type=float, default=2.0e9)
+    calibrate_p.add_argument("--stop-hz", type=float, default=3.0e9)
+    calibrate_p.add_argument("--step-hz", type=float, default=6.7e6)
+    calibrate_p.add_argument("--power-dbm", type=float, default=-40.0,
+                              help="drive power during calibration -- kept low "
+                                   "by default since open/short present a "
+                                   "near-total reflection at the reference "
+                                   "plane; don't raise this without confirming "
+                                   "the amplifier tolerates that mismatch at "
+                                   "the power you pick")
+    calibrate_p.add_argument("--cal-dir", required=True,
+                              help="folder to save osl_freqs_hz.npy / "
+                                   "osl_open_dbm.npy / osl_short_dbm.npy / "
+                                   "osl_load_dbm.npy into")
 
     interlock_p = sub.add_parser(
         "interlock", help="reflected-power safety interlock for continuous CW operation",
@@ -540,7 +757,12 @@ def main():
         run_resonance_sweep(
             args.gen_resource, args.sa_resource, args.start_hz, args.stop_hz,
             args.coarse_step_hz, args.fine_span_hz, args.fine_step_hz,
-            args.power_dbm, args.output_prefix,
+            args.power_dbm, args.output_prefix, cal_dir=args.cal_dir,
+        )
+    elif args.command == "calibrate-osl":
+        run_calibrate_osl(
+            args.gen_resource, args.sa_resource, args.start_hz, args.stop_hz,
+            args.step_hz, args.power_dbm, args.cal_dir,
         )
     elif args.command == "interlock":
         run_interlock(

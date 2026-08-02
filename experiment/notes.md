@@ -628,6 +628,86 @@ See `CLAUDE.md` for the full investigation history behind each of these.
   the real (weak) measurement without touching the phase setting. Don't
   expect `auto_phase()` to work reliably on a signal too weak for it to get
   a stable reading.
+- **`cw_odmr_lock_in.py`'s resonance sweep must run with the ZYSWA switch
+  held static, not chopping.** Originally `cmd_run()` called `setup_chop()`
+  (CH2 square wave) before `resonance_sweep()`, so the analyzer read
+  reflected power while the switch was already flipping between RF1/RF2 on
+  every chop cycle -- garbage/AM-sideband signals riding on top of the
+  resonance dip, not a clean trace (this is what was seen live on the
+  spectrum analyzer during the coarse sweep). Fixed by adding
+  `set_switch_static()` (CH2 held at a fixed DC level, HIGH = RF2/sample
+  path per the ZYSWA truth table) for the resonance sweep, only calling
+  `setup_chop()` afterward once f0 is found and the lock-in sweep is about
+  to start.
+- **Second pickup-artifact signature found with the lock-in readout,
+  converging with the `contrast_check` investigation above**: sweeping
+  `cmd_run()`'s lock-in signal shows a MUCH bigger reading at the
+  resonator's own resonant frequency (found via `resonance_sweep()`'s dip
+  in reflected power) than at 2.87 GHz (the actual NV zero-field
+  transition), when the two don't coincide -- backwards from real ODMR,
+  which should peak at the NV transition (real spin-microwave coupling) and
+  vanish elsewhere, not track the resonator's own structural resonance. A
+  resonant structure concentrates/enhances the local RF field AT its own
+  resonance by design (that's what "resonant" means) even though *more*
+  power is reflected back (not absorbed) away from it -- so a pickup
+  artifact driven by ambient RF field strength near the resonator, not real
+  NV coupling, would naturally peak exactly where this data peaks.
+  Follow-up **carrier-off test** (`cw_odmr_lock_in.py single ... carrier_off=true`,
+  keeps CH2 chopping the switch and the SR830 demodulating normally, but
+  holds the generator's RF output off throughout via explicit `rf_off()`,
+  never `rf_on()`) showed the lock-in signal drops way down with the
+  carrier off -- confirms the pickup needs real RF power present, ruling
+  out simple digital crosstalk from the AWG chop control line itself as the
+  dominant source, and leaving resonator-near-field pickup into the PMT
+  cable/electronics as the leading explanation.
+
+  **Full localization chain** (each test isolates one stage of the PMT
+  signal path):
+  1. RF power amplifier driving a dummy load instead of the resonator ->
+     no background. Requires the resonator specifically to be driven with
+     real RF, not just RF present anywhere upstream in the chain.
+  2. Optical path to the PMT blocked entirely (no light at all) -> background
+     still present. Rules out anything involving real photons/fluorescence --
+     the effect cannot be optical.
+  3. PMT itself powered off (no HV, no gain) -> background still present.
+     Rules out the PMT tube/photocathode/dynode chain -- an unpowered PMT
+     can't produce a meaningful output regardless of light.
+  4. PMT's SR445A preamp powered off -> NO background. Localizes the pickup
+     specifically to the preamp stage -- its own circuitry needs to be
+     actively biased/amplifying for the effect to appear (consistent with
+     RF coupling onto an active, biased circuit and getting rectified/
+     amplified into a baseband artifact; a passive/unpowered stage has no
+     mechanism to do that).
+  5. Preamp is plastic-housed -> no RF shielding at all (plastic is
+     transparent to RF; only a continuous conductive enclosure blocks it).
+     Moving the preamp farther from the resonator dropped the reading from
+     6 uV to 2 uV -- direct near-field-coupling-with-distance signature,
+     confirming the mechanism is RF penetrating the unshielded preamp
+     housing from the resonator's near-field, not a ground loop (ruled out
+     by the plastic, non-conductive chassis not bonding to the optical
+     table) and not any single interconnecting cable.
+
+  **Fix**: replaced the SR445A preamp entirely with a simple resistor
+  transimpedance (PMT anode current -> resistor -> voltage directly into
+  the SR830), for this CW-lock-in signal path specifically. Rationale: the
+  preamp's x5 voltage gain over its 50 ohm input impedance is only an
+  effective ~250 ohm transimpedance -- a deliberately chosen, much larger
+  discrete resistor gets both better underlying SNR (Johnson-noise-limited
+  SNR scales as sqrt(R), so a ~100x-600x larger R gives a substantial
+  improvement, limited by the RC rolloff from cable/PMT stray capacitance
+  needing to stay well above the ~1 kHz chop rate) AND removes the pickup
+  mechanism entirely, since a purely passive resistor has no active/biased
+  nonlinear element to rectify coupled RF into a baseband signal the way
+  the powered preamp evidently did. Confirmed on the bench: background is
+  gone with the resistor in place. NOTE: the SR445A is still needed for
+  fast pulsed/T1-style measurements elsewhere in this project (DC-300 MHz
+  bandwidth) -- this swap is specific to the slow (~1 kHz chop) CW lock-in
+  path, not a wholesale replacement.
+
+  **Still open**: this only confirms the pickup ARTIFACT is gone, not yet
+  that real ODMR contrast is present -- rerun the standard controls (laser
+  off; far off the actual NV resonance) with the resistor in place before
+  trusting a result from `cw_odmr_lock_in.py` as genuine ODMR.
 
 ## Pulsed ODMR (pulsed_odmr.py) -- NOT YET TESTED
 

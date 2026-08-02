@@ -1,0 +1,14 @@
+- why not esr?
+    - can't really measure resonator without diamond now
+
+- background
+    - not when generator is not on, but TTL on
+    - not when amplifier is not on but other things on
+    - not when amplifier goes directly into the load
+        - or when amplifier goes through isolator and coupler but not into resonator
+    - still there when input to the PMT is blocked
+        - still there w/o the PMT being powered
+    - turned off amplifier to pmt: not there
+
+- preamp closer: more background
+- switched to resistor 500 ohm for slower cw odmr
