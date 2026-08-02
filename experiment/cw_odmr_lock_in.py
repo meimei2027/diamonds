@@ -145,6 +145,20 @@ Usage:
         _lockin_single_x.npy, _lockin_single_y.npy,
         _lockin_single_reflected_dbm.npy, _lockin_single_metadata.txt.
 
+    python cw_odmr_lock_in.py sweep-average <file_name> [key=value ...]
+        Sweeps a FIXED frequency range (no resonance_sweep()/f0-finding)
+        n_repeats times in a row, saving each repeat's raw sweep to disk
+        immediately, then averaging X and Y (not R) across all completed
+        repeats -- a way to beat down noise across many faster sweeps
+        instead of (or in addition to) one very-long-time-constant sweep,
+        with visibility into each repeat as it finishes. See
+        cmd_sweep_average()'s docstring for the full list of key=value
+        overrides. Saves per repeat i:
+        <file_name>_repeat{i}_freqs_hz.npy, _x.npy, _y.npy,
+        _reflected_dbm.npy, and after all repeats:
+        <file_name>_avg_freqs_hz.npy, _avg_x.npy, _avg_y.npy, _avg_r.npy,
+        _avg_metadata.txt.
+
     python cw_odmr_lock_in.py calibrate-osl <cal_dir> [key=value ...]
         Open-short-load scalar calibration for the resonance sweep (see
         hp8673h.py's calibrate_osl()). Holds the switch static on RF2 first,
@@ -175,6 +189,19 @@ SA_RESOURCE = "GPIB0::18::INSTR"
 SR830_RESOURCE = "GPIB2::2::INSTR"
 
 DATA_DIR = "D:\\cw_odmr_lock_in"
+
+
+def setup_ch1_carrier(awg, carrier_freq_hz=80e6, carrier_vpp=0.632):
+    """CH1: continuous, unmodulated sine carrier, independent of CH2's chop
+    -- unrelated to the alignment tone in run_alignment.py, just needs to
+    stay running throughout the measurement. Set once right after
+    connecting to the AWG; not touched again for the rest of the run."""
+    awg.write("OUTP1:LOAD 50")
+    awg.write("SOUR1:FUNC SIN")
+    awg.write(f"SOUR1:FREQ {carrier_freq_hz}")
+    awg.write("SOUR1:VOLT:UNIT VPP")
+    awg.write(f"SOUR1:VOLT {carrier_vpp}")
+    awg.write("OUTPUT1 ON")
 
 
 def setup_chop(awg, chop_freq_hz, chop_duty_pct):
@@ -258,6 +285,8 @@ def cmd_run(file_name, **kw):
     auto_sensitivity = str(kw.get("auto_sensitivity", "true")).lower() == "true"
     phase_deg = float(kw.get("phase_deg", 0.0))
     input_coupling = str(kw.get("input_coupling", "ac"))
+    ch1_carrier_freq_hz = float(kw.get("ch1_carrier_freq_hz", 80e6))
+    ch1_carrier_vpp = float(kw.get("ch1_carrier_vpp", 0.632))
 
     run_path = f"{DATA_DIR}/{file_name}"
     import os
@@ -267,9 +296,10 @@ def cmd_run(file_name, **kw):
     log_path = f"{log_dir}/{file_name}_lockin_spectrum.txt"
 
     with _tee_stdout(log_path):
-        print("[cw_odmr_lock_in] step 1/4: configuring AWG CH2 (static, not chopping "
-              "yet) + SR830 lock-in")
+        print("[cw_odmr_lock_in] step 1/4: configuring AWG CH1 (continuous carrier) "
+              "+ CH2 (static, not chopping yet) + SR830 lock-in")
         awg = ks33600a.KS33600A(AWG_RESOURCE, debug=True)
+        setup_ch1_carrier(awg, ch1_carrier_freq_hz, ch1_carrier_vpp)
         # Hold the switch parked on the sample path (RF2) instead of chopping
         # for now -- resonance_sweep() below reads the analyzer and needs a
         # clean, unmodulated signal. Chopping only starts once resonance is
@@ -279,11 +309,12 @@ def cmd_run(file_name, **kw):
         lia = SR830(SR830_RESOURCE, debug=True)
         setup_lock_in(lia, chop_freq_hz, time_constant_s, sensitivity_v, phase_deg,
                       input_coupling, auto_sensitivity=auto_sensitivity)
-        print(f"[cw_odmr_lock_in] step 1/4 done: switch held static on RF2 (sample path) "
-              f"for the resonance sweep; chop @ {chop_freq_hz:.0f} Hz, "
-              f"{chop_duty_pct:.0f}% duty starts after resonance is found; "
-              f"time constant {time_constant_s*1e3:.1f} ms, phase {phase_deg} deg "
-              f"(NOT auto-calibrated -- see module docstring)")
+        print(f"[cw_odmr_lock_in] step 1/4 done: CH1 continuous carrier "
+              f"{ch1_carrier_freq_hz/1e6:.1f} MHz / {ch1_carrier_vpp*1e3:.0f} mVpp; "
+              f"switch held static on RF2 (sample path) for the resonance sweep; "
+              f"chop @ {chop_freq_hz:.0f} Hz, {chop_duty_pct:.0f}% duty starts after "
+              f"resonance is found; time constant {time_constant_s*1e3:.1f} ms, "
+              f"phase {phase_deg} deg (NOT auto-calibrated -- see module docstring)")
 
         print("[cw_odmr_lock_in] step 2/4: connecting to HP8673H + E4403B (interlock)")
         gen = HP8673H(GEN_RESOURCE)
@@ -487,6 +518,10 @@ def cmd_single(file_name, **kw):
                                did not
       phase_deg=0.0           pre-calibrated SR830 phase
       input_coupling=ac       SR830 input coupling, 'ac' or 'dc'
+      ch1_carrier_freq_hz=80e6  AWG CH1 continuous, unmodulated carrier
+                                frequency -- unrelated to the chop, just
+                                stays running throughout
+      ch1_carrier_vpp=0.632     AWG CH1 carrier amplitude
     """
     freq_hz = float(kw.get("freq_hz", 2.87e9))
     drive_power_dbm = float(kw.get("drive_power_dbm", 0.0))
@@ -501,6 +536,8 @@ def cmd_single(file_name, **kw):
     auto_sensitivity = str(kw.get("auto_sensitivity", "true")).lower() == "true"
     phase_deg = float(kw.get("phase_deg", 0.0))
     input_coupling = str(kw.get("input_coupling", "ac"))
+    ch1_carrier_freq_hz = float(kw.get("ch1_carrier_freq_hz", 80e6))
+    ch1_carrier_vpp = float(kw.get("ch1_carrier_vpp", 0.632))
 
     run_path = f"{DATA_DIR}/{file_name}"
     import os
@@ -510,17 +547,21 @@ def cmd_single(file_name, **kw):
     log_path = f"{log_dir}/{file_name}_lockin_single.txt"
 
     with _tee_stdout(log_path):
-        print("[cw_odmr_lock_in] step 1/3: configuring AWG CH2 chop + SR830 lock-in")
+        print("[cw_odmr_lock_in] step 1/3: configuring AWG CH1 (continuous carrier) "
+              "+ CH2 chop + SR830 lock-in")
         awg = ks33600a.KS33600A(AWG_RESOURCE, debug=True)
+        setup_ch1_carrier(awg, ch1_carrier_freq_hz, ch1_carrier_vpp)
         setup_chop(awg, chop_freq_hz, chop_duty_pct)
         awg.close()
 
         lia = SR830(SR830_RESOURCE, debug=True)
         setup_lock_in(lia, chop_freq_hz, time_constant_s, sensitivity_v, phase_deg,
                       input_coupling, auto_sensitivity=auto_sensitivity)
-        print(f"[cw_odmr_lock_in] step 1/3 done: {chop_duty_pct:.0f}% duty cycle chop "
-              f"@ {chop_freq_hz:.0f} Hz, time constant {time_constant_s*1e3:.1f} ms, "
-              f"phase {phase_deg} deg (NOT auto-calibrated -- see module docstring)")
+        print(f"[cw_odmr_lock_in] step 1/3 done: CH1 continuous carrier "
+              f"{ch1_carrier_freq_hz/1e6:.1f} MHz / {ch1_carrier_vpp*1e3:.0f} mVpp; "
+              f"{chop_duty_pct:.0f}% duty cycle chop @ {chop_freq_hz:.0f} Hz, "
+              f"time constant {time_constant_s*1e3:.1f} ms, phase {phase_deg} deg "
+              f"(NOT auto-calibrated -- see module docstring)")
 
         print(f"[cw_odmr_lock_in] step 2/3: connecting to HP8673H + E4403B (interlock), "
               f"fixed frequency {freq_hz/1e9:.5f} GHz, {drive_power_dbm} dBm"
@@ -644,6 +685,362 @@ def cmd_single(file_name, **kw):
     print("[cw_odmr_lock_in] done")
 
 
+def cmd_sweep_average(file_name, **kw):
+    """
+    Sweep a frequency range n_repeats times in a row, saving each repeat's
+    raw sweep to disk immediately, then averaging X and Y elementwise
+    across all completed repeats.
+
+    Frequency range: by default (use_resonance_sweep=true), runs the same
+    coarse-then-fine resonance_sweep() as cmd_run() first -- switch held
+    static on RF2 throughout (set_switch_static()), NOT chopping, so the
+    resonance sweep gets a clean reflected-power trace -- then derives
+    [start_hz, stop_hz] from the found f0 +/- fwhm_margin*FWHM/2, exactly
+    like cmd_run(). Pass start_hz/stop_hz explicitly to override this with
+    a fixed manual range instead (e.g. a wide blind search span that
+    doesn't trust the resonator's own narrow FWHM window) -- the resonance
+    sweep still runs and its result is still logged/saved even when you
+    override the range this way, since it's useful reference info (and
+    already needed for the switch-static protection) regardless of what
+    range you actually average over. Set use_resonance_sweep=false to skip
+    it entirely and require start_hz/stop_hz to be given manually.
+
+    Averages X and Y (NOT R) across repeats, then computes R from the
+    averaged X/Y at the end -- R = sqrt(X^2+Y^2) is always >= 0 and has a
+    well-known positive noise-rectification bias (see notes.md's SR830
+    section), so averaging R directly would keep that bias instead of
+    averaging it away. X and Y are signed and roughly zero-mean noise on
+    top of whatever real signal is there, so they average down properly.
+
+    Useful as an alternative to (or on top of) a single very-long-time-
+    constant sweep: N repeats of a faster sweep, averaged, gives similar
+    noise reduction to increasing the time constant by ~N, but you get to
+    see each repeat's result as it completes rather than waiting on one
+    slow sweep with no visibility until it's done -- and a bad/interrupted
+    repeat only costs you one repeat, not the whole measurement.
+
+    Same inline reflected-power interlock check as cmd_run/cmd_single,
+    re-checked at every point of every repeat. An interlock trip stops
+    immediately -- whatever repeats completed FULLY before that are still
+    averaged and saved; the partial (tripped) repeat itself is saved to
+    disk but excluded from the average (a short array averaged against full
+    ones would bias the result, not reduce its noise). Stop early with
+    Ctrl+C -- same partial-repeat handling applies.
+
+    Recognized key=value overrides (all optional):
+      use_resonance_sweep=true  run resonance_sweep() first to find f0/FWHM
+                                (switch held static, not chopping) and
+                                derive start_hz/stop_hz from it -- set
+                                false to skip and require a manual range
+      res_start_hz=2e9        resonance sweep start frequency
+      res_stop_hz=3e9         resonance sweep stop frequency
+      coarse_step_hz=6.7e6    coarse sweep step (track expected FWHM)
+      fine_span_hz=20e6       fine sweep span around the coarse dip
+      fine_step_hz=50e3       fine sweep step
+      res_power_dbm=-40.0     drive power during the resonance sweep
+      res_cal_dir=None        path to an open-short-load calibration folder
+                              (see hp8673h.py's calibrate_osl()) -- omit to
+                              use uncalibrated raw reflected power
+      fwhm_margin=1.0         averaged-sweep span = FWHM * this margin
+                              (only used when start_hz/stop_hz aren't given)
+      start_hz=None           explicit sweep start frequency -- overrides
+                              the resonance-sweep-derived range if given
+      stop_hz=None            explicit sweep stop frequency -- overrides
+                              the resonance-sweep-derived range if given
+      step_hz=1e6             frequency step for the averaged sweep
+      n_repeats=30            number of full sweeps to average together
+      drive_power_dbm=0.0     (constant) drive power during the scan
+      threshold_dbm=-10.0     interlock trip threshold, in dBm
+      settle_s=0.05           settle time after each frequency change --
+                               NEVER 0, see hp8673h.py's frequency_sweep()
+                               docstring for why
+      chop_freq_hz=1000.0     AWG CH2 / lock-in reference frequency
+      chop_duty_pct=50.0      AWG CH2 duty cycle
+      time_constant_s=0.1     SR830 time constant
+      settle_time_constants=5.0  how many time constants to wait after
+                                  each frequency change before reading the
+                                  lock-in (in addition to settle_s)
+      sensitivity_v=5e-3      SR830 sensitivity target -- ignored by default
+                               since auto_sensitivity=true
+      auto_sensitivity=true   call AGAN once RF/chop is running, before the
+                               first repeat starts (see cmd_run's docstring)
+      phase_deg=0.0           pre-calibrated SR830 phase
+      input_coupling=ac       SR830 input coupling, 'ac' or 'dc'
+      ch1_carrier_freq_hz=80e6  AWG CH1 continuous, unmodulated carrier
+                                frequency -- unrelated to the chop, just
+                                stays running throughout
+      ch1_carrier_vpp=0.632     AWG CH1 carrier amplitude
+
+    Saves resonance_sweep()'s own {file_name}_resonance_coarse.csv/
+    _fine.csv (if use_resonance_sweep=true), each repeat i (0-indexed):
+      <file_name>_repeat{i}_freqs_hz.npy, _x.npy, _y.npy, _reflected_dbm.npy
+    and after all repeats (or upon early stop, if at least one repeat
+    completed fully):
+      <file_name>_avg_freqs_hz.npy, _avg_x.npy, _avg_y.npy, _avg_r.npy,
+      _avg_metadata.txt (records n_repeats_averaged vs. n_repeats_requested)
+    """
+    use_resonance_sweep = str(kw.get("use_resonance_sweep", "true")).lower() == "true"
+    res_start_hz = float(kw.get("res_start_hz", 2.0e9))
+    res_stop_hz = float(kw.get("res_stop_hz", 3.0e9))
+    coarse_step_hz = float(kw.get("coarse_step_hz", 6.7e6))
+    fine_span_hz = float(kw.get("fine_span_hz", 20e6))
+    fine_step_hz = float(kw.get("fine_step_hz", 50e3))
+    res_power_dbm = float(kw.get("res_power_dbm", -40.0))
+    res_cal_dir = kw.get("res_cal_dir", None)
+    fwhm_margin = float(kw.get("fwhm_margin", 1.0))
+    manual_start_hz = kw.get("start_hz", None)
+    manual_stop_hz = kw.get("stop_hz", None)
+    if not use_resonance_sweep and (manual_start_hz is None or manual_stop_hz is None):
+        raise ValueError("start_hz and stop_hz must both be given when "
+                          "use_resonance_sweep=false")
+    step_hz = float(kw.get("step_hz", 1e6))
+    n_repeats = int(kw.get("n_repeats", 30))
+    drive_power_dbm = float(kw.get("drive_power_dbm", 0.0))
+    threshold_dbm = float(kw.get("threshold_dbm", -10.0))
+    settle_s = float(kw.get("settle_s", 0.05))  # NEVER 0 -- see
+                                                  # hp8673h.py's
+                                                  # frequency_sweep()
+                                                  # docstring
+    chop_freq_hz = float(kw.get("chop_freq_hz", 1000.0))
+    chop_duty_pct = float(kw.get("chop_duty_pct", 50.0))
+    time_constant_s = float(kw.get("time_constant_s", 0.1))
+    settle_time_constants = float(kw.get("settle_time_constants", 5.0))
+    sensitivity_v = float(kw.get("sensitivity_v", 5e-3))
+    auto_sensitivity = str(kw.get("auto_sensitivity", "true")).lower() == "true"
+    phase_deg = float(kw.get("phase_deg", 0.0))
+    input_coupling = str(kw.get("input_coupling", "ac"))
+    ch1_carrier_freq_hz = float(kw.get("ch1_carrier_freq_hz", 80e6))
+    ch1_carrier_vpp = float(kw.get("ch1_carrier_vpp", 0.632))
+
+    run_path = f"{DATA_DIR}/{file_name}"
+    import os
+    os.makedirs(run_path, exist_ok=True)
+    log_dir = f"{DATA_DIR}/logs"
+    os.makedirs(log_dir, exist_ok=True)
+    log_path = f"{log_dir}/{file_name}_sweep_average.txt"
+
+    with _tee_stdout(log_path):
+        print("[cw_odmr_lock_in] step 1/3: configuring AWG CH1 (continuous carrier) "
+              "+ CH2 "
+              f"({'static, not chopping yet' if use_resonance_sweep else 'chop'}) "
+              "+ SR830 lock-in")
+        awg = ks33600a.KS33600A(AWG_RESOURCE, debug=True)
+        setup_ch1_carrier(awg, ch1_carrier_freq_hz, ch1_carrier_vpp)
+        if use_resonance_sweep:
+            # Hold the switch parked on the sample path (RF2) instead of
+            # chopping for now -- resonance_sweep() below reads the
+            # analyzer and needs a clean, unmodulated signal. Chopping
+            # only starts once resonance is found (see cw_odmr_lock_in's
+            # notes.md entry on why this ordering matters).
+            set_switch_static(awg, route_to_sample=True)
+        else:
+            setup_chop(awg, chop_freq_hz, chop_duty_pct)
+            awg.close()
+
+        lia = SR830(SR830_RESOURCE, debug=True)
+        setup_lock_in(lia, chop_freq_hz, time_constant_s, sensitivity_v, phase_deg,
+                      input_coupling, auto_sensitivity=auto_sensitivity)
+        print(f"[cw_odmr_lock_in] step 1/3 done: CH1 continuous carrier "
+              f"{ch1_carrier_freq_hz/1e6:.1f} MHz / {ch1_carrier_vpp*1e3:.0f} mVpp; "
+              f"time constant {time_constant_s*1e3:.1f} ms, phase {phase_deg} deg "
+              f"(NOT auto-calibrated -- see module docstring)")
+
+        print("[cw_odmr_lock_in] step 2/3: connecting to HP8673H + E4403B (interlock)")
+        gen = HP8673H(GEN_RESOURCE)
+        ilock_sa = None
+        x_repeats = []
+        y_repeats = []
+        try:
+            if use_resonance_sweep:
+                print(f"[cw_odmr_lock_in] step 2/3: sweeping for resonance "
+                      f"({res_start_hz/1e9:.4f}-{res_stop_hz/1e9:.4f} GHz, "
+                      f"{res_power_dbm} dBm)")
+                from e4403b import E4403B
+                sa = E4403B(SA_RESOURCE)
+                result = gen.resonance_sweep(
+                    sa, res_start_hz, res_stop_hz, coarse_step_hz, fine_span_hz,
+                    fine_step_hz, res_power_dbm,
+                    output_prefix=f"{run_path}/{file_name}_resonance",
+                    cal_dir=res_cal_dir,
+                )
+                f0_hz = result["f0_hz"]
+                fwhm_hz = result["fwhm_hz"]
+                print(f"[cw_odmr_lock_in] step 2/3 done: f0 = {f0_hz/1e9:.5f} GHz, "
+                      f"FWHM = {fwhm_hz/1e6:.3f} MHz, Q ~= {result['Q']:.0f}")
+
+                sa.go_to_local()
+                sa.close()
+
+                print("[cw_odmr_lock_in] enabling switch chop now that resonance is "
+                      f"located ({chop_duty_pct:.0f}% duty @ {chop_freq_hz:.0f} Hz)")
+                setup_chop(awg, chop_freq_hz, chop_duty_pct)
+                awg.close()
+
+                if manual_start_hz is not None and manual_stop_hz is not None:
+                    start_hz = float(manual_start_hz)
+                    stop_hz = float(manual_stop_hz)
+                    print(f"[cw_odmr_lock_in] using manually-given range "
+                          f"{start_hz/1e9:.5f}-{stop_hz/1e9:.5f} GHz instead of "
+                          f"the resonance-sweep-derived one")
+                else:
+                    span_hz = fwhm_hz * fwhm_margin
+                    start_hz = f0_hz - span_hz / 2
+                    stop_hz = f0_hz + span_hz / 2
+            else:
+                start_hz = float(manual_start_hz)
+                stop_hz = float(manual_stop_hz)
+
+            freqs_hz = np.arange(start_hz, stop_hz + step_hz / 2, step_hz)
+
+            print(f"[cw_odmr_lock_in] step 3/3: sweeping "
+                  f"{start_hz/1e9:.5f}-{stop_hz/1e9:.5f} GHz "
+                  f"({len(freqs_hz)} points, {step_hz/1e6:.3f} MHz step), "
+                  f"{n_repeats} repeats to average, drive {drive_power_dbm} dBm, "
+                  f"threshold {threshold_dbm} dBm")
+
+            gen.preset()
+            gen.set_power_dbm(drive_power_dbm)
+            gen.set_frequency_hz(freqs_hz[0])
+            gen.rf_on()
+            time.sleep(1.0)  # let the initial frequency/level settle
+
+            if auto_sensitivity:
+                lia.auto_gain()
+                time.sleep(settle_time_constants * time_constant_s)
+                actual_sensitivity_v = lia.get_sensitivity_v()
+                print(f"[cw_odmr_lock_in] auto_sensitivity: AGAN selected "
+                      f"{actual_sensitivity_v:.3e} V full scale")
+                sensitivity_v = actual_sensitivity_v
+
+            ilock_sa = HP8673H.try_connect_analyzer(SA_RESOURCE)
+            if ilock_sa is None:
+                gen.trip_interlock("spectrum analyzer not reachable at startup")
+                return
+
+            settle_after_step_s = settle_time_constants * time_constant_s
+            tripped = False
+
+            try:
+                for rep in range(n_repeats):
+                    x_values = np.full(len(freqs_hz), np.nan)
+                    y_values = np.full(len(freqs_hz), np.nan)
+                    reflected_dbm_arr = np.full(len(freqs_hz), np.nan)
+                    n_completed = 0
+
+                    print(f"[cw_odmr_lock_in] repeat {rep + 1}/{n_repeats}: starting sweep")
+
+                    for i, f in enumerate(freqs_hz):
+                        gen.set_frequency_hz(f)
+                        time.sleep(settle_s)
+
+                        reflected_dbm = HP8673H.read_reflected_power_dbm(ilock_sa, f)
+                        reflected_dbm_arr[i] = (reflected_dbm if reflected_dbm is not None
+                                                 else np.nan)
+
+                        if reflected_dbm is None or reflected_dbm > threshold_dbm:
+                            reason = (
+                                "spectrum analyzer unreachable"
+                                if reflected_dbm is None else
+                                f"reflected power {reflected_dbm:.2f} dBm exceeds "
+                                f"threshold {threshold_dbm} dBm"
+                            )
+                            gen.trip_interlock(f"{reason} at {f/1e9:.5f} GHz "
+                                                f"(repeat {rep + 1}/{n_repeats}, "
+                                                f"point {i + 1}/{len(freqs_hz)})")
+                            tripped = True
+                            break
+
+                        time.sleep(settle_after_step_s)
+
+                        x, y = lia.read_xy()
+                        x_values[i] = x
+                        y_values[i] = y
+                        n_completed = i + 1
+
+                    np.save(f"{run_path}/{file_name}_repeat{rep}_freqs_hz.npy",
+                            freqs_hz[:n_completed])
+                    np.save(f"{run_path}/{file_name}_repeat{rep}_x.npy",
+                            x_values[:n_completed])
+                    np.save(f"{run_path}/{file_name}_repeat{rep}_y.npy",
+                            y_values[:n_completed])
+                    np.save(f"{run_path}/{file_name}_repeat{rep}_reflected_dbm.npy",
+                            reflected_dbm_arr[:n_completed])
+
+                    if n_completed == len(freqs_hz):
+                        x_repeats.append(x_values)
+                        y_repeats.append(y_values)
+                        print(f"[cw_odmr_lock_in] repeat {rep + 1}/{n_repeats} done: "
+                              f"{n_completed}/{len(freqs_hz)} points, saved "
+                              f"{file_name}_repeat{rep}_*.npy")
+                    else:
+                        # A partial repeat (interlock tripped mid-sweep) isn't a
+                        # like-for-like full-range sweep -- still saved to disk
+                        # above, but excluded from the average (a short/NaN-
+                        # padded array averaged against full ones would bias
+                        # the result rather than just reducing its noise).
+                        print(f"[cw_odmr_lock_in] repeat {rep + 1}/{n_repeats} PARTIAL "
+                              f"({n_completed}/{len(freqs_hz)} points) -- saved but "
+                              f"excluded from the average")
+
+                    if tripped:
+                        break
+            except KeyboardInterrupt:
+                print("[cw_odmr_lock_in] stopped by user (Ctrl+C)")
+
+            n_good_repeats = len(x_repeats)
+            if n_good_repeats == 0:
+                print("[cw_odmr_lock_in] FAILED: no complete repeats -- nothing to average")
+            else:
+                x_avg = np.mean(np.stack(x_repeats), axis=0)
+                y_avg = np.mean(np.stack(y_repeats), axis=0)
+                r_avg = np.hypot(x_avg, y_avg)
+
+                np.save(f"{run_path}/{file_name}_avg_freqs_hz.npy", freqs_hz)
+                np.save(f"{run_path}/{file_name}_avg_x.npy", x_avg)
+                np.save(f"{run_path}/{file_name}_avg_y.npy", y_avg)
+                np.save(f"{run_path}/{file_name}_avg_r.npy", r_avg)
+                with open(f"{run_path}/{file_name}_avg_metadata.txt", "w") as fh:
+                    fh.write(f"start_hz={start_hz}\n")
+                    fh.write(f"stop_hz={stop_hz}\n")
+                    fh.write(f"step_hz={step_hz}\n")
+                    fh.write(f"n_repeats_requested={n_repeats}\n")
+                    fh.write(f"n_repeats_averaged={n_good_repeats}\n")
+                    fh.write(f"chop_freq_hz={chop_freq_hz}\n")
+                    fh.write(f"chop_duty_pct={chop_duty_pct}\n")
+                    fh.write(f"time_constant_s={time_constant_s}\n")
+                    fh.write(f"settle_time_constants={settle_time_constants}\n")
+                    fh.write(f"sensitivity_v={sensitivity_v}\n")
+                    fh.write(f"phase_deg={phase_deg}\n")
+                    fh.write(f"drive_power_dbm={drive_power_dbm}\n")
+                print(f"[cw_odmr_lock_in] averaging done: {n_good_repeats}/{n_repeats} "
+                      f"complete repeats averaged, saved {file_name}_avg_freqs_hz.npy, "
+                      f"_avg_x.npy, _avg_y.npy, _avg_r.npy, _avg_metadata.txt")
+        finally:
+            print("[cw_odmr_lock_in] shutting down")
+            try:
+                gen.rf_off()
+            except Exception as e:
+                print(f"[cw_odmr_lock_in] WARNING: failed to turn off RF cleanly ({e})")
+            try:
+                gen.go_to_local()
+            except Exception:
+                pass
+            gen.close()
+            if ilock_sa is not None:
+                ilock_sa.close()
+            try:
+                lia.go_to_local()
+            except Exception:
+                pass
+            lia.close()
+            try:
+                awg.close()
+            except Exception:
+                pass
+
+    print("[cw_odmr_lock_in] done")
+
+
 def cmd_calibrate_osl(cal_dir, **kw):
     """
     Open-short-load scalar calibration for the resonance sweep (see
@@ -704,11 +1101,14 @@ def main():
         cmd_run(file_name, **extra)
     elif command == "single":
         cmd_single(file_name, **extra)
+    elif command == "sweep-average":
+        cmd_sweep_average(file_name, **extra)
     elif command == "calibrate-osl":
         cmd_calibrate_osl(file_name, **extra)
     else:
         raise SystemExit(f"unknown command {command!r} "
-                          f"(expected 'run', 'single', or 'calibrate-osl')")
+                          f"(expected 'run', 'single', 'sweep-average', or "
+                          f"'calibrate-osl')")
 
 
 if __name__ == "__main__":
