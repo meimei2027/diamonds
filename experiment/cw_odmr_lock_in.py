@@ -153,7 +153,10 @@ Usage:
         instead of (or in addition to) one very-long-time-constant sweep,
         with visibility into each repeat as it finishes. See
         cmd_sweep_average()'s docstring for the full list of key=value
-        overrides. Saves per repeat i:
+        overrides. Also supports drive_power_dbm_list (e.g.
+        "-40,-20,-10,0") to repeat the whole averaged sweep once per power
+        level in the list, for a power-dependence study -- output files get
+        a "_p{power_tag}" segment when this is used. Saves per repeat i:
         <file_name>_repeat{i}_freqs_hz.npy, _x.npy, _y.npy,
         _reflected_dbm.npy, and after all repeats:
         <file_name>_avg_freqs_hz.npy, _avg_x.npy, _avg_y.npy, _avg_r.npy,
@@ -189,6 +192,14 @@ SA_RESOURCE = "GPIB0::18::INSTR"
 SR830_RESOURCE = "GPIB2::2::INSTR"
 
 DATA_DIR = "D:\\cw_odmr_lock_in"
+
+
+def _power_tag(power_dbm):
+    """Filesystem-safe tag for a dBm value, e.g. -40.0 -> 'm40dBm',
+    0.0 -> '0dBm', -3.5 -> 'm3p5dBm' -- used to disambiguate per-power
+    output files in cmd_sweep_average()'s drive_power_dbm_list mode."""
+    sign = "m" if power_dbm < 0 else ""
+    return f"{sign}{abs(power_dbm):g}dBm".replace(".", "p")
 
 
 def setup_ch1_carrier(awg, carrier_freq_hz=80e6, carrier_vpp=0.632):
@@ -748,8 +759,22 @@ def cmd_sweep_average(file_name, **kw):
       stop_hz=None            explicit sweep stop frequency -- overrides
                               the resonance-sweep-derived range if given
       step_hz=1e6             frequency step for the averaged sweep
-      n_repeats=30            number of full sweeps to average together
-      drive_power_dbm=0.0     (constant) drive power during the scan
+      n_repeats=30            number of full sweeps to average together, PER
+                              power level
+      drive_power_dbm=0.0     (constant) drive power during the scan --
+                              ignored if drive_power_dbm_list is given
+      drive_power_dbm_list=None  comma-separated list of drive powers, e.g.
+                              "-40,-20,-10,0" -- if given, repeats the WHOLE
+                              n_repeats-averaged sweep once per power level
+                              in the list (same frequency range and repeat
+                              count for each), for a power-dependence study
+                              (e.g. power broadening). auto_sensitivity (if
+                              enabled) re-runs AGAN once per power level,
+                              since signal size can change a lot with drive
+                              power. A Ctrl+C or interlock trip during any
+                              power's sweep stops the WHOLE list, not just
+                              that one power -- whatever powers completed
+                              fully before that are still saved.
       threshold_dbm=-10.0     interlock trip threshold, in dBm
       settle_s=0.05           settle time after each frequency change --
                                NEVER 0, see hp8673h.py's frequency_sweep()
@@ -772,12 +797,21 @@ def cmd_sweep_average(file_name, **kw):
       ch1_carrier_vpp=0.632     AWG CH1 carrier amplitude
 
     Saves resonance_sweep()'s own {file_name}_resonance_coarse.csv/
-    _fine.csv (if use_resonance_sweep=true), each repeat i (0-indexed):
+    _fine.csv (if use_resonance_sweep=true). If drive_power_dbm_list is NOT
+    given (single power, the default), file names are unchanged from
+    before: each repeat i (0-indexed):
       <file_name>_repeat{i}_freqs_hz.npy, _x.npy, _y.npy, _reflected_dbm.npy
     and after all repeats (or upon early stop, if at least one repeat
     completed fully):
       <file_name>_avg_freqs_hz.npy, _avg_x.npy, _avg_y.npy, _avg_r.npy,
       _avg_metadata.txt (records n_repeats_averaged vs. n_repeats_requested)
+    If drive_power_dbm_list IS given, every file name gets a
+    "_p{power_tag}" segment identifying which power it's from (e.g.
+    -40.0 dBm -> "m40dBm", 0.0 dBm -> "0dBm"), one full set of the above
+    per power level:
+      <file_name>_p{power_tag}_repeat{i}_freqs_hz.npy, ...
+      <file_name>_p{power_tag}_avg_freqs_hz.npy, ...,
+      _avg_metadata.txt (also records drive_power_dbm for that power level)
     """
     use_resonance_sweep = str(kw.get("use_resonance_sweep", "true")).lower() == "true"
     res_start_hz = float(kw.get("res_start_hz", 2.0e9))
@@ -795,7 +829,12 @@ def cmd_sweep_average(file_name, **kw):
                           "use_resonance_sweep=false")
     step_hz = float(kw.get("step_hz", 1e6))
     n_repeats = int(kw.get("n_repeats", 30))
-    drive_power_dbm = float(kw.get("drive_power_dbm", 0.0))
+    drive_power_dbm_list_raw = kw.get("drive_power_dbm_list", None)
+    multi_power = drive_power_dbm_list_raw is not None
+    if multi_power:
+        power_list = [float(p) for p in str(drive_power_dbm_list_raw).split(",")]
+    else:
+        power_list = [float(kw.get("drive_power_dbm", 0.0))]
     threshold_dbm = float(kw.get("threshold_dbm", -10.0))
     settle_s = float(kw.get("settle_s", 0.05))  # NEVER 0 -- see
                                                   # hp8673h.py's
@@ -848,8 +887,6 @@ def cmd_sweep_average(file_name, **kw):
         print("[cw_odmr_lock_in] step 2/3: connecting to HP8673H + E4403B (interlock)")
         gen = HP8673H(GEN_RESOURCE)
         ilock_sa = None
-        x_repeats = []
-        y_repeats = []
         try:
             if use_resonance_sweep:
                 print(f"[cw_odmr_lock_in] step 2/3: sweeping for resonance "
@@ -895,22 +932,13 @@ def cmd_sweep_average(file_name, **kw):
             print(f"[cw_odmr_lock_in] step 3/3: sweeping "
                   f"{start_hz/1e9:.5f}-{stop_hz/1e9:.5f} GHz "
                   f"({len(freqs_hz)} points, {step_hz/1e6:.3f} MHz step), "
-                  f"{n_repeats} repeats to average, drive {drive_power_dbm} dBm, "
-                  f"threshold {threshold_dbm} dBm")
+                  f"{n_repeats} repeats to average, threshold {threshold_dbm} dBm, "
+                  f"power(s): {', '.join(f'{p:g} dBm' for p in power_list)}")
 
             gen.preset()
-            gen.set_power_dbm(drive_power_dbm)
             gen.set_frequency_hz(freqs_hz[0])
             gen.rf_on()
             time.sleep(1.0)  # let the initial frequency/level settle
-
-            if auto_sensitivity:
-                lia.auto_gain()
-                time.sleep(settle_time_constants * time_constant_s)
-                actual_sensitivity_v = lia.get_sensitivity_v()
-                print(f"[cw_odmr_lock_in] auto_sensitivity: AGAN selected "
-                      f"{actual_sensitivity_v:.3e} V full scale")
-                sensitivity_v = actual_sensitivity_v
 
             ilock_sa = HP8673H.try_connect_analyzer(SA_RESOURCE)
             if ilock_sa is None:
@@ -918,103 +946,136 @@ def cmd_sweep_average(file_name, **kw):
                 return
 
             settle_after_step_s = settle_time_constants * time_constant_s
-            tripped = False
+            stop_all = False
 
-            try:
-                for rep in range(n_repeats):
-                    x_values = np.full(len(freqs_hz), np.nan)
-                    y_values = np.full(len(freqs_hz), np.nan)
-                    reflected_dbm_arr = np.full(len(freqs_hz), np.nan)
-                    n_completed = 0
+            for power_dbm in power_list:
+                if stop_all:
+                    break
 
-                    print(f"[cw_odmr_lock_in] repeat {rep + 1}/{n_repeats}: starting sweep")
+                power_tag = _power_tag(power_dbm) if multi_power else None
+                file_prefix = (f"{file_name}_p{power_tag}" if multi_power
+                               else file_name)
 
-                    for i, f in enumerate(freqs_hz):
-                        gen.set_frequency_hz(f)
-                        time.sleep(settle_s)
+                gen.set_power_dbm(power_dbm)
+                time.sleep(1.0)  # let the new power level settle
+                print(f"[cw_odmr_lock_in] drive power {power_dbm:g} dBm: settled")
 
-                        reflected_dbm = HP8673H.read_reflected_power_dbm(ilock_sa, f)
-                        reflected_dbm_arr[i] = (reflected_dbm if reflected_dbm is not None
-                                                 else np.nan)
+                if auto_sensitivity:
+                    lia.auto_gain()
+                    time.sleep(settle_after_step_s)
+                    actual_sensitivity_v = lia.get_sensitivity_v()
+                    print(f"[cw_odmr_lock_in] auto_sensitivity: AGAN selected "
+                          f"{actual_sensitivity_v:.3e} V full scale at "
+                          f"{power_dbm:g} dBm")
+                    sensitivity_v = actual_sensitivity_v
 
-                        if reflected_dbm is None or reflected_dbm > threshold_dbm:
-                            reason = (
-                                "spectrum analyzer unreachable"
-                                if reflected_dbm is None else
-                                f"reflected power {reflected_dbm:.2f} dBm exceeds "
-                                f"threshold {threshold_dbm} dBm"
-                            )
-                            gen.trip_interlock(f"{reason} at {f/1e9:.5f} GHz "
-                                                f"(repeat {rep + 1}/{n_repeats}, "
-                                                f"point {i + 1}/{len(freqs_hz)})")
-                            tripped = True
+                x_repeats = []
+                y_repeats = []
+                tripped = False
+
+                try:
+                    for rep in range(n_repeats):
+                        x_values = np.full(len(freqs_hz), np.nan)
+                        y_values = np.full(len(freqs_hz), np.nan)
+                        reflected_dbm_arr = np.full(len(freqs_hz), np.nan)
+                        n_completed = 0
+
+                        print(f"[cw_odmr_lock_in] {power_dbm:g} dBm, repeat "
+                              f"{rep + 1}/{n_repeats}: starting sweep")
+
+                        for i, f in enumerate(freqs_hz):
+                            gen.set_frequency_hz(f)
+                            time.sleep(settle_s)
+
+                            reflected_dbm = HP8673H.read_reflected_power_dbm(ilock_sa, f)
+                            reflected_dbm_arr[i] = (reflected_dbm if reflected_dbm is not None
+                                                     else np.nan)
+
+                            if reflected_dbm is None or reflected_dbm > threshold_dbm:
+                                reason = (
+                                    "spectrum analyzer unreachable"
+                                    if reflected_dbm is None else
+                                    f"reflected power {reflected_dbm:.2f} dBm exceeds "
+                                    f"threshold {threshold_dbm} dBm"
+                                )
+                                gen.trip_interlock(f"{reason} at {f/1e9:.5f} GHz "
+                                                    f"({power_dbm:g} dBm, repeat "
+                                                    f"{rep + 1}/{n_repeats}, "
+                                                    f"point {i + 1}/{len(freqs_hz)})")
+                                tripped = True
+                                break
+
+                            time.sleep(settle_after_step_s)
+
+                            x, y = lia.read_xy()
+                            x_values[i] = x
+                            y_values[i] = y
+                            n_completed = i + 1
+
+                        np.save(f"{run_path}/{file_prefix}_repeat{rep}_freqs_hz.npy",
+                                freqs_hz[:n_completed])
+                        np.save(f"{run_path}/{file_prefix}_repeat{rep}_x.npy",
+                                x_values[:n_completed])
+                        np.save(f"{run_path}/{file_prefix}_repeat{rep}_y.npy",
+                                y_values[:n_completed])
+                        np.save(f"{run_path}/{file_prefix}_repeat{rep}_reflected_dbm.npy",
+                                reflected_dbm_arr[:n_completed])
+
+                        if n_completed == len(freqs_hz):
+                            x_repeats.append(x_values)
+                            y_repeats.append(y_values)
+                            print(f"[cw_odmr_lock_in] {power_dbm:g} dBm, repeat "
+                                  f"{rep + 1}/{n_repeats} done: "
+                                  f"{n_completed}/{len(freqs_hz)} points, saved "
+                                  f"{file_prefix}_repeat{rep}_*.npy")
+                        else:
+                            # A partial repeat (interlock tripped mid-sweep) isn't a
+                            # like-for-like full-range sweep -- still saved to disk
+                            # above, but excluded from the average (a short/NaN-
+                            # padded array averaged against full ones would bias
+                            # the result rather than just reducing its noise).
+                            print(f"[cw_odmr_lock_in] {power_dbm:g} dBm, repeat "
+                                  f"{rep + 1}/{n_repeats} PARTIAL "
+                                  f"({n_completed}/{len(freqs_hz)} points) -- saved "
+                                  f"but excluded from the average")
+
+                        if tripped:
+                            stop_all = True
                             break
+                except KeyboardInterrupt:
+                    print("[cw_odmr_lock_in] stopped by user (Ctrl+C)")
+                    stop_all = True
 
-                        time.sleep(settle_after_step_s)
+                n_good_repeats = len(x_repeats)
+                if n_good_repeats == 0:
+                    print(f"[cw_odmr_lock_in] {power_dbm:g} dBm: FAILED -- no complete "
+                          f"repeats, nothing to average")
+                else:
+                    x_avg = np.mean(np.stack(x_repeats), axis=0)
+                    y_avg = np.mean(np.stack(y_repeats), axis=0)
+                    r_avg = np.hypot(x_avg, y_avg)
 
-                        x, y = lia.read_xy()
-                        x_values[i] = x
-                        y_values[i] = y
-                        n_completed = i + 1
-
-                    np.save(f"{run_path}/{file_name}_repeat{rep}_freqs_hz.npy",
-                            freqs_hz[:n_completed])
-                    np.save(f"{run_path}/{file_name}_repeat{rep}_x.npy",
-                            x_values[:n_completed])
-                    np.save(f"{run_path}/{file_name}_repeat{rep}_y.npy",
-                            y_values[:n_completed])
-                    np.save(f"{run_path}/{file_name}_repeat{rep}_reflected_dbm.npy",
-                            reflected_dbm_arr[:n_completed])
-
-                    if n_completed == len(freqs_hz):
-                        x_repeats.append(x_values)
-                        y_repeats.append(y_values)
-                        print(f"[cw_odmr_lock_in] repeat {rep + 1}/{n_repeats} done: "
-                              f"{n_completed}/{len(freqs_hz)} points, saved "
-                              f"{file_name}_repeat{rep}_*.npy")
-                    else:
-                        # A partial repeat (interlock tripped mid-sweep) isn't a
-                        # like-for-like full-range sweep -- still saved to disk
-                        # above, but excluded from the average (a short/NaN-
-                        # padded array averaged against full ones would bias
-                        # the result rather than just reducing its noise).
-                        print(f"[cw_odmr_lock_in] repeat {rep + 1}/{n_repeats} PARTIAL "
-                              f"({n_completed}/{len(freqs_hz)} points) -- saved but "
-                              f"excluded from the average")
-
-                    if tripped:
-                        break
-            except KeyboardInterrupt:
-                print("[cw_odmr_lock_in] stopped by user (Ctrl+C)")
-
-            n_good_repeats = len(x_repeats)
-            if n_good_repeats == 0:
-                print("[cw_odmr_lock_in] FAILED: no complete repeats -- nothing to average")
-            else:
-                x_avg = np.mean(np.stack(x_repeats), axis=0)
-                y_avg = np.mean(np.stack(y_repeats), axis=0)
-                r_avg = np.hypot(x_avg, y_avg)
-
-                np.save(f"{run_path}/{file_name}_avg_freqs_hz.npy", freqs_hz)
-                np.save(f"{run_path}/{file_name}_avg_x.npy", x_avg)
-                np.save(f"{run_path}/{file_name}_avg_y.npy", y_avg)
-                np.save(f"{run_path}/{file_name}_avg_r.npy", r_avg)
-                with open(f"{run_path}/{file_name}_avg_metadata.txt", "w") as fh:
-                    fh.write(f"start_hz={start_hz}\n")
-                    fh.write(f"stop_hz={stop_hz}\n")
-                    fh.write(f"step_hz={step_hz}\n")
-                    fh.write(f"n_repeats_requested={n_repeats}\n")
-                    fh.write(f"n_repeats_averaged={n_good_repeats}\n")
-                    fh.write(f"chop_freq_hz={chop_freq_hz}\n")
-                    fh.write(f"chop_duty_pct={chop_duty_pct}\n")
-                    fh.write(f"time_constant_s={time_constant_s}\n")
-                    fh.write(f"settle_time_constants={settle_time_constants}\n")
-                    fh.write(f"sensitivity_v={sensitivity_v}\n")
-                    fh.write(f"phase_deg={phase_deg}\n")
-                    fh.write(f"drive_power_dbm={drive_power_dbm}\n")
-                print(f"[cw_odmr_lock_in] averaging done: {n_good_repeats}/{n_repeats} "
-                      f"complete repeats averaged, saved {file_name}_avg_freqs_hz.npy, "
-                      f"_avg_x.npy, _avg_y.npy, _avg_r.npy, _avg_metadata.txt")
+                    np.save(f"{run_path}/{file_prefix}_avg_freqs_hz.npy", freqs_hz)
+                    np.save(f"{run_path}/{file_prefix}_avg_x.npy", x_avg)
+                    np.save(f"{run_path}/{file_prefix}_avg_y.npy", y_avg)
+                    np.save(f"{run_path}/{file_prefix}_avg_r.npy", r_avg)
+                    with open(f"{run_path}/{file_prefix}_avg_metadata.txt", "w") as fh:
+                        fh.write(f"start_hz={start_hz}\n")
+                        fh.write(f"stop_hz={stop_hz}\n")
+                        fh.write(f"step_hz={step_hz}\n")
+                        fh.write(f"n_repeats_requested={n_repeats}\n")
+                        fh.write(f"n_repeats_averaged={n_good_repeats}\n")
+                        fh.write(f"chop_freq_hz={chop_freq_hz}\n")
+                        fh.write(f"chop_duty_pct={chop_duty_pct}\n")
+                        fh.write(f"time_constant_s={time_constant_s}\n")
+                        fh.write(f"settle_time_constants={settle_time_constants}\n")
+                        fh.write(f"sensitivity_v={sensitivity_v}\n")
+                        fh.write(f"phase_deg={phase_deg}\n")
+                        fh.write(f"drive_power_dbm={power_dbm}\n")
+                    print(f"[cw_odmr_lock_in] {power_dbm:g} dBm: averaging done: "
+                          f"{n_good_repeats}/{n_repeats} complete repeats averaged, "
+                          f"saved {file_prefix}_avg_freqs_hz.npy, _avg_x.npy, "
+                          f"_avg_y.npy, _avg_r.npy, _avg_metadata.txt")
         finally:
             print("[cw_odmr_lock_in] shutting down")
             try:
