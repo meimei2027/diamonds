@@ -232,6 +232,31 @@ class SR830:
         code = int(self.query("SENS?"))
         return self.SENSITIVITY_V[code]
 
+    def read_overload_status(self):
+        """
+        Query the LIA status byte (LIAS?) and decode the overload bits, per
+        the SR830 manual's status byte definition: bit 0 = input/reserve
+        overload, bit 1 = filter (time constant) overload, bit 2 = output
+        (X/Y/R) overload. NOT YET VERIFIED against the front-panel OVLD LED
+        on this specific unit -- cross-check once on real hardware (force
+        an overload deliberately, e.g. with sensitivity set far too
+        sensitive for the current signal, and confirm this matches the LED)
+        before trusting it unattended for anything safety-critical.
+
+        Returns a dict: {"input": bool, "filter": bool, "output": bool,
+        "any": bool} -- "any" is True if any of the three bits are set.
+        """
+        status = int(self.query("LIAS?"))
+        input_overload = bool(status & 0x01)
+        filter_overload = bool(status & 0x02)
+        output_overload = bool(status & 0x04)
+        return {
+            "input": input_overload,
+            "filter": filter_overload,
+            "output": output_overload,
+            "any": input_overload or filter_overload or output_overload,
+        }
+
     def auto_gain(self):
         self.write("AGAN")
 

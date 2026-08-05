@@ -133,6 +133,15 @@ Usage:
                                   is almost always right here (blocks the
                                   large DC baseline, leaving headroom for
                                   the much smaller AC modulation)
+          ch1_carrier_freq_hz=80e6  AWG CH1 continuous, unmodulated carrier
+                                  frequency -- unrelated to the chop, just
+                                  stays running throughout
+          ch1_carrier_vpp=0.632    AWG CH1 carrier amplitude
+          psu_voltage_v=12.0      SPD1305X output voltage for the RF
+                                  amplifier supply -- turned on right
+                                  before the resonance sweep starts, off
+                                  when the run ends (see spd1305x.py)
+          psu_current_limit_a=1.9  SPD1305X current limit
 
     python cw_odmr_lock_in.py single <file_name> [key=value ...]
         Holds the generator at ONE fixed frequency (default 2.87 GHz, no
@@ -184,14 +193,79 @@ import numpy as np
 import ks33600a
 from hp8673h import HP8673H
 from sr830 import SR830
+from spd1305x import SPD1305X
 from cw_odmr import parse_kv_args, _tee_stdout
 
 AWG_RESOURCE = "USB0::0x0957::0x5707::MY53800810::INSTR"
 GEN_RESOURCE = "GPIB1::19::INSTR"
 SA_RESOURCE = "GPIB0::18::INSTR"
 SR830_RESOURCE = "GPIB2::2::INSTR"
+# NOT YET VERIFIED -- confirm with pyvisa.ResourceManager().list_resources()
+# before trusting this (see notes.md's GPIB-bus-numbering gotchas).
+PSU_RESOURCE = "USB0::0xF4EC::0x1410::SPD13DCD7R1877::INSTR"
 
 DATA_DIR = "D:\\cw_odmr_lock_in"
+
+
+def check_resonance_position(gen, ilock_sa, freqs_hz, settle_s):
+    """
+    Quick reflected-power sweep across freqs_hz -- the SAME frequency range
+    about to be used for the real measurement sweep -- purely for
+    recording/reporting whether the resonance dip is still roughly where
+    it's expected to be. This is NOT a new interlock gate (the existing
+    inline interlock check during the real sweep still owns safety) --
+    it's here because at low scan power, reflected power can stay well
+    under the interlock threshold even after the resonance has drifted
+    well away from the intended window, since low drive power keeps
+    reflected power low either way regardless of how well-matched the
+    resonator actually is at that frequency. Confirmed on the bench: real
+    physical resonance drift went undetected for exactly this reason.
+
+    Returns a dict: {"freqs_hz", "reflected_dbm", "dip_freq_hz", "dip_dbm",
+    "offset_from_center_hz"} -- the last one is how far the dip is from the
+    center of freqs_hz, the simplest signal that the resonance has moved
+    relative to where this sweep assumes it is.
+    """
+    reflected_dbm_arr = np.full(len(freqs_hz), np.nan)
+    for i, f in enumerate(freqs_hz):
+        gen.set_frequency_hz(f)
+        time.sleep(settle_s)
+        reflected_dbm = HP8673H.read_reflected_power_dbm(ilock_sa, f)
+        reflected_dbm_arr[i] = reflected_dbm if reflected_dbm is not None else np.nan
+
+    if np.all(np.isnan(reflected_dbm_arr)):
+        return {"freqs_hz": freqs_hz, "reflected_dbm": reflected_dbm_arr,
+                "dip_freq_hz": np.nan, "dip_dbm": np.nan,
+                "offset_from_center_hz": np.nan}
+
+    dip_idx = int(np.nanargmin(reflected_dbm_arr))
+    dip_freq_hz = freqs_hz[dip_idx]
+    dip_dbm = reflected_dbm_arr[dip_idx]
+    center_hz = (freqs_hz[0] + freqs_hz[-1]) / 2
+    return {
+        "freqs_hz": freqs_hz,
+        "reflected_dbm": reflected_dbm_arr,
+        "dip_freq_hz": dip_freq_hz,
+        "dip_dbm": dip_dbm,
+        "offset_from_center_hz": dip_freq_hz - center_hz,
+    }
+
+
+def _step_sensitivity_coarser(lia):
+    """Step the SR830 to the next LESS sensitive (larger full-scale) range,
+    one step at a time -- used to back out of a real-time overload
+    condition mid-sweep without jumping straight to auto_gain() (which
+    could overshoot to an overly-insensitive range based on whatever the
+    signal happens to be doing at that specific frequency point). Returns
+    the new sensitivity in volts; unchanged if already at the least
+    sensitive range."""
+    current_v = lia.get_sensitivity_v()
+    idx = SR830.SENSITIVITY_V.index(current_v)
+    new_idx = min(idx + 1, len(SR830.SENSITIVITY_V) - 1)
+    new_v = SR830.SENSITIVITY_V[new_idx]
+    if new_idx != idx:
+        lia.set_sensitivity_v(new_v)
+    return new_v
 
 
 def _power_tag(power_dbm):
@@ -298,6 +372,8 @@ def cmd_run(file_name, **kw):
     input_coupling = str(kw.get("input_coupling", "ac"))
     ch1_carrier_freq_hz = float(kw.get("ch1_carrier_freq_hz", 80e6))
     ch1_carrier_vpp = float(kw.get("ch1_carrier_vpp", 0.632))
+    psu_voltage_v = float(kw.get("psu_voltage_v", 12.0))
+    psu_current_limit_a = float(kw.get("psu_current_limit_a", 1.9))
 
     run_path = f"{DATA_DIR}/{file_name}"
     import os
@@ -327,10 +403,14 @@ def cmd_run(file_name, **kw):
               f"resonance is found; time constant {time_constant_s*1e3:.1f} ms, "
               f"phase {phase_deg} deg (NOT auto-calibrated -- see module docstring)")
 
-        print("[cw_odmr_lock_in] step 2/4: connecting to HP8673H + E4403B (interlock)")
+        print("[cw_odmr_lock_in] step 2/4: connecting to HP8673H + E4403B (interlock) "
+              "+ SPD1305X (amplifier supply)")
         gen = HP8673H(GEN_RESOURCE)
+        psu = SPD1305X(PSU_RESOURCE)
         ilock_sa = None
         try:
+            psu.turn_on(psu_voltage_v, psu_current_limit_a)
+
             print(f"[cw_odmr_lock_in] step 2/4: sweeping for resonance "
                   f"({res_start_hz/1e9:.4f}-{res_stop_hz/1e9:.4f} GHz, {res_power_dbm} dBm)")
             from e4403b import E4403B
@@ -464,6 +544,16 @@ def cmd_run(file_name, **kw):
             except Exception:
                 pass
             gen.close()
+            try:
+                psu.turn_off()
+            except Exception as e:
+                print(f"[cw_odmr_lock_in] WARNING: failed to turn off amplifier "
+                      f"supply cleanly ({e})")
+            try:
+                psu.go_to_local()
+            except Exception:
+                pass
+            psu.close()
             if ilock_sa is not None:
                 ilock_sa.close()
             try:
@@ -738,6 +828,36 @@ def cmd_sweep_average(file_name, **kw):
     ones would bias the result, not reduce its noise). Stop early with
     Ctrl+C -- same partial-repeat handling applies.
 
+    Real-time overload detection and auto-rescale (auto_rescale_on_overload,
+    default true): the SR830's sensitivity is picked once per power level
+    (via auto_sensitivity, at freqs_hz[0]) -- but real signal size can vary
+    a lot across a sweep (e.g. much bigger right at a resonance peak/dip
+    than elsewhere), so a range that's fine at the start can still overload
+    partway through. Every point checks the SR830's hardware overload
+    status (SR830.read_overload_status(), NOT just eyeballing the value
+    afterward) right after reading X/Y. On overload at point i: step
+    sensitivity one range coarser (_step_sensitivity_coarser() -- one step
+    at a time, not straight to auto_gain(), to avoid overshooting into an
+    overly-insensitive range based on one anomalous point), then rescan
+    from i - rescan_backoff_points (clamped to 0), NOT from the beginning
+    of the repeat -- deliberately does not touch points before the
+    backed-up index, since those already read fine at the OLD, more
+    sensitive range; blanket-rescaling and redoing the WHOLE repeat would
+    needlessly throw away good data AND leave the rest of the sweep coarser
+    than it needs to be (worse resolution elsewhere for a problem that was
+    local to one region -- overloading "the other way," i.e. under-ranged,
+    if the rest of the sweep has a genuinely small signal). Each repeat
+    ends up with sensitivity mixed across regions if this triggers, which
+    is fine -- the SR830's X/Y are calibrated absolute values regardless of
+    range, changing sensitivity doesn't rescale the reported number, only
+    the resolution/full-scale headroom. Up to max_rescale_attempts total
+    rescale-and-backup events per repeat; if it's still overloading after
+    that, stops the repeat where it is and treats everything read so far as
+    PARTIAL (same handling as an interlock trip mid-repeat -- saved to
+    disk, excluded from the average) rather than looping forever. Does NOT
+    stop the whole run or move to the next power level -- only an interlock
+    trip does that.
+
     Recognized key=value overrides (all optional):
       use_resonance_sweep=true  run resonance_sweep() first to find f0/FWHM
                                 (switch held static, not chopping) and
@@ -761,6 +881,21 @@ def cmd_sweep_average(file_name, **kw):
       step_hz=1e6             frequency step for the averaged sweep
       n_repeats=30            number of full sweeps to average together, PER
                               power level
+      check_resonance_before_sweep=true  before each power level's repeats
+                              start, sweep reflected power across this SAME
+                              freqs_hz range and record/report where the
+                              dip actually is -- purely diagnostic, does
+                              NOT gate or abort anything (the inline
+                              interlock during the real sweep still owns
+                              safety). Exists because at low scan power,
+                              reflected power can stay well under the
+                              interlock threshold even after the resonance
+                              has drifted well away from this sweep's
+                              intended window -- confirmed on the bench.
+                              Saves <file_prefix>_resonance_check_freqs_hz.npy
+                              and _resonance_check_reflected_dbm.npy per
+                              power level, and prints the dip location/depth
+                              and how far it is from the center of freqs_hz.
       drive_power_dbm=0.0     (constant) drive power during the scan --
                               ignored if drive_power_dbm_list is given
       drive_power_dbm_list=None  comma-separated list of drive powers, e.g.
@@ -776,6 +911,14 @@ def cmd_sweep_average(file_name, **kw):
                               that one power -- whatever powers completed
                               fully before that are still saved.
       threshold_dbm=-10.0     interlock trip threshold, in dBm
+      auto_rescale_on_overload=true  detect SR830 overload in real time
+                              mid-sweep and auto-rescale + restart the
+                              current repeat -- see above
+      max_rescale_attempts=3  how many times to rescale-and-rescan within a
+                              single repeat before giving up on it and
+                              treating it as PARTIAL
+      rescan_backoff_points=2  how many points to back up (not restart from
+                              0) before rescanning after an overload
       settle_s=0.05           settle time after each frequency change --
                                NEVER 0, see hp8673h.py's frequency_sweep()
                                docstring for why
@@ -795,6 +938,12 @@ def cmd_sweep_average(file_name, **kw):
                                 frequency -- unrelated to the chop, just
                                 stays running throughout
       ch1_carrier_vpp=0.632     AWG CH1 carrier amplitude
+      psu_voltage_v=12.0      SPD1305X output voltage for the RF amplifier
+                              supply -- turned on right before the
+                              resonance sweep (or, if use_resonance_sweep
+                              =false, right before the measurement sweep)
+                              starts, off when the whole run ends
+      psu_current_limit_a=1.9  SPD1305X current limit
 
     Saves resonance_sweep()'s own {file_name}_resonance_coarse.csv/
     _fine.csv (if use_resonance_sweep=true). If drive_power_dbm_list is NOT
@@ -829,6 +978,8 @@ def cmd_sweep_average(file_name, **kw):
                           "use_resonance_sweep=false")
     step_hz = float(kw.get("step_hz", 1e6))
     n_repeats = int(kw.get("n_repeats", 30))
+    check_resonance_before_sweep = str(
+        kw.get("check_resonance_before_sweep", "true")).lower() == "true"
     drive_power_dbm_list_raw = kw.get("drive_power_dbm_list", None)
     multi_power = drive_power_dbm_list_raw is not None
     if multi_power:
@@ -836,6 +987,9 @@ def cmd_sweep_average(file_name, **kw):
     else:
         power_list = [float(kw.get("drive_power_dbm", 0.0))]
     threshold_dbm = float(kw.get("threshold_dbm", -10.0))
+    auto_rescale_on_overload = str(kw.get("auto_rescale_on_overload", "true")).lower() == "true"
+    max_rescale_attempts = int(kw.get("max_rescale_attempts", 3))
+    rescan_backoff_points = int(kw.get("rescan_backoff_points", 2))
     settle_s = float(kw.get("settle_s", 0.05))  # NEVER 0 -- see
                                                   # hp8673h.py's
                                                   # frequency_sweep()
@@ -850,6 +1004,8 @@ def cmd_sweep_average(file_name, **kw):
     input_coupling = str(kw.get("input_coupling", "ac"))
     ch1_carrier_freq_hz = float(kw.get("ch1_carrier_freq_hz", 80e6))
     ch1_carrier_vpp = float(kw.get("ch1_carrier_vpp", 0.632))
+    psu_voltage_v = float(kw.get("psu_voltage_v", 12.0))
+    psu_current_limit_a = float(kw.get("psu_current_limit_a", 1.9))
 
     run_path = f"{DATA_DIR}/{file_name}"
     import os
@@ -884,10 +1040,14 @@ def cmd_sweep_average(file_name, **kw):
               f"time constant {time_constant_s*1e3:.1f} ms, phase {phase_deg} deg "
               f"(NOT auto-calibrated -- see module docstring)")
 
-        print("[cw_odmr_lock_in] step 2/3: connecting to HP8673H + E4403B (interlock)")
+        print("[cw_odmr_lock_in] step 2/3: connecting to HP8673H + E4403B (interlock) "
+              "+ SPD1305X (amplifier supply)")
         gen = HP8673H(GEN_RESOURCE)
+        psu = SPD1305X(PSU_RESOURCE)
         ilock_sa = None
         try:
+            psu.turn_on(psu_voltage_v, psu_current_limit_a)
+
             if use_resonance_sweep:
                 print(f"[cw_odmr_lock_in] step 2/3: sweeping for resonance "
                       f"({res_start_hz/1e9:.4f}-{res_stop_hz/1e9:.4f} GHz, "
@@ -960,6 +1120,21 @@ def cmd_sweep_average(file_name, **kw):
                 time.sleep(1.0)  # let the new power level settle
                 print(f"[cw_odmr_lock_in] drive power {power_dbm:g} dBm: settled")
 
+                if check_resonance_before_sweep:
+                    res_check = check_resonance_position(gen, ilock_sa, freqs_hz, settle_s)
+                    np.save(f"{run_path}/{file_prefix}_resonance_check_freqs_hz.npy",
+                            res_check["freqs_hz"])
+                    np.save(f"{run_path}/{file_prefix}_resonance_check_reflected_dbm.npy",
+                            res_check["reflected_dbm"])
+                    offset_mhz = res_check["offset_from_center_hz"] / 1e6
+                    print(f"[cw_odmr_lock_in] resonance check @ {power_dbm:g} dBm: "
+                          f"dip at {res_check['dip_freq_hz']/1e9:.5f} GHz "
+                          f"({res_check['dip_dbm']:.2f} dBm), "
+                          f"{offset_mhz:+.3f} MHz from the center of this sweep's range"
+                          + (" -- LOOKS OFF-CENTER, resonance may have drifted"
+                             if abs(offset_mhz) > (freqs_hz[-1] - freqs_hz[0]) / 1e6 / 4
+                             else ""))
+
                 if auto_sensitivity:
                     lia.auto_gain()
                     time.sleep(settle_after_step_s)
@@ -979,11 +1154,14 @@ def cmd_sweep_average(file_name, **kw):
                         y_values = np.full(len(freqs_hz), np.nan)
                         reflected_dbm_arr = np.full(len(freqs_hz), np.nan)
                         n_completed = 0
+                        rescale_attempts_used = 0
 
                         print(f"[cw_odmr_lock_in] {power_dbm:g} dBm, repeat "
                               f"{rep + 1}/{n_repeats}: starting sweep")
 
-                        for i, f in enumerate(freqs_hz):
+                        i = 0
+                        while i < len(freqs_hz):
+                            f = freqs_hz[i]
                             gen.set_frequency_hz(f)
                             time.sleep(settle_s)
 
@@ -1008,9 +1186,46 @@ def cmd_sweep_average(file_name, **kw):
                             time.sleep(settle_after_step_s)
 
                             x, y = lia.read_xy()
+
+                            if auto_rescale_on_overload:
+                                overload_status = lia.read_overload_status()
+                                if overload_status["any"]:
+                                    print(f"[cw_odmr_lock_in] OVERLOAD at "
+                                          f"{f/1e9:.5f} GHz ({power_dbm:g} dBm, "
+                                          f"repeat {rep + 1}/{n_repeats}, point "
+                                          f"{i + 1}/{len(freqs_hz)}): {overload_status}")
+
+                                    if rescale_attempts_used < max_rescale_attempts:
+                                        rescale_attempts_used += 1
+                                        old_v = lia.get_sensitivity_v()
+                                        new_v = _step_sensitivity_coarser(lia)
+                                        backoff = min(rescan_backoff_points, i)
+                                        resume_i = i - backoff
+                                        print(f"[cw_odmr_lock_in] rescaling "
+                                              f"sensitivity {old_v:.3e} V -> "
+                                              f"{new_v:.3e} V full scale, rescanning "
+                                              f"from point {resume_i + 1}/"
+                                              f"{len(freqs_hz)} (backing up {backoff} "
+                                              f"points, not the whole repeat -- "
+                                              f"attempt {rescale_attempts_used}/"
+                                              f"{max_rescale_attempts})")
+                                        sensitivity_v = new_v
+                                        time.sleep(settle_after_step_s)
+                                        i = resume_i
+                                        continue  # re-measure from resume_i onward
+                                    else:
+                                        print(f"[cw_odmr_lock_in] {power_dbm:g} dBm, "
+                                              f"repeat {rep + 1}/{n_repeats}: still "
+                                              f"overloading after {max_rescale_attempts} "
+                                              f"rescale attempts -- stopping here, "
+                                              f"treating as PARTIAL "
+                                              f"({n_completed}/{len(freqs_hz)} points)")
+                                        break
+
                             x_values[i] = x
                             y_values[i] = y
                             n_completed = i + 1
+                            i += 1
 
                         np.save(f"{run_path}/{file_prefix}_repeat{rep}_freqs_hz.npy",
                                 freqs_hz[:n_completed])
@@ -1087,6 +1302,16 @@ def cmd_sweep_average(file_name, **kw):
             except Exception:
                 pass
             gen.close()
+            try:
+                psu.turn_off()
+            except Exception as e:
+                print(f"[cw_odmr_lock_in] WARNING: failed to turn off amplifier "
+                      f"supply cleanly ({e})")
+            try:
+                psu.go_to_local()
+            except Exception:
+                pass
+            psu.close()
             if ilock_sa is not None:
                 ilock_sa.close()
             try:
