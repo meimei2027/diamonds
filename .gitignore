@@ -12,3 +12,4 @@ fp-lib-table
 __pycache__
 .claude
 vna/*.exe
+*/~$*.SLDPRT
