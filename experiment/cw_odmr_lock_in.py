@@ -6,72 +6,12 @@ segments.
 
 NOT YET TESTED against real hardware.
 
-WARNING -- read before trusting any result from this: chopping the
-microwave while the laser stays continuously on (as this script does) is
-EXACTLY the condition that produced a real, reproducible, but NOT-genuine-
-ODMR artifact in `cw_odmr.py`'s `contrast_check` (see notes.md /
-`contrast_check_result.ipynb`) -- a signal synchronized with RF on/off that
-turned out to be frequency-independent (same size at a wildly off-resonance
-frequency) and required real photocurrent to appear, rather than tracking
-the NV transition. Using a lock-in instead of scope-segment comparison does
-NOT avoid this: the lock-in demodulates whatever is synchronized with the
-chop reference, and it can't distinguish "real fluorescence modulation"
-from "any other effect that happens to be synchronized with the same
-square wave" any better than the scope comparison could.
-
-UPDATE -- a second, converging pickup-artifact signature was found and
-fully localized with this lock-in readout (see notes.md's SR830 section
-for the full chain): the effect required real RF power at the resonator,
-had nothing to do with light or the PMT tube itself, and was traced to the
-SR445A preamp's plastic (unshielded) housing picking up the resonator's
-near-field directly -- confirmed by signal dropping with distance and
-vanishing entirely once the preamp was replaced with a simple resistor
-transimpedance for this signal path. That specific artifact is understood
-and fixed. HOWEVER this does not by itself confirm real ODMR contrast is
-now present -- before trusting a result from this script, still run the
-same two controls used before:
-  1. Laser off (no photocurrent) -> a real artifact-of-pickup should vanish.
-  2. Far from any plausible NV resonance -> real ODMR contrast should
-     vanish/shrink there; the artifact previously did not.
-If those controls aren't clean, the safer path is `pulsed_odmr.py` instead,
-which confines the MW pulse to the dark period specifically to avoid ever
-having RF and photocurrent present at the same time.
-
-How lock-in readout works here (see the conversation this was written for):
-unlike a scope segment average, you do NOT get one reading per RF on/off
-cycle. The chop reference (AWG CH2's square wave) runs continuously; the
-SR830 continuously demodulates the PMT signal against it and low-pass
-filters with a settable TIME CONSTANT, integrating over many chop cycles
-(e.g. a 100 ms time constant at a 1 kHz chop averages ~100 cycles). So the
-per-frequency-point pattern is: set the generator frequency -> wait several
-time constants for the lock-in's filter to settle to the new value -> read
-one X (and Y) value -> move on. The chop cycle itself is just the internal
-clock the lock-in locks to; it never surfaces as a discrete readout.
-
-Hardware
---------
-CH2 (AWG) -> split/tee'd to BOTH:
-  (a) the ZYSWA-2-50DR+ switch's Control pin (gates the microwave, same
-      wiring as rf_switch_test.ipynb / pulsed_odmr.py), and
-  (b) the SR830's external reference input, so the lock-in locks onto the
-      EXACT same signal driving the switch (see set_reference_external()
-      below, TTL rising-edge mode -- CH2's 0-5V square wave is TTL-level
-      compatible).
-50% duty cycle by default -- maximizes the fundamental-frequency AC content
-of the resulting chopped optical signal (same Fourier reasoning as the
-sideband work in rf_switch_test.ipynb: a 50% duty square wave puts the most
-energy in its fundamental harmonic of any duty cycle).
-Laser stays on continuously (external/manual, same as cw_odmr.py's other
-CW-ODMR commands) -- only the microwave is chopped.
-Generator stays at a FIXED CW power/frequency between interlock checks,
-same as run_spectrum() -- only the frequency changes per sweep point.
-
-Phase calibration (see the SR830 phase-calibration discussion in the
-conversation this was written for): this script does NOT auto-calibrate
-phase -- do it manually once per session (e.g. feed a large, real
-modulation at the chop frequency, null Y by adjusting phase, or use
-`SR830.auto_phase()` if the signal is already strong enough for it to
-converge reliably), then pass the resulting value as `phase_deg`.
+See notes.md's "cw_odmr_lock_in.py operation notes" section for hardware
+wiring, how lock-in readout works, phase calibration, and design rationale
+for cmd_single/cmd_sweep_average -- and its "CW-ODMR contrast_check" /
+"SR830 lock-in amplifier" sections for chop-synchronized pickup artifacts
+found on this signal path and the controls needed to rule them out before
+trusting a result.
 
 Usage:
     python cw_odmr_lock_in.py run <file_name> [key=value ...]
@@ -606,18 +546,9 @@ def cmd_single(file_name, **kw):
     Same inline reflected-power interlock check as cmd_run, re-checked
     every sample. Stop with Ctrl+C -- partial data is still saved.
 
-    Diagnostic use -- carrier_off=true: isolates whether an observed
-    lock-in signal requires the RF carrier to be present at all, or is
-    just crosstalk from the AWG CH2 chop control line itself (switch
-    control pin transitions, no actual microwave power). With
-    carrier_off=true, CH2 still chops the switch and the SR830 still
-    demodulates against it exactly as normal, but the generator's RF
-    output is kept off throughout (never calls rf_on()) -- if the signal
-    disappears, whatever you were seeing needed real RF power (e.g.
-    resonator near-field pickup); if it persists, it's coming from the
-    control line itself. Reflected-power interlock is still checked each
-    sample for safety, but should trivially read very low the whole time
-    since there's no RF to reflect.
+    carrier_off=true is a diagnostic for isolating real-RF-power effects
+    from AWG CH2 control-line crosstalk -- see notes.md's
+    "cw_odmr_lock_in.py operation notes" section.
 
     Recognized key=value overrides (all optional):
       freq_hz=2.87e9          fixed generator frequency (tuned even with
@@ -815,73 +746,23 @@ def cmd_sweep_average(file_name, **kw):
     """
     Sweep a frequency range n_repeats times in a row, saving each repeat's
     raw sweep to disk immediately, then averaging X and Y elementwise
-    across all completed repeats.
+    across all completed repeats (then computing R from the averaged X/Y,
+    not by averaging R directly -- see notes.md's "cw_odmr_lock_in.py
+    operation notes" section for why).
 
-    Frequency range: by default (use_resonance_sweep=true), runs the same
-    coarse-then-fine resonance_sweep() as cmd_run() first -- switch held
-    static on RF2 throughout (set_switch_static()), NOT chopping, so the
-    resonance sweep gets a clean reflected-power trace -- then derives
-    [start_hz, stop_hz] from the found f0 +/- fwhm_margin*FWHM/2, exactly
-    like cmd_run(). Pass start_hz/stop_hz explicitly to override this with
-    a fixed manual range instead (e.g. a wide blind search span that
-    doesn't trust the resonator's own narrow FWHM window) -- the resonance
-    sweep still runs and its result is still logged/saved even when you
-    override the range this way, since it's useful reference info (and
-    already needed for the switch-static protection) regardless of what
-    range you actually average over. Set use_resonance_sweep=false to skip
-    it entirely and require start_hz/stop_hz to be given manually.
-
-    Averages X and Y (NOT R) across repeats, then computes R from the
-    averaged X/Y at the end -- R = sqrt(X^2+Y^2) is always >= 0 and has a
-    well-known positive noise-rectification bias (see notes.md's SR830
-    section), so averaging R directly would keep that bias instead of
-    averaging it away. X and Y are signed and roughly zero-mean noise on
-    top of whatever real signal is there, so they average down properly.
-
-    Useful as an alternative to (or on top of) a single very-long-time-
-    constant sweep: N repeats of a faster sweep, averaged, gives similar
-    noise reduction to increasing the time constant by ~N, but you get to
-    see each repeat's result as it completes rather than waiting on one
-    slow sweep with no visibility until it's done -- and a bad/interrupted
-    repeat only costs you one repeat, not the whole measurement.
+    By default (use_resonance_sweep=true) runs the same coarse-then-fine
+    resonance_sweep() as cmd_run() first to derive [start_hz, stop_hz] from
+    f0 +/- fwhm_margin*FWHM/2; pass start_hz/stop_hz explicitly to override
+    with a fixed manual range instead (the resonance sweep still runs and
+    is logged/saved either way). Set use_resonance_sweep=false to skip it
+    entirely and require start_hz/stop_hz manually.
 
     Same inline reflected-power interlock check as cmd_run/cmd_single,
-    re-checked at every point of every repeat. An interlock trip stops
-    immediately -- whatever repeats completed FULLY before that are still
-    averaged and saved; the partial (tripped) repeat itself is saved to
-    disk but excluded from the average (a short array averaged against full
-    ones would bias the result, not reduce its noise). Stop early with
-    Ctrl+C -- same partial-repeat handling applies.
-
-    Real-time overload detection and auto-rescale (auto_rescale_on_overload,
-    default true): the SR830's sensitivity is picked once per power level
-    (via auto_sensitivity, at freqs_hz[0]) -- but real signal size can vary
-    a lot across a sweep (e.g. much bigger right at a resonance peak/dip
-    than elsewhere), so a range that's fine at the start can still overload
-    partway through. Every point checks the SR830's hardware overload
-    status (SR830.read_overload_status(), NOT just eyeballing the value
-    afterward) right after reading X/Y. On overload at point i: step
-    sensitivity one range coarser (_step_sensitivity_coarser() -- one step
-    at a time, not straight to auto_gain(), to avoid overshooting into an
-    overly-insensitive range based on one anomalous point), then rescan
-    from i - rescan_backoff_points (clamped to 0), NOT from the beginning
-    of the repeat -- deliberately does not touch points before the
-    backed-up index, since those already read fine at the OLD, more
-    sensitive range; blanket-rescaling and redoing the WHOLE repeat would
-    needlessly throw away good data AND leave the rest of the sweep coarser
-    than it needs to be (worse resolution elsewhere for a problem that was
-    local to one region -- overloading "the other way," i.e. under-ranged,
-    if the rest of the sweep has a genuinely small signal). Each repeat
-    ends up with sensitivity mixed across regions if this triggers, which
-    is fine -- the SR830's X/Y are calibrated absolute values regardless of
-    range, changing sensitivity doesn't rescale the reported number, only
-    the resolution/full-scale headroom. Up to max_rescale_attempts total
-    rescale-and-backup events per repeat; if it's still overloading after
-    that, stops the repeat where it is and treats everything read so far as
-    PARTIAL (same handling as an interlock trip mid-repeat -- saved to
-    disk, excluded from the average) rather than looping forever. Does NOT
-    stop the whole run or move to the next power level -- only an interlock
-    trip does that.
+    re-checked at every point of every repeat; a trip or Ctrl+C stops
+    immediately, with completed repeats still averaged/saved and the
+    partial one saved-but-excluded. Also does real-time SR830 overload
+    detection with auto-rescale (auto_rescale_on_overload, default true) --
+    see notes.md for the rescale/rescan rationale.
 
     Recognized key=value overrides (all optional):
       use_resonance_sweep=true  run resonance_sweep() first to find f0/FWHM
@@ -903,7 +784,7 @@ def cmd_sweep_average(file_name, **kw):
                               the resonance-sweep-derived range if given
       stop_hz=None            explicit sweep stop frequency -- overrides
                               the resonance-sweep-derived range if given
-      step_hz=1e6             frequency step for the averaged sweep
+      freq_step_hz=1e6        frequency step for the averaged sweep
       n_repeats=30            number of full sweeps to average together, PER
                               power level
       check_resonance_before_sweep=true  before each power level's repeats
@@ -1010,7 +891,7 @@ def cmd_sweep_average(file_name, **kw):
     if not use_resonance_sweep and (manual_start_hz is None or manual_stop_hz is None):
         raise ValueError("start_hz and stop_hz must both be given when "
                           "use_resonance_sweep=false")
-    step_hz = float(kw.get("step_hz", 1e6))
+    freq_step_hz = float(kw.get("freq_step_hz", 1e6))
     n_repeats = int(kw.get("n_repeats", 30))
     check_resonance_before_sweep = str(
         kw.get("check_resonance_before_sweep", "true")).lower() == "true"
@@ -1126,11 +1007,11 @@ def cmd_sweep_average(file_name, **kw):
                 start_hz = float(manual_start_hz)
                 stop_hz = float(manual_stop_hz)
 
-            freqs_hz = np.arange(start_hz, stop_hz + step_hz / 2, step_hz)
+            freqs_hz = np.arange(start_hz, stop_hz + freq_step_hz / 2, freq_step_hz)
 
             print(f"[cw_odmr_lock_in] step 3/3: sweeping "
                   f"{start_hz/1e9:.5f}-{stop_hz/1e9:.5f} GHz "
-                  f"({len(freqs_hz)} points, {step_hz/1e6:.3f} MHz step), "
+                  f"({len(freqs_hz)} points, {freq_step_hz/1e6:.3f} MHz step), "
                   f"{n_repeats} repeats to average, threshold {threshold_dbm} dBm, "
                   f"power(s): {', '.join(f'{p:g} dBm' for p in power_list)}")
 
@@ -1316,7 +1197,7 @@ def cmd_sweep_average(file_name, **kw):
                     with open(f"{run_path}/{file_prefix}_avg_metadata.txt", "w") as fh:
                         fh.write(f"start_hz={start_hz}\n")
                         fh.write(f"stop_hz={stop_hz}\n")
-                        fh.write(f"step_hz={step_hz}\n")
+                        fh.write(f"freq_step_hz={freq_step_hz}\n")
                         fh.write(f"n_repeats_requested={n_repeats}\n")
                         fh.write(f"n_repeats_averaged={n_good_repeats}\n")
                         fh.write(f"chop_freq_hz={chop_freq_hz}\n")

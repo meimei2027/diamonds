@@ -748,6 +748,60 @@ See `CLAUDE.md` for the full investigation history behind each of these.
   or abort anything itself. Any `powerstudy*` run from before this was
   added has no such record and can't be retroactively checked this way.
 
+## cw_odmr_lock_in.py operation notes
+
+- **Hardware**: AWG CH2 is tee'd to both the ZYSWA switch's control pin
+  (gates the microwave) and the SR830's external reference input, so the
+  lock-in locks onto the exact signal driving the switch (TTL rising-edge
+  mode). 50% duty by default -- puts the most energy in the fundamental
+  harmonic of any duty cycle (same Fourier reasoning as
+  `rf_switch_test.ipynb`'s sideband work). Laser stays on continuously
+  throughout; only the microwave is chopped.
+- **Readout is continuous demodulation, not one-reading-per-chop-cycle**:
+  the SR830 demodulates the PMT signal against the CH2 reference
+  continuously and low-pass filters with a settable time constant (e.g. a
+  100ms time constant at 1kHz chop averages ~100 cycles). Per frequency
+  point: set frequency -> wait several time constants for the filter to
+  settle -> read one X/Y -> move on. The chop cycle itself never surfaces
+  as a discrete readout.
+- **Phase is NOT auto-calibrated by this script** -- do it manually once
+  per session (feed a large real modulation at the chop frequency, null Y
+  by adjusting phase, or use `SR830.auto_phase()` if the signal is already
+  strong enough to converge reliably), then pass the result as `phase_deg`.
+- Before trusting any ODMR result from this script, run the same two
+  controls that caught the chop-synchronized pickup artifacts above (see
+  "CW-ODMR contrast_check" and "SR830 lock-in amplifier" sections): laser
+  off (a real artifact-of-pickup should vanish) and far off-resonance (real
+  ODMR contrast should vanish/shrink there; the artifacts above did not).
+  If those controls aren't clean, `pulsed_odmr.py` is the safer path -- it
+  confines the MW pulse to the dark period, so RF and photocurrent are
+  never present at the same time.
+- `cmd_single`'s `carrier_off=true` isolates whether an observed signal
+  needs real RF power, or is just crosstalk from the AWG CH2 control line
+  itself: CH2 keeps chopping the switch and the SR830 keeps demodulating
+  normally, but the generator's RF output is held off throughout. Signal
+  vanishing means it needed real RF power (e.g. resonator near-field
+  pickup); persisting means it's coming from the control line itself.
+- `cmd_sweep_average()` averages X and Y elementwise across repeats, THEN
+  computes R from the averaged X/Y -- never averages R directly, since
+  R = sqrt(X^2+Y^2) has a positive noise-rectification bias (see SR830
+  section above) that averaging after the fact doesn't remove. A partial
+  repeat (interlock trip or Ctrl+C mid-repeat) is saved to disk but
+  excluded from the average -- a short/NaN-padded array averaged against
+  full ones would bias the result, not just reduce its noise.
+- `cmd_sweep_average()`'s real-time overload handling
+  (`auto_rescale_on_overload`, default on): checks the SR830's hardware
+  overload status after every point (not just eyeballing values
+  afterward), since real signal size can vary a lot across a sweep (e.g.
+  much bigger right at a resonance dip than elsewhere). On overload, steps
+  sensitivity ONE range coarser at a time (never straight to
+  `auto_gain()`, which could overshoot into an overly-insensitive range
+  based on one anomalous point) and rescans from a few points back
+  (`rescan_backoff_points`), not from the start of the repeat -- points
+  before that already read fine at the old, more sensitive range. Gives up
+  after `max_rescale_attempts` and treats the repeat as PARTIAL (saved,
+  excluded from the average) rather than looping forever.
+
 ## Pulsed ODMR (pulsed_odmr.py) -- NOT YET TESTED
 
 - Uses `[SOURce[1|2]:]PHASe:SYNChronize` (confirmed via Keysight's own
