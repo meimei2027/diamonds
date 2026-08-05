@@ -142,6 +142,16 @@ Usage:
                                   before the resonance sweep starts, off
                                   when the run ends (see spd1305x.py)
           psu_current_limit_a=1.9  SPD1305X current limit
+          coil_current_a=1.5      SPD1168X current setpoint for the static-
+                                  field coil -- turned on right before the
+                                  resonance sweep starts (same place as the
+                                  SPD1305X above), off when the run ends
+                                  (see spd1168x.py)
+          coil_voltage_margin=1.2  voltage setpoint headroom above the
+                                  calibration's expected coil voltage drop
+                                  at coil_current_a, so the supply regulates
+                                  in constant-current mode (same convention
+                                  as spd1168x.py's set_field())
 
     python cw_odmr_lock_in.py single <file_name> [key=value ...]
         Holds the generator at ONE fixed frequency (default 2.87 GHz, no
@@ -194,6 +204,7 @@ import ks33600a
 from hp8673h import HP8673H
 from sr830 import SR830
 from spd1305x import SPD1305X
+from spd1168x import SPD1168X, voltage_for_current
 from cw_odmr import parse_kv_args, _tee_stdout
 
 AWG_RESOURCE = "USB0::0x0957::0x5707::MY53800810::INSTR"
@@ -203,6 +214,9 @@ SR830_RESOURCE = "GPIB2::2::INSTR"
 # NOT YET VERIFIED -- confirm with pyvisa.ResourceManager().list_resources()
 # before trusting this (see notes.md's GPIB-bus-numbering gotchas).
 PSU_RESOURCE = "USB0::0xF4EC::0x1410::SPD13DCD7R1877::INSTR"
+# SPD1168X driving the static-field coil (see spd1168x.py) -- confirmed via
+# spd1168x_test.ipynb's rm.list_resources() output.
+COIL_PSU_RESOURCE = "USB0::0xF4EC::0x1410::SPD13DCQ7R0986::INSTR"
 
 DATA_DIR = "D:\\cw_odmr_lock_in"
 
@@ -374,6 +388,8 @@ def cmd_run(file_name, **kw):
     ch1_carrier_vpp = float(kw.get("ch1_carrier_vpp", 0.632))
     psu_voltage_v = float(kw.get("psu_voltage_v", 12.0))
     psu_current_limit_a = float(kw.get("psu_current_limit_a", 1.9))
+    coil_current_a = float(kw.get("coil_current_a", 1.5))
+    coil_voltage_margin = float(kw.get("coil_voltage_margin", 1.2))
 
     run_path = f"{DATA_DIR}/{file_name}"
     import os
@@ -404,12 +420,15 @@ def cmd_run(file_name, **kw):
               f"phase {phase_deg} deg (NOT auto-calibrated -- see module docstring)")
 
         print("[cw_odmr_lock_in] step 2/4: connecting to HP8673H + E4403B (interlock) "
-              "+ SPD1305X (amplifier supply)")
+              "+ SPD1305X (amplifier supply) + SPD1168X (coil supply)")
         gen = HP8673H(GEN_RESOURCE)
         psu = SPD1305X(PSU_RESOURCE)
+        coil_psu = SPD1168X(COIL_PSU_RESOURCE)
         ilock_sa = None
         try:
             psu.turn_on(psu_voltage_v, psu_current_limit_a)
+            coil_voltage_v = voltage_for_current(coil_current_a) * coil_voltage_margin
+            coil_psu.turn_on(coil_voltage_v, coil_current_a)
 
             print(f"[cw_odmr_lock_in] step 2/4: sweeping for resonance "
                   f"({res_start_hz/1e9:.4f}-{res_stop_hz/1e9:.4f} GHz, {res_power_dbm} dBm)")
@@ -554,6 +573,12 @@ def cmd_run(file_name, **kw):
             except Exception:
                 pass
             psu.close()
+            try:
+                coil_psu.turn_off()
+            except Exception as e:
+                print(f"[cw_odmr_lock_in] WARNING: failed to turn off coil "
+                      f"supply cleanly ({e})")
+            coil_psu.close()
             if ilock_sa is not None:
                 ilock_sa.close()
             try:
@@ -944,6 +969,15 @@ def cmd_sweep_average(file_name, **kw):
                               =false, right before the measurement sweep)
                               starts, off when the whole run ends
       psu_current_limit_a=1.9  SPD1305X current limit
+      coil_current_a=1.5      SPD1168X current setpoint for the static-field
+                              coil -- turned on at the same point as the
+                              SPD1305X above, off when the whole run ends
+                              (see spd1168x.py)
+      coil_voltage_margin=1.2  voltage setpoint headroom above the
+                              calibration's expected coil voltage drop at
+                              coil_current_a, so the supply regulates in
+                              constant-current mode (same convention as
+                              spd1168x.py's set_field())
 
     Saves resonance_sweep()'s own {file_name}_resonance_coarse.csv/
     _fine.csv (if use_resonance_sweep=true). If drive_power_dbm_list is NOT
@@ -1006,6 +1040,8 @@ def cmd_sweep_average(file_name, **kw):
     ch1_carrier_vpp = float(kw.get("ch1_carrier_vpp", 0.632))
     psu_voltage_v = float(kw.get("psu_voltage_v", 12.0))
     psu_current_limit_a = float(kw.get("psu_current_limit_a", 1.9))
+    coil_current_a = float(kw.get("coil_current_a", 1.5))
+    coil_voltage_margin = float(kw.get("coil_voltage_margin", 1.2))
 
     run_path = f"{DATA_DIR}/{file_name}"
     import os
@@ -1041,12 +1077,15 @@ def cmd_sweep_average(file_name, **kw):
               f"(NOT auto-calibrated -- see module docstring)")
 
         print("[cw_odmr_lock_in] step 2/3: connecting to HP8673H + E4403B (interlock) "
-              "+ SPD1305X (amplifier supply)")
+              "+ SPD1305X (amplifier supply) + SPD1168X (coil supply)")
         gen = HP8673H(GEN_RESOURCE)
         psu = SPD1305X(PSU_RESOURCE)
+        coil_psu = SPD1168X(COIL_PSU_RESOURCE)
         ilock_sa = None
         try:
             psu.turn_on(psu_voltage_v, psu_current_limit_a)
+            coil_voltage_v = voltage_for_current(coil_current_a) * coil_voltage_margin
+            coil_psu.turn_on(coil_voltage_v, coil_current_a)
 
             if use_resonance_sweep:
                 print(f"[cw_odmr_lock_in] step 2/3: sweeping for resonance "
@@ -1312,6 +1351,12 @@ def cmd_sweep_average(file_name, **kw):
             except Exception:
                 pass
             psu.close()
+            try:
+                coil_psu.turn_off()
+            except Exception as e:
+                print(f"[cw_odmr_lock_in] WARNING: failed to turn off coil "
+                      f"supply cleanly ({e})")
+            coil_psu.close()
             if ilock_sa is not None:
                 ilock_sa.close()
             try:
