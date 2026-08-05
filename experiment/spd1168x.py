@@ -13,15 +13,20 @@ import pyvisa
 from visa_retry import call_with_reconnect
 
 # Calibration data measured on our coil: (voltage_v, current_a, field_g).
-# Field grows ~linearly with current (coil is just a resistor, ~0.34 ohm,
-# well below saturation over this range), so we fit straight lines for
+# Field grows ~linearly with current (coil is just a resistor, well below
+# saturation over this range), so we fit straight lines for
 # field-vs-current and voltage-vs-current and invert the first to go from
 # a desired field to a target current.
+#
+# Voltage column updated after swapping the coil cable for one with
+# different resistance (was ~0.34 ohm, now ~0.5 ohm) -- field-vs-current is
+# a property of the coil itself, not the cable, so the field column is
+# unchanged from the original calibration.
 _COIL_CALIBRATION = [
-    (0.172, 0.5, 7.0),
-    (0.341, 1.0, 14.3),
-    (0.509, 1.5, 21.3),
-    (0.678, 2.0, 28.4),
+    (0.243, 0.5, 7.0),
+    (0.484, 1.0, 14.3),
+    (0.723, 1.5, 21.3),
+    (0.961, 2.0, 28.4),
 ]
 _CAL_VOLTAGE = np.array([v for v, i, g in _COIL_CALIBRATION])
 _CAL_CURRENT = np.array([i for v, i, g in _COIL_CALIBRATION])
