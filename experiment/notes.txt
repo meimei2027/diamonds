@@ -12,3 +12,15 @@
 
 - preamp closer: more background
 - switched to resistor 500 ohm for slower cw odmr
+
+- maybe we cannot see the signal but it is there
+    - average more to see it
+- maybe it is just not there at all, anywhere
+    - later, maybe sand down the resonator, decrease the laser intensity even more?
+- maybe it is there but shifted in frequency
+    - tune it a bit later tonight
+
+1kohm, no nd filter for now
+- for a while it was useless data because not aligned
+
+- 80 mhz was never on, for lockin before scan/

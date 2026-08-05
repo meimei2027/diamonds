@@ -704,10 +704,49 @@ See `CLAUDE.md` for the full investigation history behind each of these.
   bandwidth) -- this swap is specific to the slow (~1 kHz chop) CW lock-in
   path, not a wholesale replacement.
 
-  **Still open**: this only confirms the pickup ARTIFACT is gone, not yet
-  that real ODMR contrast is present -- rerun the standard controls (laser
-  off; far off the actual NV resonance) with the resistor in place before
-  trusting a result from `cw_odmr_lock_in.py` as genuine ODMR.
+- **Separately, ALL `cw_odmr_lock_in.py` lock-in data taken before AWG CH1
+  was explicitly reconfigured is invalid.** `KS33600A.__init__()`
+  unconditionally sends `*RST` on every connection (needed elsewhere, e.g.
+  to guarantee a known clean state) -- `*RST` resets BOTH channels to their
+  power-on default (output off), including CH1. `cw_odmr_lock_in.py` only
+  ever configured CH2 (the chop), never touched CH1 at all -- so any prior
+  CH1 setup (e.g. a continuous carrier needed for the measurement, set up
+  by a separate script like `run_alignment.py`) got silently wiped out the
+  moment ANY `cw_odmr_lock_in.py` command connected to the AWG, without any
+  error or warning. Confirmed the impact is real: after adding
+  `setup_ch1_carrier()` (CH1: continuous, unmodulated 80 MHz / 632 mVpp
+  sine, called right after connecting to the AWG in `cmd_run`/`cmd_single`/
+  `cmd_sweep_average`, before CH2 is touched) so CH1 stays correctly
+  configured throughout, **a real ODMR dip was observed for the first time**
+  -- everything recorded before this fix (`lockin1`-`lockin9`,
+  `backgroundfree1`/`2`, `average1`) was taken with CH1 silently off and
+  should be treated as invalid, regardless of what it appeared to show.
+  `scan1`-`scan7` were taken after this fix was in place (`setup_ch1_carrier()`
+  already added to `cmd_run`/`cmd_single`/`cmd_sweep_average`) and are valid
+  -- these are the first runs to show the real dip.
+
+- **The physical resonance can drift out of a `sweep-average` power study's
+  frequency window WITHOUT tripping the interlock, if scan power is low.**
+  The interlock only watches reflected power against a fixed threshold --
+  at low drive power, reflected power stays comfortably under that
+  threshold whether or not the resonator is actually well-matched at the
+  frequencies being scanned, so a real physical drift (resonator detuning
+  between sessions) goes completely undetected by the existing safety
+  check. Confirmed for real: found the resonance had physically drifted
+  away from where a `powerstudy*` run assumed it was, discovered only by
+  comparing run-to-run scale differences (see the X-vs-R phase-calibration
+  discussion above) and manually checking, not by anything alerting during
+  the run. **`powerstudy9`'s data is affected by this** -- its
+  power-comparison numbers should be treated with caution until re-checked
+  against a resonance position record. **Fixed going forward**:
+  `cmd_sweep_average()` gained `check_resonance_before_sweep=true`
+  (default on) -- before each power level's repeats start, sweeps
+  reflected power across that exact frequency range and records/reports
+  where the dip actually is (saved as `_resonance_check_freqs_hz.npy`/
+  `_resonance_check_reflected_dbm.npy`, plus a printed warning if the dip
+  is far from the center of the range) -- diagnostic only, does not gate
+  or abort anything itself. Any `powerstudy*` run from before this was
+  added has no such record and can't be retroactively checked this way.
 
 ## Pulsed ODMR (pulsed_odmr.py) -- NOT YET TESTED
 
