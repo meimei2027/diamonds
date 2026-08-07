@@ -559,6 +559,56 @@ class HP8673H:
             print(f"[interlock] failed to read reflected power: {e}")
             return None
 
+    @staticmethod
+    def read_max_hold_reflected_power_dbm(sa, freq_hz, hold_time_s, span_hz=10e6):
+        """
+        Reflected-power read for a source that isn't continuously present
+        (e.g. a periodically-repeating microsecond-scale MW pulse), where
+        read_reflected_power_dbm()'s single WRITE-mode sweep has no
+        guarantee of overlapping the pulse in time -- a GPIB round-trip
+        plus this analyzer's own sweep time both run orders of magnitude
+        slower than a us-scale pulse, so there's no way to time a single
+        query to land inside one specific pulse.
+
+        Instead, switches the trace to MAX HOLD and free-runs sweeps for
+        hold_time_s: as long as hold_time_s comfortably exceeds the
+        pulse's repetition period, at least one real pulse is guaranteed
+        to be captured at its peak by some sweep during that window. This
+        trades timing precision for a hardware guarantee -- it reports the
+        worst (highest) reflected power seen over the hold window, not the
+        reflected power at any particular instant.
+
+        Resets the trace back to WRITE mode before returning (even on
+        failure), so a later read_reflected_power_dbm() call doesn't
+        inherit stale MAXHOLD state -- same shape of gotcha as notes.md's
+        "TRAC1:MODE BLANK poisons subsequent reads" entry.
+
+        Returns None if the read fails for any reason -- treated as
+        'analyzer unreachable' by the caller, same as read_reflected_power_dbm().
+        """
+        try:
+            sa.set_center_span(freq_hz, span_hz)
+            sa.write("AVER:STATE OFF")
+            sa.write("TRAC1:MODE WRITE")  # clear any old MAX HOLD state first
+            sa.write("INIT:CONT OFF")
+            sa.write("INIT:IMM")
+            sa.query("*OPC?")
+            sa.write("TRAC1:MODE MAXHOLD")
+            sa.write("INIT:CONT ON")
+            time.sleep(hold_time_s)
+            sa.write("INIT:CONT OFF")
+            sa.write("CALC:MARK1:MODE POS")
+            sa.write(f"CALC:MARK1:X {freq_hz}")
+            return float(sa.query("CALC:MARK1:Y?"))
+        except Exception as e:
+            print(f"[interlock] failed to read max-hold reflected power: {e}")
+            return None
+        finally:
+            try:
+                sa.write("TRAC1:MODE WRITE")
+            except Exception:
+                pass
+
     def trip_interlock(self, reason):
         """Immediately kill RF output and report why."""
         print(f"[interlock] TRIPPED: {reason}")

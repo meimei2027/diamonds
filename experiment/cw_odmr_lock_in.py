@@ -21,77 +21,11 @@ Usage:
         records the SR830's X/Y lock-in output at each frequency -- same
         inline reflected-power interlock check per point as run_spectrum
         (generator kept at fixed CW power/frequency between checks, only
-        the frequency changes). Saves
+        the frequency changes). See cmd_run()'s docstring for the full
+        list of key=value overrides. Saves
         data/<file_name>/<file_name>_lockin_spectrum_freqs_hz.npy,
         _lockin_spectrum_x.npy, _lockin_spectrum_y.npy,
         _lockin_spectrum_reflected_dbm.npy, _lockin_spectrum_metadata.txt.
-
-        Recognized key=value overrides (all optional):
-          res_start_hz=2e9        resonance sweep start frequency
-          res_stop_hz=3e9         resonance sweep stop frequency
-          coarse_step_hz=6.7e6    coarse sweep step (track expected FWHM)
-          fine_span_hz=20e6       fine sweep span around the coarse dip
-          fine_step_hz=50e3       fine sweep step
-          res_power_dbm=-40.0     drive power during the resonance sweep
-          res_cal_dir=None        path to an open-short-load calibration
-                                  folder (see hp8673h.py's calibrate_osl()/
-                                  the 'calibrate-osl' CLI subcommand) --
-                                  omit to use uncalibrated raw reflected
-                                  power for dip-finding/Q, same as before
-                                  calibration support existed
-          drive_power_dbm=0.0     (constant) drive power during the scan
-          threshold_dbm=-10.0     interlock trip threshold, in dBm
-          freq_step_hz=10e3       frequency step across the FWHM
-          fwhm_margin=1.0         scan span = FWHM * this margin
-          settle_s=0.05           settle time after each frequency change
-                                  -- NEVER 0, see hp8673h.py's
-                                  frequency_sweep() docstring for why
-          chop_freq_hz=1000.0     AWG CH2 / lock-in reference frequency
-          chop_duty_pct=50.0      AWG CH2 duty cycle
-          time_constant_s=0.1     SR830 time constant
-          settle_time_constants=5.0  how many time constants to wait after
-                                      each frequency change before reading
-                                      the lock-in (in addition to settle_s)
-          sensitivity_v=5e-3      SR830 sensitivity target (auto-rounds up
-                                  to the nearest available range) -- ignored
-                                  by default since auto_sensitivity=true;
-                                  only takes effect if you explicitly set
-                                  auto_sensitivity=false.
-          auto_sensitivity=true   call the SR830's own AGAN (auto gain) once
-                                  RF/chop is running and a real signal is
-                                  present at the input, right before the
-                                  frequency sweep starts, instead of trusting
-                                  a fixed sensitivity_v -- confirmed on the
-                                  bench to actually find a usable range
-                                  where a fixed placeholder value did not.
-                                  The actual range it picks gets printed and
-                                  saved to the metadata file. Set to false to
-                                  use sensitivity_v verbatim instead.
-          phase_deg=0.0           pre-calibrated SR830 phase (see above --
-                                  NOT auto-calibrated by this script)
-          input_coupling=ac       SR830 input coupling, 'ac' or 'dc' -- ac
-                                  is almost always right here (blocks the
-                                  large DC baseline, leaving headroom for
-                                  the much smaller AC modulation)
-          ch1_carrier_freq_hz=80e6  AWG CH1 continuous, unmodulated carrier
-                                  frequency -- unrelated to the chop, just
-                                  stays running throughout
-          ch1_carrier_vpp=0.632    AWG CH1 carrier amplitude
-          psu_voltage_v=12.0      SPD1305X output voltage for the RF
-                                  amplifier supply -- turned on right
-                                  before the resonance sweep starts, off
-                                  when the run ends (see spd1305x.py)
-          psu_current_limit_a=1.9  SPD1305X current limit
-          coil_current_a=1.5      SPD1168X current setpoint for the static-
-                                  field coil -- turned on right before the
-                                  resonance sweep starts (same place as the
-                                  SPD1305X above), off when the run ends
-                                  (see spd1168x.py)
-          coil_voltage_margin=1.2  voltage setpoint headroom above the
-                                  calibration's expected coil voltage drop
-                                  at coil_current_a, so the supply regulates
-                                  in constant-current mode (same convention
-                                  as spd1168x.py's set_field())
 
     python cw_odmr_lock_in.py single <file_name> [key=value ...]
         Holds the generator at ONE fixed frequency (default 2.87 GHz, no
@@ -121,19 +55,9 @@ Usage:
         <file_name>_avg_freqs_hz.npy, _avg_x.npy, _avg_y.npy, _avg_r.npy,
         _avg_metadata.txt.
 
-    python cw_odmr_lock_in.py calibrate-osl <cal_dir> [key=value ...]
-        Open-short-load scalar calibration for the resonance sweep (see
-        hp8673h.py's calibrate_osl()). Holds the switch static on RF2 first,
-        same as 'run' does before its own resonance sweep. See
-        cmd_calibrate_osl()'s docstring for the full list of key=value
-        overrides. Saves <cal_dir>/osl_freqs_hz.npy, osl_open_dbm.npy,
-        osl_short_dbm.npy, osl_load_dbm.npy -- pass <cal_dir> as
-        res_cal_dir=<cal_dir> to 'run' to use it.
-
 Example:
     python cw_odmr_lock_in.py run lockin1 chop_freq_hz=1000 phase_deg=42.3
     python cw_odmr_lock_in.py single calib1 freq_hz=2.87e9 auto_sensitivity=true
-    python cw_odmr_lock_in.py calibrate-osl D:\\cw_odmr_lock_in\\osl_cal
 """
 import sys
 import time
@@ -143,8 +67,8 @@ import numpy as np
 import ks33600a
 from hp8673h import HP8673H
 from sr830 import SR830
-from spd1305x import SPD1305X
-from spd1168x import SPD1168X, voltage_for_current
+from spd1305x import SPD1305X, voltage_for_current
+from spd1168x import SPD1168X
 from cw_odmr import parse_kv_args, _tee_stdout
 
 AWG_RESOURCE = "USB0::0x0957::0x5707::MY53800810::INSTR"
@@ -153,10 +77,12 @@ SA_RESOURCE = "GPIB0::18::INSTR"
 SR830_RESOURCE = "GPIB2::2::INSTR"
 # NOT YET VERIFIED -- confirm with pyvisa.ResourceManager().list_resources()
 # before trusting this (see notes.md's GPIB-bus-numbering gotchas).
-PSU_RESOURCE = "USB0::0xF4EC::0x1410::SPD13DCD7R1877::INSTR"
-# SPD1168X driving the static-field coil (see spd1168x.py) -- confirmed via
+# SPD1305X driving the static-field coil (see spd1305x.py) -- chosen for
+# this role over the SPD1168X for its higher current limit.
+COIL_PSU_RESOURCE = "USB0::0xF4EC::0x1410::SPD13DCD7R1877::INSTR"
+# SPD1168X driving the RF amplifier supply -- confirmed via
 # spd1168x_test.ipynb's rm.list_resources() output.
-COIL_PSU_RESOURCE = "USB0::0xF4EC::0x1410::SPD13DCQ7R0986::INSTR"
+AMP_PSU_RESOURCE = "USB0::0xF4EC::0x1410::SPD13DCQ7R0986::INSTR"
 
 DATA_DIR = "D:\\cw_odmr_lock_in"
 
@@ -301,6 +227,78 @@ def setup_lock_in(lia, chop_freq_hz, time_constant_s, sensitivity_v, phase_deg,
 
 
 def cmd_run(file_name, **kw):
+    """
+    Sweep microwave frequency across the resonance's FWHM (coarse-then-fine
+    resonance_sweep() first to find it), gating the microwave with a
+    chopped square wave on AWG CH2 throughout, and record the SR830's X/Y
+    at each frequency. Same inline reflected-power interlock check per
+    point as run_spectrum -- generator held at fixed CW power/frequency
+    between checks, only the frequency changes.
+
+    Recognized key=value overrides (all optional):
+      use_resonance_sweep=true  run resonance_sweep() first to find f0/FWHM
+                                (switch held static, not chopping) and
+                                derive the scan range from it -- set false
+                                to skip and require start_hz/stop_hz
+      res_start_hz=2e9        resonance sweep start frequency
+      res_stop_hz=3e9         resonance sweep stop frequency
+      coarse_step_hz=6.7e6    coarse sweep step (track expected FWHM)
+      fine_span_hz=20e6       fine sweep span around the coarse dip
+      fine_step_hz=50e3       fine sweep step
+      res_power_dbm=-40.0     drive power during the resonance sweep
+      res_cal_dir=None        open-short-load calibration folder (see
+                              hp8673h.py's calibrate_osl()) -- omit for
+                              uncalibrated raw reflected power
+      drive_power_dbm=0.0     (constant) drive power during the scan
+      threshold_dbm=-10.0     interlock trip threshold, in dBm
+      freq_step_hz=10e3       frequency step across the scan range
+      fwhm_margin=1.0         scan span = FWHM * this margin (only used
+                              when start_hz/stop_hz aren't given)
+      start_hz=None           explicit scan start frequency -- overrides
+                              the resonance-sweep-derived range if given;
+                              required if use_resonance_sweep=false
+      stop_hz=None            explicit scan stop frequency -- overrides
+                              the resonance-sweep-derived range if given;
+                              required if use_resonance_sweep=false
+      settle_s=0.05           settle time after each frequency change --
+                              NEVER 0, see hp8673h.py's frequency_sweep()
+      chop_freq_hz=1000.0     AWG CH2 / lock-in reference frequency
+      chop_duty_pct=50.0      AWG CH2 duty cycle
+      time_constant_s=0.1     SR830 time constant
+      settle_time_constants=5.0  time constants to wait after each
+                              frequency change before reading (on top of
+                              settle_s)
+      sensitivity_v=5e-3      SR830 sensitivity target -- ignored unless
+                              auto_sensitivity=false
+      auto_sensitivity=true   call SR830 AGAN once RF/chop is running,
+                              before the sweep starts, instead of trusting
+                              a fixed sensitivity_v; picked range is
+                              printed and saved to the metadata file
+      phase_deg=0.0           pre-calibrated SR830 phase (NOT
+                              auto-calibrated by this script)
+      input_coupling=ac       SR830 input coupling, 'ac' or 'dc'
+      ch1_carrier_freq_hz=80e6  AWG CH1 continuous carrier frequency,
+                              unrelated to the chop
+      ch1_carrier_vpp=0.632   AWG CH1 carrier amplitude
+      psu_voltage_v=12.0      SPD1168X output voltage for the RF amplifier
+                              supply (see spd1168x.py) -- on before the
+                              resonance sweep, off when the run ends
+      psu_current_limit_a=1.9  SPD1168X current limit
+      coil_current_a=1.5      SPD1305X current setpoint for the static-
+                              field coil (see spd1305x.py; chosen over the
+                              SPD1168X for its higher current limit) --
+                              turned on/off alongside the amplifier supply
+      coil_voltage_margin=1.5  voltage headroom above the calibration's
+                              expected coil voltage drop at coil_current_a,
+                              so the supply regulates in constant-current
+                              mode (same convention as spd1305x.py's
+                              set_field())
+
+    Saves data/<file_name>/<file_name>_lockin_spectrum_freqs_hz.npy,
+    _lockin_spectrum_x.npy, _lockin_spectrum_y.npy,
+    _lockin_spectrum_reflected_dbm.npy, _lockin_spectrum_metadata.txt.
+    """
+    use_resonance_sweep = str(kw.get("use_resonance_sweep", "true")).lower() == "true"
     res_start_hz = float(kw.get("res_start_hz", 2.0e9))
     res_stop_hz = float(kw.get("res_stop_hz", 3.0e9))
     coarse_step_hz = float(kw.get("coarse_step_hz", 6.7e6))
@@ -308,6 +306,11 @@ def cmd_run(file_name, **kw):
     fine_step_hz = float(kw.get("fine_step_hz", 50e3))
     res_power_dbm = float(kw.get("res_power_dbm", -40.0))
     res_cal_dir = kw.get("res_cal_dir", None)
+    manual_start_hz = kw.get("start_hz", None)
+    manual_stop_hz = kw.get("stop_hz", None)
+    if not use_resonance_sweep and (manual_start_hz is None or manual_stop_hz is None):
+        raise ValueError("start_hz and stop_hz must both be given when "
+                          "use_resonance_sweep=false")
     drive_power_dbm = float(kw.get("drive_power_dbm", 0.0))
     threshold_dbm = float(kw.get("threshold_dbm", -10.0))
     freq_step_hz = float(kw.get("freq_step_hz", 10e3))
@@ -329,7 +332,7 @@ def cmd_run(file_name, **kw):
     psu_voltage_v = float(kw.get("psu_voltage_v", 12.0))
     psu_current_limit_a = float(kw.get("psu_current_limit_a", 1.9))
     coil_current_a = float(kw.get("coil_current_a", 1.5))
-    coil_voltage_margin = float(kw.get("coil_voltage_margin", 1.2))
+    coil_voltage_margin = float(kw.get("coil_voltage_margin", 1.5))
 
     run_path = f"{DATA_DIR}/{file_name}"
     import os
@@ -340,61 +343,80 @@ def cmd_run(file_name, **kw):
 
     with _tee_stdout(log_path):
         print("[cw_odmr_lock_in] step 1/4: configuring AWG CH1 (continuous carrier) "
-              "+ CH2 (static, not chopping yet) + SR830 lock-in")
+              "+ CH2 "
+              f"({'static, not chopping yet' if use_resonance_sweep else 'chop'}) "
+              "+ SR830 lock-in")
         awg = ks33600a.KS33600A(AWG_RESOURCE, debug=True)
         setup_ch1_carrier(awg, ch1_carrier_freq_hz, ch1_carrier_vpp)
-        # Hold the switch parked on the sample path (RF2) instead of chopping
-        # for now -- resonance_sweep() below reads the analyzer and needs a
-        # clean, unmodulated signal. Chopping only starts once resonance is
-        # found, right before the actual lock-in sweep loop.
-        set_switch_static(awg, route_to_sample=True)
+        if use_resonance_sweep:
+            # Hold the switch parked on the sample path (RF2) instead of
+            # chopping for now -- resonance_sweep() below reads the
+            # analyzer and needs a clean, unmodulated signal. Chopping
+            # only starts once resonance is found (see cw_odmr_lock_in's
+            # notes.md entry on why this ordering matters).
+            set_switch_static(awg, route_to_sample=True)
+        else:
+            setup_chop(awg, chop_freq_hz, chop_duty_pct)
+            awg.close()
 
         lia = SR830(SR830_RESOURCE, debug=True)
         setup_lock_in(lia, chop_freq_hz, time_constant_s, sensitivity_v, phase_deg,
                       input_coupling, auto_sensitivity=auto_sensitivity)
         print(f"[cw_odmr_lock_in] step 1/4 done: CH1 continuous carrier "
               f"{ch1_carrier_freq_hz/1e6:.1f} MHz / {ch1_carrier_vpp*1e3:.0f} mVpp; "
-              f"switch held static on RF2 (sample path) for the resonance sweep; "
-              f"chop @ {chop_freq_hz:.0f} Hz, {chop_duty_pct:.0f}% duty starts after "
-              f"resonance is found; time constant {time_constant_s*1e3:.1f} ms, "
-              f"phase {phase_deg} deg (NOT auto-calibrated -- see module docstring)")
+              f"time constant {time_constant_s*1e3:.1f} ms, phase {phase_deg} deg "
+              f"(NOT auto-calibrated -- see module docstring)")
 
         print("[cw_odmr_lock_in] step 2/4: connecting to HP8673H + E4403B (interlock) "
-              "+ SPD1305X (amplifier supply) + SPD1168X (coil supply)")
+              "+ SPD1168X (amplifier supply) + SPD1305X (coil supply)")
         gen = HP8673H(GEN_RESOURCE)
-        psu = SPD1305X(PSU_RESOURCE)
-        coil_psu = SPD1168X(COIL_PSU_RESOURCE)
+        amp_psu = SPD1168X(AMP_PSU_RESOURCE)
+        coil_psu = SPD1305X(COIL_PSU_RESOURCE)
         ilock_sa = None
         try:
-            psu.turn_on(psu_voltage_v, psu_current_limit_a)
+            amp_psu.turn_on(psu_voltage_v, psu_current_limit_a)
             coil_voltage_v = voltage_for_current(coil_current_a) * coil_voltage_margin
             coil_psu.turn_on(coil_voltage_v, coil_current_a)
 
-            print(f"[cw_odmr_lock_in] step 2/4: sweeping for resonance "
-                  f"({res_start_hz/1e9:.4f}-{res_stop_hz/1e9:.4f} GHz, {res_power_dbm} dBm)")
-            from e4403b import E4403B
-            sa = E4403B(SA_RESOURCE)
-            result = gen.resonance_sweep(
-                sa, res_start_hz, res_stop_hz, coarse_step_hz, fine_span_hz, fine_step_hz,
-                res_power_dbm, output_prefix=f"{run_path}/{file_name}_resonance",
-                cal_dir=res_cal_dir,
-            )
-            f0_hz = result["f0_hz"]
-            fwhm_hz = result["fwhm_hz"]
-            print(f"[cw_odmr_lock_in] step 2/4 done: f0 = {f0_hz/1e9:.5f} GHz, "
-                  f"FWHM = {fwhm_hz/1e6:.3f} MHz, Q ~= {result['Q']:.0f}")
+            if use_resonance_sweep:
+                print(f"[cw_odmr_lock_in] step 2/4: sweeping for resonance "
+                      f"({res_start_hz/1e9:.4f}-{res_stop_hz/1e9:.4f} GHz, "
+                      f"{res_power_dbm} dBm)")
+                from e4403b import E4403B
+                sa = E4403B(SA_RESOURCE)
+                result = gen.resonance_sweep(
+                    sa, res_start_hz, res_stop_hz, coarse_step_hz, fine_span_hz, fine_step_hz,
+                    res_power_dbm, output_prefix=f"{run_path}/{file_name}_resonance",
+                    cal_dir=res_cal_dir,
+                )
+                f0_hz = result["f0_hz"]
+                fwhm_hz = result["fwhm_hz"]
+                print(f"[cw_odmr_lock_in] step 2/4 done: f0 = {f0_hz/1e9:.5f} GHz, "
+                      f"FWHM = {fwhm_hz/1e6:.3f} MHz, Q ~= {result['Q']:.0f}")
 
-            sa.go_to_local()
-            sa.close()
+                sa.go_to_local()
+                sa.close()
 
-            print(f"[cw_odmr_lock_in] enabling switch chop now that resonance is "
-                  f"located ({chop_duty_pct:.0f}% duty @ {chop_freq_hz:.0f} Hz)")
-            setup_chop(awg, chop_freq_hz, chop_duty_pct)
-            awg.close()
+                print(f"[cw_odmr_lock_in] enabling switch chop now that resonance is "
+                      f"located ({chop_duty_pct:.0f}% duty @ {chop_freq_hz:.0f} Hz)")
+                setup_chop(awg, chop_freq_hz, chop_duty_pct)
+                awg.close()
 
-            span_hz = fwhm_hz * fwhm_margin
-            freqs_hz = np.arange(f0_hz - span_hz / 2, f0_hz + span_hz / 2 + freq_step_hz / 2,
-                                  freq_step_hz)
+                if manual_start_hz is not None and manual_stop_hz is not None:
+                    start_hz = float(manual_start_hz)
+                    stop_hz = float(manual_stop_hz)
+                    print(f"[cw_odmr_lock_in] using manually-given range "
+                          f"{start_hz/1e9:.5f}-{stop_hz/1e9:.5f} GHz instead of "
+                          f"the resonance-sweep-derived one")
+                else:
+                    span_hz = fwhm_hz * fwhm_margin
+                    start_hz = f0_hz - span_hz / 2
+                    stop_hz = f0_hz + span_hz / 2
+            else:
+                start_hz = float(manual_start_hz)
+                stop_hz = float(manual_stop_hz)
+
+            freqs_hz = np.arange(start_hz, stop_hz + freq_step_hz / 2, freq_step_hz)
             print(f"[cw_odmr_lock_in] step 3/4: lock-in spectrum scan "
                   f"{freqs_hz[0]/1e9:.5f}-{freqs_hz[-1]/1e9:.5f} GHz "
                   f"({len(freqs_hz)} points, {freq_step_hz/1e3:.1f} kHz step), "
@@ -504,20 +526,20 @@ def cmd_run(file_name, **kw):
                 pass
             gen.close()
             try:
-                psu.turn_off()
+                amp_psu.turn_off()
             except Exception as e:
                 print(f"[cw_odmr_lock_in] WARNING: failed to turn off amplifier "
                       f"supply cleanly ({e})")
-            try:
-                psu.go_to_local()
-            except Exception:
-                pass
-            psu.close()
+            amp_psu.close()
             try:
                 coil_psu.turn_off()
             except Exception as e:
                 print(f"[cw_odmr_lock_in] WARNING: failed to turn off coil "
                       f"supply cleanly ({e})")
+            try:
+                coil_psu.go_to_local()
+            except Exception:
+                pass
             coil_psu.close()
             if ilock_sa is not None:
                 ilock_sa.close()
@@ -556,29 +578,32 @@ def cmd_single(file_name, **kw):
       drive_power_dbm=0.0     generator CW power
       threshold_dbm=-10.0     interlock trip threshold, in dBm
       carrier_off=false       keep RF output off throughout -- see above
-      duration_s=0            total run time in seconds; 0 = run until
-                               Ctrl+C
+      duration_s=0            total run time in seconds; 0 = run until Ctrl+C
       sample_interval_s=1.0   time between lock-in reads (on top of the
-                               time-constant settle already built into the
-                               lock-in's own filter)
+                               lock-in's own time-constant settle)
       chop_freq_hz=1000.0     AWG CH2 / lock-in reference frequency
       chop_duty_pct=50.0      AWG CH2 duty cycle
       time_constant_s=0.1     SR830 time constant
-      sensitivity_v=5e-3      SR830 sensitivity target -- ignored by default
-                               since auto_sensitivity=true; only takes
-                               effect if you explicitly set
+      sensitivity_v=5e-3      SR830 sensitivity target -- ignored unless
                                auto_sensitivity=false
       auto_sensitivity=true   call AGAN once RF/chop is running, before the
-                               read loop starts (see cmd_run's docstring) --
-                               confirmed on the bench to actually find a
-                               usable range where a fixed placeholder value
-                               did not
+                               read loop starts, instead of trusting a
+                               fixed sensitivity_v
       phase_deg=0.0           pre-calibrated SR830 phase
       input_coupling=ac       SR830 input coupling, 'ac' or 'dc'
       ch1_carrier_freq_hz=80e6  AWG CH1 continuous, unmodulated carrier
                                 frequency -- unrelated to the chop, just
                                 stays running throughout
       ch1_carrier_vpp=0.632     AWG CH1 carrier amplitude
+      coil_current_a=1.5      SPD1305X current setpoint for the static-field
+                              coil -- turned on right before the generator
+                              is armed, off when the run ends (see
+                              spd1305x.py)
+      coil_voltage_margin=1.5  voltage setpoint headroom above the
+                              calibration's expected coil voltage drop at
+                              coil_current_a, so the supply regulates in
+                              constant-current mode (same convention as
+                              spd1305x.py's set_field())
     """
     freq_hz = float(kw.get("freq_hz", 2.87e9))
     drive_power_dbm = float(kw.get("drive_power_dbm", 0.0))
@@ -595,6 +620,8 @@ def cmd_single(file_name, **kw):
     input_coupling = str(kw.get("input_coupling", "ac"))
     ch1_carrier_freq_hz = float(kw.get("ch1_carrier_freq_hz", 80e6))
     ch1_carrier_vpp = float(kw.get("ch1_carrier_vpp", 0.632))
+    coil_current_a = float(kw.get("coil_current_a", 1.5))
+    coil_voltage_margin = float(kw.get("coil_voltage_margin", 1.5))
 
     run_path = f"{DATA_DIR}/{file_name}"
     import os
@@ -620,12 +647,17 @@ def cmd_single(file_name, **kw):
               f"time constant {time_constant_s*1e3:.1f} ms, phase {phase_deg} deg "
               f"(NOT auto-calibrated -- see module docstring)")
 
-        print(f"[cw_odmr_lock_in] step 2/3: connecting to HP8673H + E4403B (interlock), "
-              f"fixed frequency {freq_hz/1e9:.5f} GHz, {drive_power_dbm} dBm"
+        print(f"[cw_odmr_lock_in] step 2/3: connecting to HP8673H + E4403B (interlock) "
+              f"+ SPD1305X (coil supply), fixed frequency {freq_hz/1e9:.5f} GHz, "
+              f"{drive_power_dbm} dBm"
               f"{' -- CARRIER OFF (control-line-pickup diagnostic)' if carrier_off else ''}")
         gen = HP8673H(GEN_RESOURCE)
+        coil_psu = SPD1305X(COIL_PSU_RESOURCE)
         ilock_sa = None
         try:
+            coil_voltage_v = voltage_for_current(coil_current_a) * coil_voltage_margin
+            coil_psu.turn_on(coil_voltage_v, coil_current_a)
+
             gen.preset()
             gen.set_power_dbm(drive_power_dbm)
             gen.set_frequency_hz(freq_hz)
@@ -731,6 +763,16 @@ def cmd_single(file_name, **kw):
             except Exception:
                 pass
             gen.close()
+            try:
+                coil_psu.turn_off()
+            except Exception as e:
+                print(f"[cw_odmr_lock_in] WARNING: failed to turn off coil "
+                      f"supply cleanly ({e})")
+            try:
+                coil_psu.go_to_local()
+            except Exception:
+                pass
+            coil_psu.close()
             if ilock_sa is not None:
                 ilock_sa.close()
             try:
@@ -788,77 +830,63 @@ def cmd_sweep_average(file_name, **kw):
       n_repeats=30            number of full sweeps to average together, PER
                               power level
       check_resonance_before_sweep=true  before each power level's repeats
-                              start, sweep reflected power across this SAME
+                              start, sweep reflected power across this same
                               freqs_hz range and record/report where the
-                              dip actually is -- purely diagnostic, does
-                              NOT gate or abort anything (the inline
-                              interlock during the real sweep still owns
-                              safety). Exists because at low scan power,
-                              reflected power can stay well under the
-                              interlock threshold even after the resonance
-                              has drifted well away from this sweep's
-                              intended window -- confirmed on the bench.
-                              Saves <file_prefix>_resonance_check_freqs_hz.npy
-                              and _resonance_check_reflected_dbm.npy per
-                              power level, and prints the dip location/depth
-                              and how far it is from the center of freqs_hz.
+                              dip actually is -- diagnostic only, doesn't
+                              gate or abort anything (guards against
+                              resonance drift going undetected at low scan
+                              power, where reflected power stays under the
+                              interlock threshold regardless). Saves
+                              <file_prefix>_resonance_check_freqs_hz.npy /
+                              _resonance_check_reflected_dbm.npy per power
+                              level.
       drive_power_dbm=0.0     (constant) drive power during the scan --
                               ignored if drive_power_dbm_list is given
       drive_power_dbm_list=None  comma-separated list of drive powers, e.g.
-                              "-40,-20,-10,0" -- if given, repeats the WHOLE
+                              "-40,-20,-10,0" -- repeats the whole
                               n_repeats-averaged sweep once per power level
-                              in the list (same frequency range and repeat
-                              count for each), for a power-dependence study
-                              (e.g. power broadening). auto_sensitivity (if
-                              enabled) re-runs AGAN once per power level,
-                              since signal size can change a lot with drive
-                              power. A Ctrl+C or interlock trip during any
-                              power's sweep stops the WHOLE list, not just
-                              that one power -- whatever powers completed
-                              fully before that are still saved.
+                              (for a power-dependence study). A Ctrl+C or
+                              interlock trip stops the whole list, not just
+                              the current power -- powers already completed
+                              are still saved.
       threshold_dbm=-10.0     interlock trip threshold, in dBm
-      auto_rescale_on_overload=true  detect SR830 overload in real time
-                              mid-sweep and auto-rescale + restart the
-                              current repeat -- see above
-      max_rescale_attempts=3  how many times to rescale-and-rescan within a
-                              single repeat before giving up on it and
-                              treating it as PARTIAL
-      rescan_backoff_points=2  how many points to back up (not restart from
-                              0) before rescanning after an overload
+      auto_rescale_on_overload=true  detect SR830 overload in real time and
+                              auto-rescale + restart the current repeat
+      max_rescale_attempts=3  rescale-and-rescan attempts per repeat before
+                              giving up and treating it as PARTIAL
+      rescan_backoff_points=2  points to back up (not restart from 0)
+                              before rescanning after an overload
       settle_s=0.05           settle time after each frequency change --
                                NEVER 0, see hp8673h.py's frequency_sweep()
-                               docstring for why
       chop_freq_hz=1000.0     AWG CH2 / lock-in reference frequency
       chop_duty_pct=50.0      AWG CH2 duty cycle
       time_constant_s=0.1     SR830 time constant
-      settle_time_constants=5.0  how many time constants to wait after
-                                  each frequency change before reading the
-                                  lock-in (in addition to settle_s)
-      sensitivity_v=5e-3      SR830 sensitivity target -- ignored by default
-                               since auto_sensitivity=true
-      auto_sensitivity=true   call AGAN once RF/chop is running, before the
-                               first repeat starts (see cmd_run's docstring)
+      settle_time_constants=5.0  time constants to wait after each
+                                  frequency change before reading (on top
+                                  of settle_s)
+      sensitivity_v=5e-3      SR830 sensitivity target -- ignored unless
+                               auto_sensitivity=false
+      auto_sensitivity=true   call AGAN once RF/chop is running, before
+                               the first repeat starts
       phase_deg=0.0           pre-calibrated SR830 phase
       input_coupling=ac       SR830 input coupling, 'ac' or 'dc'
-      ch1_carrier_freq_hz=80e6  AWG CH1 continuous, unmodulated carrier
-                                frequency -- unrelated to the chop, just
-                                stays running throughout
+      ch1_carrier_freq_hz=80e6  AWG CH1 continuous carrier frequency,
+                                unrelated to the chop
       ch1_carrier_vpp=0.632     AWG CH1 carrier amplitude
-      psu_voltage_v=12.0      SPD1305X output voltage for the RF amplifier
-                              supply -- turned on right before the
-                              resonance sweep (or, if use_resonance_sweep
-                              =false, right before the measurement sweep)
-                              starts, off when the whole run ends
-      psu_current_limit_a=1.9  SPD1305X current limit
-      coil_current_a=1.5      SPD1168X current setpoint for the static-field
-                              coil -- turned on at the same point as the
-                              SPD1305X above, off when the whole run ends
-                              (see spd1168x.py)
-      coil_voltage_margin=1.2  voltage setpoint headroom above the
-                              calibration's expected coil voltage drop at
-                              coil_current_a, so the supply regulates in
-                              constant-current mode (same convention as
-                              spd1168x.py's set_field())
+      psu_voltage_v=12.0      SPD1168X output voltage for the RF amplifier
+                              supply (see spd1168x.py) -- on before the
+                              resonance/measurement sweep, off when the
+                              whole run ends
+      psu_current_limit_a=1.9  SPD1168X current limit
+      coil_current_a=1.5      SPD1305X current setpoint for the static-
+                              field coil (see spd1305x.py; chosen over the
+                              SPD1168X for its higher current limit) --
+                              turned on/off alongside the amplifier supply
+      coil_voltage_margin=1.5  voltage headroom above the calibration's
+                              expected coil voltage drop at coil_current_a,
+                              so the supply regulates in constant-current
+                              mode (same convention as spd1305x.py's
+                              set_field())
 
     Saves resonance_sweep()'s own {file_name}_resonance_coarse.csv/
     _fine.csv (if use_resonance_sweep=true). If drive_power_dbm_list is NOT
@@ -922,7 +950,7 @@ def cmd_sweep_average(file_name, **kw):
     psu_voltage_v = float(kw.get("psu_voltage_v", 12.0))
     psu_current_limit_a = float(kw.get("psu_current_limit_a", 1.9))
     coil_current_a = float(kw.get("coil_current_a", 1.5))
-    coil_voltage_margin = float(kw.get("coil_voltage_margin", 1.2))
+    coil_voltage_margin = float(kw.get("coil_voltage_margin", 1.5))
 
     run_path = f"{DATA_DIR}/{file_name}"
     import os
@@ -958,13 +986,13 @@ def cmd_sweep_average(file_name, **kw):
               f"(NOT auto-calibrated -- see module docstring)")
 
         print("[cw_odmr_lock_in] step 2/3: connecting to HP8673H + E4403B (interlock) "
-              "+ SPD1305X (amplifier supply) + SPD1168X (coil supply)")
+              "+ SPD1168X (amplifier supply) + SPD1305X (coil supply)")
         gen = HP8673H(GEN_RESOURCE)
-        psu = SPD1305X(PSU_RESOURCE)
-        coil_psu = SPD1168X(COIL_PSU_RESOURCE)
+        amp_psu = SPD1168X(AMP_PSU_RESOURCE)
+        coil_psu = SPD1305X(COIL_PSU_RESOURCE)
         ilock_sa = None
         try:
-            psu.turn_on(psu_voltage_v, psu_current_limit_a)
+            amp_psu.turn_on(psu_voltage_v, psu_current_limit_a)
             coil_voltage_v = voltage_for_current(coil_current_a) * coil_voltage_margin
             coil_psu.turn_on(coil_voltage_v, coil_current_a)
 
@@ -1223,20 +1251,20 @@ def cmd_sweep_average(file_name, **kw):
                 pass
             gen.close()
             try:
-                psu.turn_off()
+                amp_psu.turn_off()
             except Exception as e:
                 print(f"[cw_odmr_lock_in] WARNING: failed to turn off amplifier "
                       f"supply cleanly ({e})")
-            try:
-                psu.go_to_local()
-            except Exception:
-                pass
-            psu.close()
+            amp_psu.close()
             try:
                 coil_psu.turn_off()
             except Exception as e:
                 print(f"[cw_odmr_lock_in] WARNING: failed to turn off coil "
                       f"supply cleanly ({e})")
+            try:
+                coil_psu.go_to_local()
+            except Exception:
+                pass
             coil_psu.close()
             if ilock_sa is not None:
                 ilock_sa.close()
@@ -1251,53 +1279,6 @@ def cmd_sweep_average(file_name, **kw):
                 pass
 
     print("[cw_odmr_lock_in] done")
-
-
-def cmd_calibrate_osl(cal_dir, **kw):
-    """
-    Open-short-load scalar calibration for the resonance sweep (see
-    hp8673h.py's calibrate_osl()/apply_osl_calibration() for what this does
-    and its vector-vs-scalar limitation). Holds the switch static on RF2
-    first, same as cmd_run() does before its own resonance sweep -- without
-    this, the switch could still be left chopping from a previous run,
-    which would corrupt the calibration sweep exactly the way it used to
-    corrupt the coarse resonance sweep before that was fixed.
-
-    Recognized key=value overrides (all optional):
-      start_hz=2e9            calibration sweep start frequency
-      stop_hz=3e9             calibration sweep stop frequency
-      step_hz=6.7e6           calibration sweep step -- match whatever
-                              coarse_step_hz you'll use for the real
-                              resonance sweep
-      drive_power_dbm=-40.0   calibration drive power -- kept low by
-                              default since open/short present a near-total
-                              reflection at the reference plane; don't
-                              raise this without confirming the amplifier
-                              tolerates that mismatch at the power you pick
-    """
-    start_hz = float(kw.get("start_hz", 2.0e9))
-    stop_hz = float(kw.get("stop_hz", 3.0e9))
-    step_hz = float(kw.get("step_hz", 6.7e6))
-    drive_power_dbm = float(kw.get("drive_power_dbm", -40.0))
-
-    print("[cw_odmr_lock_in] configuring AWG CH2 (static, not chopping) before calibration")
-    awg = ks33600a.KS33600A(AWG_RESOURCE, debug=True)
-    set_switch_static(awg, route_to_sample=True)
-    awg.close()
-
-    gen = HP8673H(GEN_RESOURCE)
-    from e4403b import E4403B
-    sa = E4403B(SA_RESOURCE)
-    try:
-        gen.calibrate_osl(sa, start_hz, stop_hz, step_hz, cal_dir,
-                           drive_power_dbm=drive_power_dbm)
-    finally:
-        gen.go_to_local()
-        gen.close()
-        sa.go_to_local()
-        sa.close()
-
-    print(f"[cw_odmr_lock_in] done: calibration saved to {cal_dir}")
 
 
 def main():
@@ -1315,12 +1296,9 @@ def main():
         cmd_single(file_name, **extra)
     elif command == "sweep-average":
         cmd_sweep_average(file_name, **extra)
-    elif command == "calibrate-osl":
-        cmd_calibrate_osl(file_name, **extra)
     else:
         raise SystemExit(f"unknown command {command!r} "
-                          f"(expected 'run', 'single', 'sweep-average', or "
-                          f"'calibrate-osl')")
+                          f"(expected 'run', 'single', or 'sweep-average')")
 
 
 if __name__ == "__main__":

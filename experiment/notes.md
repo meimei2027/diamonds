@@ -801,6 +801,52 @@ See `CLAUDE.md` for the full investigation history behind each of these.
   before that already read fine at the old, more sensitive range. Gives up
   after `max_rescale_attempts` and treats the repeat as PARTIAL (saved,
   excluded from the average) rather than looping forever.
+- **`coil_voltage_margin`'s old default (1.2, i.e. 20% headroom) wasn't
+  enough to actually reach the commanded coil current on a long scan.**
+  Confirmed for the `static_new*` runs: commanding `coil_current_a=2.0`
+  with the old default only achieved ~1.92 A actual coil current (per
+  `SPD1305X.read_current()`), because the SPD1305X hit its voltage
+  compliance limit before reaching the requested current -- the coil's
+  *actual* (warm) resistance during the scan was higher than
+  `spd1305x.py`'s cold-calibration value predicts (working backward from
+  the 1.92 A shortfall: ~0.60 ohm actual vs. ~0.48 ohm cold-calibrated,
+  ~26% higher), consistent with ordinary resistive self-heating over a
+  long run -- and a 20% voltage margin over the *cold* prediction wasn't
+  enough to cover that. **Any `static_new*` scan's actual coil current
+  (and therefore field -- see the NV-field-estimation discussion below)
+  may be somewhat below its nominal `coil_current_a` setting for this
+  reason; check `SPD1305X.read_current()` if the exact current matters for
+  a specific run, don't just trust the commanded setpoint.** **Fixed**:
+  `cw_odmr_lock_in.py`'s `coil_voltage_margin` default raised from `1.2`
+  to `1.5` (50% headroom) in `cmd_run()`/`cmd_single()`/
+  `cmd_sweep_average()`, comfortably above the ~1.25 that would have just
+  barely reached 2.0 A given the coil's apparent warm resistance, leaving
+  room for further heating on an even longer scan.
+- **Estimating the applied field from the observed NV splitting for the
+  `static_new*` runs**: using `nv_center.ipynb`'s magic-angle spin-1
+  Hamiltonian model (field along [100] on this (100)-cut diamond, at
+  54.74 deg to every NV axis -- not the simple on-axis `D +- gamma*B`),
+  the two double-Lorentzian fits in `cw_odmr_lock_in_result.ipynb`
+  (splittings 54.12 MHz for the `power_up` subset, 54.36 MHz for the
+  non-`power_up` subset) both invert to essentially the same field, ~16.7-
+  16.8 G. This is well below the ~28.4 G `spd1168x.py`'s calibration table
+  measures directly at `I=2.0 A` "right at the coil" (and still well below
+  the ~27.3 G predicted for the actual ~1.92 A current, per the point
+  above) -- **the diamond was positioned further from the coil than the
+  calibration point** for these runs, not merely a current shortfall.
+  Treating the coil as a simple single-turn loop (on-axis field
+  `B(z) = B0 / (1 + (z/R)^2)^(3/2)`, `B0` = the calibrated field at the
+  coil center) gives `z/R ~= 0.65` -- i.e. the diamond sat about 65% of
+  one coil-radius away from the coil's center plane. The coil's actual
+  physical parameters (not documented anywhere else in this repo -- see
+  `spd1305x.py`/`spd1168x.py`/`drawings/`, none of which record the real
+  coil geometry) are **R = 31.4 mm, N = 68 turns**, giving an absolute
+  distance of **z ~= 20.3-20.4 mm (~2.0-2.1 cm)** from the coil's center
+  plane to the diamond. Cross-check: the theoretical on-axis field for
+  this R/N at I=2.0A (`B0 = mu0*N*I/(2R)`) works out to ~27.2 G, matching
+  the measured calibration point (28.4 G) to within ~4% -- close enough to
+  confirm the single-loop-at-radius-R approximation is reasonable for this
+  coil, not wildly off.
 
 ## Pulsed ODMR (pulsed_odmr.py) -- NOT YET TESTED
 
@@ -828,6 +874,202 @@ See `CLAUDE.md` for the full investigation history behind each of these.
   the relevant relaxation timescale is (the T1 sweep above suggests
   order-100s of us, not the ~18.7us originally assumed) rather than
   worrying about T2*.
+
+## Rabi oscillation (rabi.py) -- NOT YET TESTED
+
+Design: instead of `cw_odmr_lock_in.py`'s continuous fast chop, the lock-in
+reference comes from a slow block structure on CH1 -- `n_reps` loop
+iterations with the MW pulse present ("on" block), then `n_reps` without
+("off" block), with the "on"/"off" blocks marked `highAtStart`/`lowAtStart`
+in the `DATA:SEQ` sequence table so CH1's Sync/marker BNC output becomes
+the reference square wave. See
+`tests/rabi_awg_marker_test.ipynb` for the AWG-only bench test this is
+being verified against before building the real sweep into `rabi.py`.
+
+- **Earlier entry in this section claimed an all-`"repeat"`-segment
+  `DATA:SEQ` sequence (no `"once"` anchor) doesn't play on this hardware --
+  this is now believed to be WRONG, or at least not the real explanation.**
+  The actual Keysight 33500/33600 programming manual's own `DATA:SEQuence`
+  examples (`MMEMory` subsystem example, e.g.
+  `"dc5v",2,repeat,maintain,5`) use sequences made entirely of `"repeat"`
+  segments with no `"once"` segment at all, and document them as working.
+  The original ad hoc test that seemed to show all-`"repeat"` failing most
+  likely actually hit the separately-documented "re-uploading a
+  `DATA:SEQ`/arb name that already exists silently does nothing (or
+  errors)" issue instead (see `t1_test.py`'s `upload_sequence()` docstring
+  and the `DATA:ARBitrary` manual entry, page 241: "Specifying a waveform
+  that is already loaded generates a 'Specified arb waveform already
+  exists' error"), triggered by re-running the same upload cell more than
+  once in one AWG session -- not a fundamental restriction on all-`repeat`
+  sequences. The `"once"`-anchor structure was removed from the test
+  notebook's sequence-building cell as a result; it now uses two plain
+  `"repeat"` segments per block per channel, matching the manual's
+  validated pattern, and this still produces correct sequence playback.
+- **Confirmed real bug: `SOURce{ch}:FUNC:ARBitrary:PTPeak`
+  (`FUNC:ARB:PTP`) does NOT reliably update the channel's actual output
+  amplitude register on this firmware.** Set `SOUR2:FUNC:ARB:PTP 5.0` and
+  `SOUR2:VOLT:OFFS 2.5`, then queried `SOUR2:VOLT?`/`SOUR2:VOLT:OFFS?`
+  afterward and got back `0.1`/`0.0` (old/default values) -- no SCPI error
+  raised at any point. Switching to the plain `VOLTage`/`VOLTage:OFFSet`
+  commands instead (`SOUR{ch}:VOLT <vpp>`) and re-querying confirmed they
+  actually stick. **Use `VOLTage`, not `FUNC:ARB:PTPeak`, for setting ARB
+  channel amplitude on this instrument going forward** (affects
+  `tests/rabi_awg_marker_test.ipynb`'s `configure-output` cell; check any
+  other script using `FUNC:ARB:PTP` for amplitude, e.g. `t1_test.py`'s
+  `setup_awg_output()`, `pulsed_odmr.py` -- not yet audited/fixed there).
+- **Confirmed real (but not confirmed as the cause of any specific
+  symptom) driver gap**: `KS33600A.upload_waveform()` uploads arb data via
+  a raw `pyvisa.write_binary_values()` call, bypassing `write()`'s
+  `SYST:ERR?` check entirely. Since re-uploading an arb under an existing
+  name errors per the manual (see above), re-running a waveform-upload
+  cell in the same AWG session without first clearing volatile memory
+  could silently leave stale data in place with no error surfaced
+  anywhere. This is a real gap worth fixing in `ks33600a.py` (mirror
+  `write()`'s error check after the binary transfer) -- not yet done.
+  Added a `SOUR{1,2}:DATA:VOL:CLE` cell to
+  `tests/rabi_awg_marker_test.ipynb` as a precaution before every
+  waveform re-upload, but this was **never independently confirmed** to
+  be the actual cause of a specific symptom seen in this session (a
+  missing `PRE_US` gap) -- that was a plausible hypothesis at the time,
+  not a verified diagnosis. Don't cite it as a confirmed fix.
+- **`SOUR2:DATA:SEQ` (targeting channel 2's sequence table with an
+  explicit prefix, since t1_test.py's proven CH1 usage is unprefixed) is
+  confirmed accepted without a SCPI error on this firmware** -- this was
+  flagged as unverified in `pulsed_odmr.py`'s own docstring; now checked.
+- **Resolved: CH1's Sync/marker BNC output IS a clean single edge per
+  block, not a burst of `n_reps` quick edges.** Confirmed on real hardware
+  with a `"repeat"`-segment `DATA:SEQ` sequence and `marker_mode`
+  `highAtStart`/`lowAtStart` on each block's segment -- the Sync signal
+  showed a smooth square wave at the block period with no restarts or
+  extra edges, even across many loop cycles. This confirms the
+  block-chopped lock-in reference scheme (SR830 external reference driven
+  by CH1's Sync BNC) is viable in principle -- the per-segment
+  `marker_mode` field does toggle once per block, not once per repeat, as
+  hoped. The fallback (a single big pre-concatenated arb per block with
+  per-sample marker data) is NOT needed.
+- **Confirmed real bug: `PHASe:SYNChronize` reliably kills all output**
+  when issued after both channels are already configured/enabled and
+  running under `TRIG:SOUR IMM`, in this continuous (non-burst, non-sweep)
+  `DATA:SEQ`-based ARB setup. Reproduced twice, on two separate AWG
+  connections, with the `FUNC:ARB:PTP` amplitude bug and the
+  stale-arb-upload gap already accounted for -- so this is a real,
+  independent incompatibility, not just a symptom of those other bugs (an
+  earlier hypothesis that it was innocent turned out to be wrong). Do not
+  use `PHASe:SYNChronize` with this sequence-table + `TRIG:SOUR IMM`
+  combination on this firmware.
+- **RESOLVED: CH1/CH2 startup alignment**, via the manual's documented
+  "start a sequence on a trigger" technique (p.181) -- confirmed working
+  on real hardware, duty cycle measured at 49.18% (target 50%, see below
+  for why it's not exact). With independent `TRIG:SOUR IMM`
+  self-triggering, each channel starts looping its sequence the instant
+  its own `OUTPUT ON` is processed; since `OUTPUT1 ON`/`OUTPUT2 ON` are
+  separate SCPI writes issued moments apart, CH2 landed at an uncontrolled
+  point in the cycle relative to CH1 every time -- confirmed to vary from
+  run to run ("depending on initial conditions/luck"). Dead ends tried
+  first, all confirmed broken/inapplicable on this firmware, not just
+  failed attempts:
+  - `PHASe:SYNChronize`: reliably kills all output entirely when issued
+    after both channels are configured/running under `TRIG:SOUR IMM`.
+  - `TRIG:SOUR BUS` + `INIT:IMM:ALL` + a shared `*TRG` (targeting the
+    whole continuous sequence directly, no anchor segment): worked once,
+    didn't reproduce.
+  - Root cause of why plain triggering never worked, confirmed in the
+    manual: `TRIGger[1|2]:SOURce`/`LEVel`/`SLOPe` only apply to sweep and
+    burst mode (p.138-139) -- they do nothing for a plain continuous
+    `FUNC ARB` sequence with no burst/sweep enabled.
+  - `BURSt:MODE GATed` (bypasses `TRIGger` entirely, watches the Ext Trig
+    BNC level directly): works on a plain single arb, but errors with
+    `-221 "Settings conflict; not able to burst this function"` on a
+    multi-segment `DATA:SEQ` sequence -- contradicts the datasheet's
+    capability table, which claims "Sequenced arbitrary" supports burst.
+  - **The actual fix**: place a brief DC "anchor" segment (minimum 32 Sa
+    on 33600 Series) at the START of each channel's sequence, marked
+    `onceWaitTrig` (play once, then hold and wait for a trigger before
+    advancing) -- this is a documented *sequence-level* trigger
+    (segment-advance-on-trigger), completely distinct from the
+    burst/sweep-only `TRIGger:SOURce` restriction above. Both channels get
+    this same anchor; once each has played it (near-instantly, 32 Sa) and
+    is sitting in the wait-for-trigger state, a single trigger event
+    advances both into their real sequences at the same instant.
+    - `TRIG:SOUR BUS` + `*TRG` produced no output at all for this
+      mechanism (unclear why -- possibly `*TRG` doesn't drive
+      sequence-advance triggering the same way it does burst/sweep;
+      not fully root-caused). Switched to `TRIG:SOUR EXT` with a real
+      external edge (Siglent SDG1062X, `sdg1062x.py`, wired into the
+      rear-panel Ext Trig BNC) instead -- **this worked**, confirmed
+      correct CH1-vs-CH2 relative timing on the scope.
+    - **Critical subtlety, confirmed on real hardware: the external
+      trigger must be a CONTINUOUS, fast signal, not a one-time edge.**
+      When the sequence finishes its last segment, it wraps back to the
+      FIRST segment (the anchor) to loop -- and since that's
+      `onceWaitTrig`, every single lap needs a fresh trigger. A slow
+      trigger (100 Hz, tried first) let the sequence blaze through one
+      off+on cycle right after each edge, then sit frozen at the anchor
+      (holding low) for most of the 10 ms until the next edge -- a badly
+      asymmetric duty cycle, not a clean square wave. The external
+      trigger frequency must be at or above the real block-cycle rate
+      (`1 / (2 * BLOCK_US)`) so every wraparound is retriggered
+      essentially immediately.
+    - Even with a fast trigger, the duty cycle is never *exactly* 50%,
+      because the external trigger free-runs asynchronously to the
+      sequence's own wrap-around moment -- each lap picks up a random
+      extra dead time of up to one trigger period waiting for the next
+      edge, which always lengthens the "low" (anchor) portion. At 50 kHz
+      (20us period) this was a visible few-percent skew; at 1 MHz (1us
+      period, bounding the worst case to ~1.7% of a 60us block cycle) it
+      measured 49.18% -- close enough not to matter, but not perfect by
+      construction.
+    - **Real design implication for `rabi.py`**: since `BLOCK_US` depends
+      on `MW_US`, which is swept, the external trigger frequency needs to
+      be reconfigured (or just set very high, e.g. several MHz,
+      comfortably above every sweep point's own block rate) for the real
+      sweep, not left at one fixed value.
+    - **Anchor value must match each channel's own real "off"/rest level,
+      not a generic value -- confirmed on real hardware.** Originally used
+      a plain `0.0`-valued (normalized) anchor arb, shared conceptually
+      between both channels. This is fine for CH1 (simple 0-centered
+      `VOLTage` convention, where `0.0` normalized already is the "off"
+      level `ch1_rep` itself uses), but wrong for CH2, which uses an
+      asymmetric unipolar mapping (`VOLT 5.0`, `VOLT:OFFS 2.5`, i.e. 0-5V)
+      where `0.0` normalized maps to the *midpoint* (2.5V), not the real
+      "off" level (`-1.0` normalized -> 0V, matching `gate_off_rep`).
+      Symptom: a brief (~32 ns) unwanted blip to 2.5V right after the
+      MW-on block ends (when the sequence wraps to the anchor) and before
+      `gate_off_rep` pulls it down to the true 0V off level -- exactly at
+      the ZYSWA switch's control-voltage midpoint, i.e. potentially in an
+      undefined switch state for that instant. Fixed by giving each
+      channel its own anchor arb at that channel's actual rest level
+      (`anchor_ch1` at `0.0`, `anchor_ch2` at `-1.0`) instead of reusing
+      one shared `0.0`-valued anchor. Apply the same channel-specific
+      anchor-level care in `rabi.py`'s real `setup_awg_sequences()`.
+  - **Also fixed independently, still valid regardless of the above**:
+    the marker lives on CH2's OWN sequence now, not CH1's (`highAtStart`/
+    `lowAtStart` on CH2's segments, `OUTPut:SYNC:SOURce CH2` to switch the
+    shared Sync/Marker BNC to source from CH2). Since there's only one
+    physical Sync/Marker connector, shared between channels, this ties
+    the reference signal directly to CH2's own internal sequence
+    position -- always exactly aligned with CH2's real MW pulses by
+    construction, independent of CH1/CH2 relative timing. This alone
+    already fully solved lock-in reference validity even before the
+    anchor/external-trigger fix above solved the separate (but still
+    important, e.g. for `PRE_US`/`POST_US`'s RF-pickup-avoidance purpose)
+    question of CH1-vs-CH2 relative timing.
+- **Open item, still unverified**: interlock timing during a pulsed (not
+  continuous) RF source. `read_reflected_power_dbm()`'s single-sweep
+  approach (used everywhere else in this codebase) can't reliably land a
+  reading inside a microsecond-scale MW pulse -- GPIB round-trip plus the
+  analyzer's own sweep time are both far slower than that. `rabi.py`
+  instead uses a new `HP8673H.read_max_hold_reflected_power_dbm()`
+  (MAX HOLD over several full reference periods, guaranteeing it catches
+  at least one real pulse at its peak somewhere in that window, at the
+  cost of timing precision) checked only periodically
+  (`interlock_check_interval`), not every sweep point, since each check
+  now takes multiple reference periods instead of one quick sweep. Not yet
+  validated against real hardware -- in particular, whether the check
+  cadence is safe enough, and whether the MAX HOLD window's wall-clock
+  cost (currently counted as time *in addition to* the settle wait, even
+  though the pulse sequence is already running throughout the check) is
+  worth optimizing away.
 
 ## General
 
