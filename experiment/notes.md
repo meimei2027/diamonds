@@ -1070,6 +1070,82 @@ being verified against before building the real sweep into `rabi.py`.
   cost (currently counted as time *in addition to* the settle wait, even
   though the pulse sequence is already running throughout the check) is
   worth optimizing away.
+- **`settle_time_constants`'s old default (5.0) was NOT actually enough to
+  settle the SR830's own filter, given the filter slope this codebase
+  configures.** `setup_lock_in()` sets a 24 dB/oct filter (`set_filter_
+  slope_db_oct(24)`), which is a 4-pole cascaded RC filter, not a single
+  pole -- cascaded filters have a slower, S-shaped step response (delayed
+  initial response before catching up), so "5 time constants" means very
+  different things depending on filter order. Computing the actual
+  cascaded-filter step-response formula
+  (`1 - exp(-t/tau) * sum_{k=0}^{n-1} (t/tau)^k / k!`, the Erlang-CDF
+  form, for n=4 poles): 5 TC only reaches **~73.5% settled** (a ~26.5%
+  residual of the *previous* point's value still contaminating every
+  reading) -- compare to a single-pole filter, where 5 TC already reaches
+  ~99.3%. For reference: 1-pole needs ~5 TC for 99%, 2-pole ~7 TC, 3-pole
+  ~9 TC, 4-pole (ours) ~9-10 TC for ~98-99%. This is a real, systematic
+  bias, not just added noise -- and critically, it's NOT fixed by more
+  averaging (`n_reps`), which is consistent with a 250-`n_reps` run
+  (`rabi2`) not showing cleaner Rabi data than a 50-`n_reps` run
+  (`rabi1`) despite 5x more averaging. **Fixed**: `settle_time_constants`
+  default raised from `5.0` to `9.0` in both `cmd_run()` and
+  `cmd_calibrate_phase()`. Worth re-running previous data (`rabi1`/
+  `rabi2`/`rabi3`, all taken with the old insufficient default) with the
+  corrected settle time before trusting their apparent decay/noise
+  characteristics.
+- **Why this under-settling issue may bite `rabi.py` harder than
+  `cw_odmr_lock_in.py` even though both share the identical 24 dB/oct
+  filter and the identical (old) `settle_time_constants=5.0` default.**
+  `settle_time_constants` (the ~9-10 multiplier) is a pure filter-order
+  property -- it only depends on the 4-pole cascade, not on the reference
+  frequency -- so it's the same fixed ratio in both scripts. But
+  `time_constant_s` itself is chosen relative to the reference *period*,
+  and that period differs a lot between the two: `cw_odmr_lock_in.py`
+  chops at a fixed `chop_freq_hz` (e.g. 1 kHz -> 1 ms period), while
+  `rabi.py`'s block-based reference period is several ms and varies with
+  `n_reps`/`mw_us`. With the shared `time_constant_s=0.1` (100 ms) value,
+  that's ~100 reference cycles per time constant for CW-ODMR vs. only
+  ~22-50 cycles per time constant for `rabi.py` -- CW-ODMR's tau was
+  generous relative to its own reference rate. Since the *absolute* wait
+  is `settle_time_constants * time_constant_s`, CW-ODMR's oversized tau
+  means its old 5 TC wait (500 ms) may have amounted to enough real dwell
+  time in practice to mostly converge, even though 5 TC is formally only
+  73.5% settled in cascaded-filter terms -- the generous tau likely masked
+  the shortfall. `rabi.py`'s tau sits much closer to its own reference
+  period (less slack), so the same formal 73.5%-settled shortfall is more
+  exposed and more likely to actually show up in the data. This is a
+  plausible explanation, not proof, for why `rabi1`/`rabi2`'s data shows
+  the effect while previously-collected CW-ODMR data (`static_new*`/
+  `powerscan*`/`powerstudy*`, same old `settle_time_constants=5.0`
+  default, intentionally NOT changed since that data is already
+  collected) may still be fine -- it would need the same absolute-dwell-
+  time-vs-reference-period analysis on that data to confirm either way.
+- **Analysis of `rabi1`/`rabi2`/`rabi3`'s R data (taken before the settle-
+  time fix above) found no convincing evidence of genuine Rabi
+  oscillations yet** -- FFT of the detrended R data shows no low-frequency
+  peak consistent across runs (each run's "loudest" frequency component
+  sits near its own Nyquist limit and differs between runs, the signature
+  of picking out the largest bin of white noise in a finite dataset, not
+  a real shared oscillation frequency); lag-1 autocorrelation of the
+  residuals is close to zero (-0.006/+0.025/-0.089), ruling out a
+  systematic point-to-point alternating artifact as the explanation for
+  the near-Nyquist FFT peaks. A plain (non-oscillating) exponential decay
+  does fit `rabi1`/`rabi2` reasonably (R^2 0.74/0.44) with a similar time
+  constant (~1.57-1.59 us) between the two independent runs -- suggestive
+  of *something* reproducible as a function of tau_mw, but adding a
+  decaying-cosine term never improved the fit in any of the three runs
+  (frequency always collapsed to ~0), so there's no confirmed oscillatory
+  (as opposed to monotonic-drift) component yet. Can't yet distinguish
+  "real T2*/Rabi-decay envelope, oscillation just not resolved" from
+  "unrelated monotonic drift over the sweep's wall-clock duration that
+  happens to correlate with tau_mw" -- the clean test is a
+  reversed-order or randomized/interleaved tau_mw sweep, not yet done.
+  Also notable: all three runs hit `OVERLOAD`/auto-rescale multiple times
+  right at the START of the sweep (e.g. `rabi3`: 4 times in its first
+  34/197 points), immediately after `auto_gain()` had just picked a
+  sensitivity -- direct evidence the raw signal was unstable enough to
+  blow past a just-chosen range almost immediately, independent of the
+  FFT/noise analysis above.
 
 ## General
 

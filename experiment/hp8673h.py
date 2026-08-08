@@ -153,6 +153,14 @@ class HP8673H:
         sa.write("TRAC1:MODE WRITE")
         sa.write("AVER:STATE OFF")
         sa.write("INIT:CONT OFF")
+        sa.write("CALC:MARK1:STATE ON")  # marker must be explicitly enabled
+                                            # for display, separately from
+                                            # its MODE -- without this, the
+                                            # marker's X/Y reads still work
+                                            # for the sweep DATA (functional
+                                            # correctness is unaffected),
+                                            # but nothing visibly moves on
+                                            # the analyzer's own screen
         sa.write("CALC:MARK1:MODE POS")
 
         readings_dbm = np.empty(len(freqs_hz))
@@ -552,6 +560,7 @@ class HP8673H:
             sa.write("INIT:CONT OFF")
             sa.write("INIT:IMM")
             sa.query("*OPC?")
+            sa.write("CALC:MARK1:STATE ON")
             sa.write("CALC:MARK1:MODE POS")
             sa.write(f"CALC:MARK1:X {freq_hz}")
             return float(sa.query("CALC:MARK1:Y?"))
@@ -597,6 +606,7 @@ class HP8673H:
             sa.write("INIT:CONT ON")
             time.sleep(hold_time_s)
             sa.write("INIT:CONT OFF")
+            sa.write("CALC:MARK1:STATE ON")
             sa.write("CALC:MARK1:MODE POS")
             sa.write(f"CALC:MARK1:X {freq_hz}")
             return float(sa.query("CALC:MARK1:Y?"))
