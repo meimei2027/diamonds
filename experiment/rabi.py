@@ -137,6 +137,16 @@ RESEQUENCE_INTERVAL = 20  # reset the AWG this often to clear out accumulated
                            # DATA:SEQ sequences before hitting its "too many
                            # sequences defined" limit -- same lesson as
                            # t1_test.py's RESEQUENCE_INTERVAL
+                           # NOT yet re-validated against anchor_free_reps:
+                           # each point's own sequence is now much larger
+                           # (up to ~2*anchor_free_reps+1 listed segments,
+                           # vs. 3 before), a DIFFERENT AWG resource (total
+                           # listed segments within one sequence, see
+                           # setup_awg_sequences()'s docstring) than the
+                           # "too many sequences defined" limit this
+                           # interval was tuned against (total DISTINCT
+                           # sequence names accumulated). Watch for errors
+                           # here on real hardware -- may need retuning.
 
 
 def build_block_descriptor(sequence_name, segments):
@@ -528,10 +538,10 @@ def cmd_run(file_name, **kw):
     underload_margin, psu_voltage_v,
     psu_current_limit_a, coil_current_a, coil_voltage_margin,
     interlock_check_interval, interlock_hold_periods, ch1_vpp, ch2_vpp,
-    ch2_offset_v, trigger_margin, reflected_power_scan, res_span_hz,
-    coarse_step_hz, fine_span_hz, fine_step_hz, res_power_dbm, res_cal_dir,
-    fine_sweep -- see the parameter-parsing block below for defaults and
-    notes.md for the reasoning behind non-obvious ones.
+    ch2_offset_v, trigger_margin, anchor_free_reps, reflected_power_scan,
+    res_span_hz, coarse_step_hz, fine_span_hz, fine_step_hz, res_power_dbm,
+    res_cal_dir, fine_sweep -- see the parameter-parsing block below for
+    defaults and notes.md for the reasoning behind non-obvious ones.
 
     If reflected_power_scan=true (default), runs a coarse-then-fine
     reflected-power sweep (HP8673H.resonance_sweep()) centered on freq_hz
@@ -593,7 +603,24 @@ def cmd_run(file_name, **kw):
     ch1_vpp = float(kw.get("ch1_vpp", 0.632))
     ch2_vpp = float(kw.get("ch2_vpp", 5.0))
     ch2_offset_v = float(kw.get("ch2_offset_v", 2.5))
-    trigger_margin = float(kw.get("trigger_margin", 100))
+    # Lowered from 100 -- that large a margin was needed when every
+    # single off+on cycle (a few ms) went through the onceWaitTrig
+    # anchor, since the trigger's own asynchronous dead time (up to one
+    # trigger period) was a meaningful fraction of that short cycle,
+    # visibly skewing its duty cycle. With anchor_free_reps now spacing
+    # anchor-wraps out to a much longer stretch (see below), that same
+    # dead time is a tiny fraction of the much longer period -- a modest
+    # margin is "just enough" without needlessly fast triggering.
+    trigger_margin = float(kw.get("trigger_margin", 3.0))
+    # Real-hardware testing (tests/rabi_anchor_free_reps_test.ipynb) found
+    # ~250 off+on-pair listings is close to this AWG's actual sequence-
+    # table capacity (consistent with the ~512-sequence-steps-per-channel
+    # spec estimated for this series: 512 - 1 anchor, /2 per pair ~= 255).
+    # 200 leaves a bit of headroom below that observed ceiling rather than
+    # running right up against it. See setup_awg_sequences()'s docstring
+    # and notes.md's "spurious off-resonance/no-MW-near-sample signal"
+    # entry for the full history/reasoning.
+    anchor_free_reps = int(kw.get("anchor_free_reps", 200))
     reflected_power_scan = str(kw.get("reflected_power_scan", "true")).lower() == "true"
     res_span_hz = float(kw.get("res_span_hz", 100e6))
     coarse_step_hz = float(kw.get("coarse_step_hz", 2e6))
@@ -764,17 +791,22 @@ def cmd_run(file_name, **kw):
                     settle_s = max(settle_periods * ref_period_s,
                                     settle_time_constants * time_constant_s)
 
-                    # Must be reconfigured every point: the external
-                    # trigger frequency has to stay at/above this point's
-                    # own block-cycle rate, which changes with mw_us (see
-                    # _configure_external_trigger()).
-                    _configure_external_trigger(sdg, ref_period_s, margin=trigger_margin)
+                    # With anchor_free_reps > 1, both channels only wrap
+                    # back through their anchor once every anchor_free_reps
+                    # off+on cycles (see setup_awg_sequences()'s docstring)
+                    # -- so the external trigger only needs to stay at/
+                    # above THAT longer rate, not the single-cycle rate.
+                    # Must be reconfigured every point regardless, since
+                    # this period changes with mw_us.
+                    anchor_period_s = ref_period_s * anchor_free_reps
+                    _configure_external_trigger(sdg, anchor_period_s, margin=trigger_margin)
 
                     setup_awg_sequences(
                         awg, mw_us, n_reps, laser_us, pre_us, post_us,
                         sequence_name_ch1=f"rabi_ch1_{i}",
                         sequence_name_ch2=f"rabi_ch2_{i}",
                         ch1_vpp=ch1_vpp, ch2_vpp=ch2_vpp, ch2_offset_v=ch2_offset_v,
+                        anchor_free_reps=anchor_free_reps,
                     )
 
                     # Clears anything latched from BEFORE this point's own

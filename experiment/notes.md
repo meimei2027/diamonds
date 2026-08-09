@@ -1451,13 +1451,52 @@ being verified against before building the real sweep into `rabi.py`.
   reps_test.ipynb` (using the real `setup_awg_sequences()`/
   `_configure_external_trigger()`, neither channel held constant) to
   inspect this directly on a scope before trusting it in a real sweep.
-  Tradeoff: `anchor_free_reps` grows the sequence TABLE size (more listed
-  segments per point), not waveform memory -- worth watching
-  `RESEQUENCE_INTERVAL` if pushed much higher, since that limit is about
-  a different (but related) AWG resource constraint. Not yet run on real
-  hardware to confirm the realignment fix, or to establish how large
-  `anchor_free_reps` needs to be for the residual artifact to become
-  negligible in a real sweep.
+  **Confirmed CH1/CH2 stay aligned on real hardware** when the trigger is
+  slowed down enough to see individual pulses.
+
+  **Found the actual sequence-table ceiling on real hardware: ~250
+  off+on-pair listings** (`VisaIOError`/`VI_ERROR_TMO` at 20000 listings;
+  50 worked). Consistent with the ~512-sequence-steps-per-channel spec
+  estimated for this AWG series (`512 - 1 anchor, /2 per pair ~= 255`).
+  Since `n_reps` (the repeat COUNT inside each listed segment) doesn't
+  consume extra table steps -- only the number of listed off+on PAIRS
+  does -- this ~250-pair ceiling carries over unchanged to real production
+  `n_reps=250`. At real parameters, one off+on cycle is `500 * (4 +
+  mw_us)` us (~2.0-4.5 ms across the sweep); 250 cycles covers ~0.50 s
+  (short `mw_us`) to ~1.13 s (long `mw_us`). Compared to `settle_s`
+  (dominated by the `settle_time_constants * time_constant_s = 0.9 s`
+  floor across essentially the whole sweep): this doesn't fully eliminate
+  the trigger-wait glitch at the very shortest `mw_us` (covers ~0.5s of
+  the ~0.9s window, so ~1 retrigger still occurs there, down from ~450
+  today), but fully eliminates it (zero retriggers during the read) for
+  the majority of the sweep where per-cycle duration is longer.
+
+  **Applied to `cmd_run()`'s real (non-diagnostic) path.** New
+  `anchor_free_reps` key=value override, default `200` (a bit of headroom
+  under the observed ~250 ceiling, not run right up against it).
+  `_configure_external_trigger()` is now given the FULL `anchor_free_reps`
+  -scaled period (`ref_period_s * anchor_free_reps`), not a single
+  cycle's period, since the trigger now only needs to keep up with the
+  much-less-frequent anchor-wrap rate. `trigger_margin`'s default also
+  lowered from `100` to `3.0` -- the large margin was compensating for
+  the trigger's own asynchronous dead time being a meaningful fraction of
+  a SHORT single cycle (visible duty-cycle skew); with anchor-wraps now
+  spaced out over a much longer stretch, that same dead time is a tiny
+  fraction of the period, so a modest margin is "just enough" without
+  needlessly fast triggering.
+
+  **Not yet re-validated**: `RESEQUENCE_INTERVAL` (still `20`) was tuned
+  against the OLD, much smaller per-point sequences (3 listed segments)
+  and a DIFFERENT AWG resource (total distinct sequence names
+  accumulated across points) than the one `anchor_free_reps` bumps into
+  (total listed segments within ONE sequence) -- each point's sequence is
+  now much larger (up to `2*anchor_free_reps+1` ~= 401 segments), so it's
+  not yet confirmed whether 20 points' worth of these larger sequences
+  still fits before hitting a real limit. Watch for errors here on real
+  hardware; may need retuning. Also not yet run on real hardware at all
+  with `anchor_free_reps` applied to `cmd_run()` specifically (only the
+  standalone notebook and the `run-ch2-constant` diagnostic have been
+  tested so far).
 - **SR830 sensitivity auto-rescaling was one-directional: only coarser,
   never finer again.** `_step_sensitivity_coarser()` + `auto_rescale_on_
   overload` back out of a real-time `OVERLOAD` by stepping to a LESS
