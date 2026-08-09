@@ -535,13 +535,15 @@ def cmd_run(file_name, **kw):
     pre_us, post_us, time_constant_s, settle_periods, settle_time_constants,
     sensitivity_v, auto_sensitivity, phase_deg, input_coupling,
     auto_rescale_on_overload, max_rescale_attempts, auto_rescale_on_underload,
-    underload_margin, psu_voltage_v,
+    underload_margin, underload_persistence, fixed_sensitivity,
+    psu_voltage_v,
     psu_current_limit_a, coil_current_a, coil_voltage_margin,
     interlock_check_interval, interlock_hold_periods, ch1_vpp, ch2_vpp,
-    ch2_offset_v, trigger_margin, anchor_free_reps, reflected_power_scan,
-    res_span_hz, coarse_step_hz, fine_span_hz, fine_step_hz, res_power_dbm,
-    res_cal_dir, fine_sweep -- see the parameter-parsing block below for
-    defaults and notes.md for the reasoning behind non-obvious ones.
+    ch2_offset_v, trigger_margin, anchor_free_reps, fixed_external_trigger,
+    reflected_power_scan, res_span_hz, coarse_step_hz, fine_span_hz,
+    fine_step_hz, res_power_dbm, res_cal_dir, fine_sweep -- see the
+    parameter-parsing block below for defaults and notes.md for the
+    reasoning behind non-obvious ones.
 
     If reflected_power_scan=true (default), runs a coarse-then-fine
     reflected-power sweep (HP8673H.resonance_sweep()) centered on freq_hz
@@ -594,6 +596,45 @@ def cmd_run(file_name, **kw):
     # avoids oscillating back and forth between two adjacent ranges on
     # noise alone.
     underload_margin = float(kw.get("underload_margin", 0.5))
+    # Real-hardware testing found underload_margin alone wasn't enough --
+    # a real bounce pattern: OVERLOAD coarsens sensitivity, then the very
+    # NEXT point's reading (at that new, coarser range) satisfies the
+    # underload condition and immediately reverts back to the finer range
+    # that just overloaded, which then overloads again next point, etc.
+    # This shows up as strong NEGATIVE lag-1 autocorrelation (point-to-
+    # point alternation) in the collected data -- confirmed on
+    # rabi_new2/3/4_fix_trigger (-0.19 to -0.60), consistent with a
+    # near-Nyquist FFT peak that's real, not finite-sample noise (unlike
+    # rabi_new/rabi_new1/the noise floor, which showed near-zero
+    # autocorrelation despite a similar-looking near-Nyquist peak -- see
+    # notes.md). Requiring the underload condition to hold for
+    # underload_persistence CONSECUTIVE points before actually stepping
+    # finer acts as a low-pass filter on the decision: a one-off reading
+    # right after an overload-forced coarsening won't immediately trigger
+    # a revert, since it needs the same condition to also hold on
+    # subsequent points, which won't happen if the coarser range was
+    # genuinely needed.
+    underload_persistence = int(kw.get("underload_persistence", 3))
+    # Convenience override: skip AGAN and BOTH overload/underload
+    # rescaling entirely, using sensitivity_v as-is for the whole sweep --
+    # for isolating whether auto-rescaling itself (even with the
+    # underload_persistence fix above) is adding noise/artifacts, by
+    # comparing against a run with sensitivity held completely fixed
+    # throughout. Overrides auto_sensitivity/auto_rescale_on_overload/
+    # auto_rescale_on_underload regardless of what they're individually
+    # set to -- MUST come after all three are parsed above, or their own
+    # parsing lines would silently reset this override (a real bug found
+    # on real hardware: fixed_sensitivity=true still rescaled, because
+    # this block used to run BEFORE auto_rescale_on_underload's own
+    # kw.get() line, which unconditionally overwrote it back to True
+    # right after). Pick sensitivity_v manually (e.g. from a previous
+    # auto_sensitivity run's logged range) since AGAN won't pick one for
+    # you here.
+    fixed_sensitivity = str(kw.get("fixed_sensitivity", "false")).lower() == "true"
+    if fixed_sensitivity:
+        auto_sensitivity = False
+        auto_rescale_on_overload = False
+        auto_rescale_on_underload = False
     psu_voltage_v = float(kw.get("psu_voltage_v", 12.0))
     psu_current_limit_a = float(kw.get("psu_current_limit_a", 1.9))
     coil_current_a = float(kw.get("coil_current_a", 2.0))
@@ -621,6 +662,13 @@ def cmd_run(file_name, **kw):
     # and notes.md's "spurious off-resonance/no-MW-near-sample signal"
     # entry for the full history/reasoning.
     anchor_free_reps = int(kw.get("anchor_free_reps", 200))
+    # Fixes the SDG1062X trigger at a single rate for the WHOLE sweep
+    # (derived from mw_start_us, the sweep's shortest rep and therefore
+    # its largest bare-minimum trigger requirement -- comfortably fast
+    # enough for every other, longer rep too), instead of recomputing it
+    # every point from the current mw_us. Set false to restore the old
+    # per-point recomputation.
+    fixed_external_trigger = str(kw.get("fixed_external_trigger", "true")).lower() == "true"
     reflected_power_scan = str(kw.get("reflected_power_scan", "true")).lower() == "true"
     res_span_hz = float(kw.get("res_span_hz", 100e6))
     coarse_step_hz = float(kw.get("coarse_step_hz", 2e6))
@@ -762,6 +810,20 @@ def cmd_run(file_name, **kw):
                                         f"{drive_power_dbm} dBm)")
                     return
 
+            if fixed_external_trigger:
+                # Worst case (highest bare-minimum trigger requirement) is
+                # the sweep's SHORTEST rep, at mw_start_us -- fast enough
+                # here means comfortably fast enough for every longer rep
+                # later in the sweep too.
+                fixed_rep_us = laser_us + pre_us + mw_start_us + post_us
+                fixed_anchor_period_s = 2 * n_reps * fixed_rep_us * 1e-6 * anchor_free_reps
+                fixed_trigger_freq_hz = _configure_external_trigger(
+                    sdg, fixed_anchor_period_s, margin=trigger_margin)
+                print(f"[rabi] fixed_external_trigger=true: SDG1062X trigger fixed "
+                      f"at {fixed_trigger_freq_hz/1e3:.3f} kHz for the whole sweep "
+                      f"(derived from mw_start_us={mw_start_us} us, "
+                      f"anchor_free_reps={anchor_free_reps})")
+
             print(f"[rabi] step 3/3: sweeping tau_mw, threshold {threshold_dbm} dBm")
 
             x_values = np.full(len(mw_values_us), np.nan)
@@ -769,6 +831,7 @@ def cmd_run(file_name, **kw):
             reflected_dbm_arr = np.full(len(mw_values_us), np.nan)
             n_completed = 0
             tripped = False
+            underload_streak = 0
 
             try:
                 for i, mw_us in enumerate(mw_values_us):
@@ -796,10 +859,11 @@ def cmd_run(file_name, **kw):
                     # off+on cycles (see setup_awg_sequences()'s docstring)
                     # -- so the external trigger only needs to stay at/
                     # above THAT longer rate, not the single-cycle rate.
-                    # Must be reconfigured every point regardless, since
-                    # this period changes with mw_us.
-                    anchor_period_s = ref_period_s * anchor_free_reps
-                    _configure_external_trigger(sdg, anchor_period_s, margin=trigger_margin)
+                    # Skipped when fixed_external_trigger is set (default)
+                    # -- see the one-time configuration before this loop.
+                    if not fixed_external_trigger:
+                        anchor_period_s = ref_period_s * anchor_free_reps
+                        _configure_external_trigger(sdg, anchor_period_s, margin=trigger_margin)
 
                     setup_awg_sequences(
                         awg, mw_us, n_reps, laser_us, pre_us, post_us,
@@ -862,11 +926,13 @@ def cmd_run(file_name, **kw):
 
                     x, y = lia.read_xy()
 
+                    overloaded_this_point = False
                     if auto_rescale_on_overload:
                         for attempt in range(max_rescale_attempts):
                             overload_status = lia.read_overload_status()
                             if not overload_status["any"]:
                                 break
+                            overloaded_this_point = True
                             old_v = lia.get_sensitivity_v()
                             new_v = _step_sensitivity_coarser(lia)
                             # Changing SENS itself can transiently overload
@@ -890,20 +956,38 @@ def cmd_run(file_name, **kw):
                                   f"after {max_rescale_attempts} rescale attempts -- "
                                   f"saving as-is")
 
-                    if auto_rescale_on_underload:
+                    if overloaded_this_point:
+                        # This point just got coarsened out of an overload
+                        # -- don't let it count toward underload_persistence
+                        # at all (even if it happens to look "underloaded"
+                        # relative to the NEW coarser range); that's
+                        # exactly the single-point-triggered bounce this
+                        # persistence check exists to prevent.
+                        underload_streak = 0
+                    elif auto_rescale_on_underload:
                         idx = SR830.SENSITIVITY_V.index(sensitivity_v)
                         if idx > 0:
                             r = (x ** 2 + y ** 2) ** 0.5
                             next_v = SR830.SENSITIVITY_V[idx - 1]
                             if r < underload_margin * next_v:
-                                old_v = sensitivity_v
-                                new_v = _step_sensitivity_finer(lia)
-                                print(f"[rabi] tau_mw={mw_us:.3f} us (point {i + 1}/"
-                                      f"{len(mw_values_us)}): R={r:.3e} V is well under "
-                                      f"the current {old_v:.3e} V full scale -- stepping "
-                                      f"sensitivity down to {new_v:.3e} V full scale for "
-                                      f"the next point")
-                                sensitivity_v = new_v
+                                underload_streak += 1
+                                if underload_streak >= underload_persistence:
+                                    old_v = sensitivity_v
+                                    new_v = _step_sensitivity_finer(lia)
+                                    print(f"[rabi] tau_mw={mw_us:.3f} us (point {i + 1}/"
+                                          f"{len(mw_values_us)}): R={r:.3e} V well under "
+                                          f"the current {old_v:.3e} V full scale for "
+                                          f"{underload_streak} consecutive points -- "
+                                          f"stepping sensitivity down to {new_v:.3e} V "
+                                          f"full scale for the next point")
+                                    sensitivity_v = new_v
+                                    underload_streak = 0
+                            else:
+                                underload_streak = 0
+                        else:
+                            underload_streak = 0
+                    else:
+                        underload_streak = 0
 
                     x_values[i] = x
                     y_values[i] = y
@@ -1031,8 +1115,9 @@ def cmd_run_no_mw(file_name, **kw):
     laser_us, pre_us, post_us, time_constant_s, settle_periods,
     settle_time_constants, sensitivity_v, auto_sensitivity, phase_deg,
     input_coupling, auto_rescale_on_overload, max_rescale_attempts,
-    auto_rescale_on_underload, underload_margin, ch1_vpp, ch2_vpp,
-    ch2_offset_v, trigger_margin. freq_hz/drive_power_dbm are accepted
+    auto_rescale_on_underload, underload_margin, underload_persistence,
+    fixed_sensitivity, ch1_vpp, ch2_vpp, ch2_offset_v, trigger_margin.
+    freq_hz/drive_power_dbm are accepted
     too, but ONLY as labels recorded in the log/metadata (e.g. so the
     saved file documents what frequency the generator was physically
     parked at) -- neither is ever sent to any instrument here. No
@@ -1196,6 +1281,18 @@ def _run_no_mw_impl(file_name, ch2_hold_constant, ch1_hold_constant=False,
     max_rescale_attempts = int(kw.get("max_rescale_attempts", 3))
     auto_rescale_on_underload = str(kw.get("auto_rescale_on_underload", "true")).lower() == "true"
     underload_margin = float(kw.get("underload_margin", 0.5))
+    # See cmd_run()'s underload_persistence comment -- same overload/
+    # underload oscillation fix applied here.
+    underload_persistence = int(kw.get("underload_persistence", 3))
+    # See cmd_run()'s fixed_sensitivity comment -- same convenience
+    # override, and the same ordering requirement (must come after
+    # auto_sensitivity/auto_rescale_on_overload/auto_rescale_on_underload
+    # are all parsed above).
+    fixed_sensitivity = str(kw.get("fixed_sensitivity", "false")).lower() == "true"
+    if fixed_sensitivity:
+        auto_sensitivity = False
+        auto_rescale_on_overload = False
+        auto_rescale_on_underload = False
     ch1_vpp = float(kw.get("ch1_vpp", 0.632))
     ch2_vpp = float(kw.get("ch2_vpp", 5.0))
     ch2_offset_v = float(kw.get("ch2_offset_v", 2.5))
@@ -1257,6 +1354,7 @@ def _run_no_mw_impl(file_name, ch2_hold_constant, ch1_hold_constant=False,
             y_values = np.full(len(mw_values_us), np.nan)
             reflected_dbm_arr = np.full(len(mw_values_us), np.nan)
             n_completed = 0
+            underload_streak = 0
 
             try:
                 for i, mw_us in enumerate(mw_values_us):
@@ -1301,11 +1399,13 @@ def _run_no_mw_impl(file_name, ch2_hold_constant, ch1_hold_constant=False,
 
                     x, y = lia.read_xy()
 
+                    overloaded_this_point = False
                     if auto_rescale_on_overload:
                         for attempt in range(max_rescale_attempts):
                             overload_status = lia.read_overload_status()
                             if not overload_status["any"]:
                                 break
+                            overloaded_this_point = True
                             old_v = lia.get_sensitivity_v()
                             new_v = _step_sensitivity_coarser(lia)
                             lia.read_overload_status()
@@ -1322,20 +1422,38 @@ def _run_no_mw_impl(file_name, ch2_hold_constant, ch1_hold_constant=False,
                                   f"after {max_rescale_attempts} rescale attempts -- "
                                   f"saving as-is")
 
-                    if auto_rescale_on_underload:
+                    if overloaded_this_point:
+                        # This point just got coarsened out of an overload
+                        # -- don't let it count toward underload_persistence
+                        # at all (even if it happens to look "underloaded"
+                        # relative to the NEW coarser range); that's
+                        # exactly the single-point-triggered bounce this
+                        # persistence check exists to prevent.
+                        underload_streak = 0
+                    elif auto_rescale_on_underload:
                         idx = SR830.SENSITIVITY_V.index(sensitivity_v)
                         if idx > 0:
                             r = (x ** 2 + y ** 2) ** 0.5
                             next_v = SR830.SENSITIVITY_V[idx - 1]
                             if r < underload_margin * next_v:
-                                old_v = sensitivity_v
-                                new_v = _step_sensitivity_finer(lia)
-                                print(f"[rabi] tau_mw={mw_us:.3f} us (point {i + 1}/"
-                                      f"{len(mw_values_us)}): R={r:.3e} V is well under "
-                                      f"the current {old_v:.3e} V full scale -- stepping "
-                                      f"sensitivity down to {new_v:.3e} V full scale for "
-                                      f"the next point")
-                                sensitivity_v = new_v
+                                underload_streak += 1
+                                if underload_streak >= underload_persistence:
+                                    old_v = sensitivity_v
+                                    new_v = _step_sensitivity_finer(lia)
+                                    print(f"[rabi] tau_mw={mw_us:.3f} us (point {i + 1}/"
+                                          f"{len(mw_values_us)}): R={r:.3e} V well under "
+                                          f"the current {old_v:.3e} V full scale for "
+                                          f"{underload_streak} consecutive points -- "
+                                          f"stepping sensitivity down to {new_v:.3e} V "
+                                          f"full scale for the next point")
+                                    sensitivity_v = new_v
+                                    underload_streak = 0
+                            else:
+                                underload_streak = 0
+                        else:
+                            underload_streak = 0
+                    else:
+                        underload_streak = 0
 
                     x_values[i] = x
                     y_values[i] = y

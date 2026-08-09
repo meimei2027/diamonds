@@ -1497,6 +1497,23 @@ being verified against before building the real sweep into `rabi.py`.
   with `anchor_free_reps` applied to `cmd_run()` specifically (only the
   standalone notebook and the `run-ch2-constant` diagnostic have been
   tested so far).
+- **`cmd_run()`'s external trigger was still recomputed every point** --
+  scaled by `anchor_free_reps` (better than before), but still a function
+  of the current `mw_us`, so not actually constant across the sweep the
+  way `cmd_run_ch2_constant()`'s `fixed_external_trigger` already was.
+  **Fixed**: added the same `fixed_external_trigger` option to `cmd_run()`
+  (default `true`) -- when set, the SDG1062X trigger is configured ONCE
+  before the sweep starts, derived from `mw_start_us` (the sweep's
+  shortest rep, hence its largest bare-minimum trigger requirement --
+  comfortably fast enough for every longer rep later in the sweep too),
+  instead of being recomputed every point. Set `fixed_external_trigger=
+  false` to restore the old per-point recomputation. Note: `rabi_new`/
+  `rabi_new1` (the first runs collected under the `anchor_free_reps` fix)
+  were taken BEFORE this trigger-fixing change, so their external trigger
+  still varied point-to-point (scaled by `anchor_free_reps`, but not
+  constant) -- worth keeping in mind if re-analyzing them, though this is
+  a much smaller effect than the background artifact those runs already
+  fixed. Not yet run on real hardware to confirm.
 - **`rabi1` through `rabi9` (all data collected before the
   anchor_free_reps/trigger fixes above) are NOT reliable Rabi
   measurements and should not be used or reanalyzed as such.** All of
@@ -1517,6 +1534,72 @@ being verified against before building the real sweep into `rabi.py`.
   analysis again. (The various `rabi_off_resonance*`/`no_mw*` runs are
   exempt from this caveat -- those were themselves the diagnostic probes
   that found this artifact, not intended as real physics measurements.)
+- **Found and fixed a real overload/underload sensitivity-bounce
+  oscillation, distinct from the background artifact above.** FFT
+  analysis of `rabi_new2_fix_trigger`/`rabi_new3_fix_trigger`/`rabi_new4_
+  fix_trigger` (collected after the anchor_free_reps/trigger fixes) still
+  showed a peak near each run's own Nyquist frequency -- but UNLIKE the
+  earlier `rabi1`/`rabi2`/`rabi3` case (near-zero lag-1 autocorrelation,
+  consistent with finite-sample white noise randomly peaking anywhere)
+  and the `rabi_off_resonance_fix_long` noise-floor control (also
+  near-zero, 0.054), these three runs showed strongly NEGATIVE lag-1
+  autocorrelation (-0.19 to -0.60) -- genuine point-to-point alternation,
+  which by construction sits exactly at Nyquist frequency, not a
+  coincidental noise peak. Root cause: the existing overload/underload
+  logic reacts to a SINGLE reading each way -- `OVERLOAD` coarsens
+  sensitivity, then the very next point's reading (now measured at that
+  coarser range) satisfies `auto_rescale_on_underload`'s margin check and
+  immediately reverts back to the finer range that just overloaded, which
+  then overloads again next point, repeating indefinitely -- exactly a
+  period-2 bounce. **Fixed**: added `underload_persistence` (default `3`)
+  -- the underload condition must now hold for that many CONSECUTIVE
+  points before actually stepping to a finer range, acting as a low-pass
+  filter on the decision (a one-off reading right after an overload-
+  forced coarsening won't immediately trigger a revert, since subsequent
+  points must also independently confirm it). Also: any point where an
+  `OVERLOAD` actually triggered a coarsening this same point resets
+  `underload_streak` to 0 unconditionally (via a new `overloaded_this_
+  point` flag), so a point still recovering from an overload can never
+  itself count toward the persistence requirement, even if it happens to
+  look "underloaded" relative to its newly-coarsened range. Applied to
+  both `cmd_run()` and `_run_no_mw_impl()` (shared by `cmd_run_no_mw()`/
+  `cmd_run_ch2_constant()`/`cmd_run_ch1_ch2_constant()`). Not yet run on
+  real hardware to confirm the oscillation is actually gone (check via
+  the same lag-1-autocorrelation test used to find it). **Confirmed on
+  real hardware**: `rabi_new5_fix_overload`'s lag-1 autocorrelation
+  flipped from strongly negative (-0.19 to -0.60 in the pre-fix runs) to
+  positive (0.324) -- the period-2 bounce signature is gone, though not
+  yet as close to zero as the noise floor's own 0.054. (Also checked
+  lag-3 across all runs as a second check -- it sits around -0.2 to -0.3
+  for several runs regardless of whether they ever showed the lag-1
+  bounce, including ones that never had it, while the noise floor itself
+  is +0.150 -- no clean separation there, consistent with lag-3 being
+  dominated by sampling variance at these modest sample sizes (n=20-100)
+  rather than tracking a real periodic effect. A genuine period-2 bounce
+  shows its signature at lag-1 specifically, not lag-3, so this doesn't
+  undermine the lag-1 result.)
+- **Added `fixed_sensitivity` convenience override** (`cmd_run()` and
+  `_run_no_mw_impl()`) -- when `true`, forces `auto_sensitivity`/
+  `auto_rescale_on_overload`/`auto_rescale_on_underload` all to `False`
+  regardless of their own individual settings, using `sensitivity_v` as-
+  is for the entire sweep with no AGAN and no rescaling at all. Useful
+  for isolating whether auto-rescaling itself (even with the
+  `underload_persistence` fix above) still contributes noise/artifacts,
+  by comparing directly against a run with sensitivity held completely
+  fixed throughout. Since `auto_sensitivity` is forced off, `sensitivity_
+  v` must be picked manually (e.g. from a previous auto_sensitivity run's
+  logged range) rather than relying on AGAN to choose it.
+  **Bug found on real hardware, fixed**: `fixed_sensitivity=true
+  sensitivity_v=1e-4` still rescaled. Root cause: the override block was
+  placed right after `auto_rescale_on_overload`/`max_rescale_attempts`
+  were parsed, but BEFORE `auto_rescale_on_underload`'s own `kw.get(...)`
+  line further down -- that line ran unconditionally afterward and
+  silently reset `auto_rescale_on_underload` back to `True`, undoing half
+  the override (auto_sensitivity and auto_rescale_on_overload stayed
+  correctly disabled since nothing reassigned them again, but underload
+  rescaling kept happening). Fixed by moving the override block to AFTER
+  all three flags (and `underload_margin`/`underload_persistence`) are
+  parsed, in both `cmd_run()` and `_run_no_mw_impl()`.
 - **SR830 sensitivity auto-rescaling was one-directional: only coarser,
   never finer again.** `_step_sensitivity_coarser()` + `auto_rescale_on_
   overload` back out of a real-time `OVERLOAD` by stepping to a LESS

@@ -43,3 +43,11 @@
         - instead of decay wildly oscillating
 - no internal repeat => still signal
     - no wait for trigger => no signal
+
+
+to run cw odmr: 
+python cw_odmr_lock_in.py run rabi_new_scan threshold_dbm=-5 coil_current_a=2 freq_step_hz=200e3
+don't forget ref for lockin comes from ch2, not sync
+
+
+python rabi.py run rabi_new4_fix_trigger threshold_dbm=-5 freq_hz=2.844e9 mw_start_us=0.02 mw_stop_us=1 mw_step_us=0.01 fine_sweep=false
