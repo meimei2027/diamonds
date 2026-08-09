@@ -1120,6 +1120,468 @@ being verified against before building the real sweep into `rabi.py`.
   default, intentionally NOT changed since that data is already
   collected) may still be fine -- it would need the same absolute-dwell-
   time-vs-reference-period analysis on that data to confirm either way.
+- **`setup_awg_sequences()` used to reissue the AWG's output-stage config
+  (amplitude `VOLT`, `OUTP:LOAD`, `TRIG:SOUR/SLOP/LEV`, `OUTPUT ON`,
+  `OUTPut:SYNC:SOURce`) from inside the per-sweep-point loop, even though
+  none of those values depend on `mw_us` -- a 250-point run reissued the
+  identical output-stage settings 250 times. These are plausibly
+  relay-switched internally (amplitude range, load impedance, and the
+  shared Sync/Marker source are all things AWGs commonly implement with
+  mechanical relays), unlike uploading arb waveform data
+  (`SOUR:DATA:ARB`), which is a pure digital memory write with no analog
+  output-stage involvement. Repeatedly re-triggering relays with no
+  functional benefit risks wearing them out over many sweeps. **Tried,
+  then REVERTED**: split the output-stage config out into a new
+  `configure_awg_outputs()`, called ONCE before the sweep starts (and
+  again after `awg.reset()`) instead of every point, leaving
+  `setup_awg_sequences()` to only touch arbs/sequence/`FUNC:ARB` selection
+  per point. On real hardware this did NOT reduce the relay clicking, and
+  the resulting CH1/CH2 sequence looked wrong on the scope -- so the
+  theory that VOLT/OUTP:LOAD/OUTPUT ON/SYNC:SOURce were the (sole) source
+  of the clicking, and that they're safe to only set once, is not
+  confirmed and may be flat wrong (e.g. the click could be coming from
+  something inside setup_awg_sequences() that still runs every point --
+  DATA:VOL:CLE, the arb uploads themselves, or DATA:SEQ -- not the
+  output-stage block at all). Reverted `setup_awg_sequences()` back to
+  reconfiguring the full output stage every call, matching the last
+  confirmed-working behavior; `configure_awg_outputs()` was removed
+  entirely. The relay-wear question is still open and unsolved -- next
+  step, if revisited, should isolate which specific SCPI write(s) the
+  click actually correlates with (e.g. by testing them one at a time on
+  the bench) rather than assuming which category is the culprit.
+- **`resonance_sweep()`'s fine sweep used to always center on the coarse
+  sweep's dip**, which is right for `cw_odmr.py`/`cw_odmr_lock_in.py`'s
+  `use_resonance_sweep` (the whole point there is finding f0 from the dip),
+  but wrong for `rabi.py`'s pre-flight reflected-power check: `freq_hz` is
+  already fixed and NOT being re-derived from this sweep (see `cmd_run()`'s
+  docstring), so if the coarse dip lands somewhere other than `freq_hz`
+  (resonance drift, a different nearby dip, etc.), the fine sweep/Q
+  estimate ends up describing the wrong point instead of characterizing
+  what's actually being driven. **Fixed**: added an optional
+  `fine_center_hz` parameter to `resonance_sweep()` (`hp8673h.py`) --
+  `None` (default) preserves the original dip-centering behavior for
+  `cw_odmr.py`/`cw_odmr_lock_in.py` (neither passes it), while `rabi.py`
+  now passes `fine_center_hz=freq_hz` so its pre-flight fine sweep is
+  always centered on the frequency actually being driven.
+- **Added a reflected-power readout at the real operating point.** The
+  pre-flight coarse/fine sweep only ever runs at the low, safe
+  `res_power_dbm` -- it never actually checks reflected power at the real
+  `drive_power_dbm` that the tau_mw sweep is about to use. `cmd_run()` now
+  reads `HP8673H.read_reflected_power_dbm(ilock_sa, freq_hz)` right after
+  the generator is set to `freq_hz`/`drive_power_dbm` and RF is turned on
+  (CH2 is still statically routed to the sample path from
+  `set_switch_static()`, not chopping yet, so the signal is CW and a
+  single-sweep read is enough -- no need for `read_max_hold_reflected_
+  power_dbm()`'s pulsed-signal handling, which only matters once the
+  per-point loop starts gating). **Bug found on real hardware**: this
+  readout was print-only and never actually enforced `threshold_dbm` --
+  confirmed live when a `0.61 dBm` reading (well over the default
+  `threshold_dbm=-10.0`, i.e. more power reflected than makes sense for a
+  remotely-matched resonator) printed and the run just continued into the
+  tau_mw sweep with no trip at all. Unlike the periodic in-sweep interlock
+  check, which does call `gen.trip_interlock()` when `power_dbm >
+  threshold_dbm`, this pre-flight readout was purely informational.
+  **Fixed**: added the same threshold check + `gen.trip_interlock()` +
+  `return` right after this readout, before the tau_mw sweep starts --
+  mirrors the existing "spectrum analyzer unreachable at startup" early
+  return a few lines above it, and runs inside the same `try` block so the
+  existing `finally` cleanup (RF off, PSUs off, etc.) still executes.
+- **Added a `fine_sweep` option to skip `resonance_sweep()`'s fine stage.**
+  `HP8673H.resonance_sweep()` (`hp8673h.py`) gained a `run_fine_sweep=True`
+  parameter -- when `False`, it runs only the coarse sweep, skips the fine
+  sweep and its `estimate_q()`-based Q/FWHM estimate entirely, doesn't
+  write `{output_prefix}_fine.csv`, and returns a smaller dict (just
+  `coarse_freqs_hz`/`coarse_power_dbm`/`dip_freq_hz`/`dip_power_dbm`,
+  plus `coarse_power_dbm_cal` if calibrated) instead of the full
+  `estimate_q()` result. Default `True` preserves existing behavior for
+  `cw_odmr.py`/`cw_odmr_lock_in.py` (neither passes it). `rabi.py`'s
+  `cmd_run()` exposes this as a new `fine_sweep=true` (default) key=value
+  override, independent of `reflected_power_scan` (which gates the whole
+  pre-flight coarse+fine sweep on/off) -- `fine_sweep=false` keeps the
+  quick coarse sanity check around `freq_hz` but skips the slower fine
+  stage. `rabi_result.ipynb`'s pre-flight plot cell (`eb08ea9d`) updated
+  to handle a missing `_resonance_fine.csv` gracefully (shows the coarse
+  panel with a "fine sweep skipped" placeholder instead of treating the
+  whole run as having no resonance CSVs at all).
+- **Found a spurious lock-in signal that isn't real ODMR contrast.**
+  Real-hardware testing found a signal off the actual NV resonance
+  frequency (`rabi_off_resonance` at 2.26 GHz, R even LARGER than an
+  on-resonance run's -- see the `rabi8` vs. `rabi_off_resonance` R
+  comparison), and separately found the signal persists even with the
+  amplifier's output routed into a dummy load instead of near the diamond
+  (no MW field reaching the sample/resonator at all). The SAME signal
+  disappears when the PMT's optical path is physically blocked. Together:
+  it's a genuine optical signal (needs real light hitting the PMT, so it's
+  not electrical pickup straight into the PMT cable) that doesn't require
+  actual MW-NV coupling (persists into a dummy load) -- i.e. NOT real spin
+  physics. Leading hypothesis: electrical crosstalk between the
+  MW-switching side (CH2/amplifier/switch) and the laser/AOM drive side
+  (CH1), modulating the ACTUAL laser intensity in sync with the same block
+  reference used for demodulation, regardless of where the RF power ends
+  up (shared power supply loading, AWG channel-to-channel crosstalk, or
+  RF pickup on the AOM driver line are all plausible mechanisms). This
+  casts doubt on whether ANY of `rabi1`-`rabi8`'s apparent contrast is
+  genuine NV physics rather than this artifact -- needs to be ruled out
+  before trusting that data. **Added `cmd_run_no_mw()`/`run-no-mw`
+  command** to help isolate it -- a fully SEPARATE, self-contained
+  function (not a flag/wrapper on `cmd_run()`), which never connects to
+  or commands the HP8673H generator or spectrum-analyzer interlock at
+  all. It runs the same AWG sequences and CH2 gate/switch toggling and the
+  same tau_mw sweep/lock-in reads as `cmd_run()`, but with no generator
+  object in the picture whatsoever -- the user turns the generator's RF
+  off (or disconnects it) themselves beforehand, deliberately avoiding any
+  reliance on this code to manage RF state correctly (a real concern:
+  `gen.preset()` resets the instrument and its RF-on/off state after
+  preset was never actually verified, so a flag-based approach inside
+  `cmd_run()` risked `preset()` silently re-enabling RF regardless of the
+  flag). `freq_hz`/`drive_power_dbm` are accepted only as labels recorded
+  in the log/metadata, never sent to any instrument. Saves the same
+  `{file_name}_rabi_*` file set as `cmd_run()` (with `_rabi_reflected_
+  dbm.npy` all-NaN, no SA involved) so it loads into `rabi_result.ipynb`
+  the same way. **Confirmed on real hardware: the spurious signal
+  persists even with the generator's RF confirmed off** -- CH2 was still
+  toggling the switch/amplifier chain, pointing at CH2's switching action
+  itself (AWG crosstalk, or the switch/amplifier drawing current even
+  with no RF applied) rather than real RF power as the mechanism.
+  **Follow-up**: `cmd_run_no_mw()` extended to also never connect to or
+  command the SPD1168X amplifier supply or SPD1305X coil supply -- same
+  reasoning as the generator (turn both off/disconnect them yourself
+  before running), testing whether the effect depends on either supply
+  being powered at all, or persists even with them off too (which would
+  point at something in the AWG/lock-in/PMT chain itself, independent of
+  every piece of RF-side hardware). **Confirmed on real hardware: the
+  spurious signal persists with the generator's RF AND both PSUs off** --
+  the only things still active at that point are the AWG (CH1 laser/AOM
+  drive, CH2 switch-control/marker), the SDG1062X external trigger, and
+  the SR830 lock-in. Turning off the AOM's own RF driver (and the AOM)
+  also kills the signal, but that's expected and not a new distinguishing
+  clue -- disabling the AOM stops ALL light from reaching the PMT at all
+  (equivalent to the earlier optical-block test), so it doesn't say
+  anything about WHERE in the chain the artifact originates, only that it
+  (like everything) needs light to exist in the first place.
+
+  This narrows the culprit to the AWG itself -- CH1/CH2 channel-to-channel
+  crosstalk (internal to the Keysight 33600A, or on the CH1/CH2 cabling/
+  grounding) -- since CH2 is still physically toggling its own output
+  voltage every block regardless of what's powered downstream. Notably,
+  CH2 is ALSO the source of the lock-in's own reference (`OUTPut:SYNC:
+  SOURce CH2`), so the demodulation reference and the hypothesized source
+  of crosstalk are generated by the same physical instrument -- if the
+  crosstalk is genuinely AWG-internal, it's structurally inseparable from
+  this measurement architecture as long as CH2 supplies the reference.
+
+  **Added `cmd_run_ch2_constant()`/`run-ch2-constant` command** to test
+  the next specific question: does the artifact need CH2's own ANALOG
+  output to physically switch, or only need the marker/reference to
+  toggle? The marker (`highAtStart`/`lowAtStart`) and a segment's analog
+  waveform value are independent `DATA:SEQ` attributes -- normally they
+  change together, but don't have to. `setup_awg_sequences()` (`rabi.py`)
+  gained a `ch2_hold_constant` parameter -- when `True`, CH2's "on"
+  segment is reassigned to use the SAME constant,
+  physically-off `gate_off_rep` arb as the "off" segment (normalized
+  `-1.0` -> `0V` given `ch2_offset_v=2.5`), so CH2's real output voltage
+  never changes at all, while its marker flag stays `highAtStart` as
+  usual -- the lock-in still gets an identical, correctly-toggling
+  reference. If the spurious signal disappears with CH2 truly held
+  constant, that confirms it depends on CH2's own analog switching
+  action; if it persists, the culprit is the marker/Sync output
+  circuitry itself (or elsewhere), not CH2's analog DAC/switch-driving
+  output. Refactored `cmd_run_no_mw()`'s body into a shared
+  `_run_no_mw_impl(file_name, ch2_hold_constant, ch1_hold_constant, **kw)`
+  so all three diagnostic commands reuse the same sweep logic without
+  duplicating it, while still remaining separate top-level commands per
+  the user's preference (not a flag on `cmd_run()` itself).
+
+  **Confirmed on real hardware: the spurious signal persists even with
+  CH2 held constant.** This rules out CH2's own analog output/switch-
+  driving voltage entirely -- the only thing left toggling in that test
+  was CH2's marker (`highAtStart`/`lowAtStart`, routed to the lock-in's
+  reference via `OUTPut:SYNC:SOURce CH2`). But CH1's OWN sequence table
+  ALSO couldn't be ruled out yet: even with `ch2_hold_constant`, CH1 still
+  transitioned between two separately-listed "rep" segments (both marked
+  "maintain", so nothing visibly changed on CH1's output) at exactly the
+  same block boundary as CH2 -- an internal segment-advance event on
+  CH1's OWN sequencer that's synchronous with the block reference,
+  independent of anything CH2 does. **Added `ch1_hold_constant` to
+  `setup_awg_sequences()`** -- when `True`, CH1 is reconfigured as a
+  plain, non-sequenced continuous `FUNC SIN` at 80 MHz / `ch1_vpp`
+  (no `DATA:SEQ` at all for CH1, so no sequence table to advance through,
+  and therefore no internal segment-transition event on CH1 whatsoever --
+  doesn't need `TRIG1:SOUR EXT` either, since a plain continuous function
+  ignores `TRIG:SOURce`, unlike burst/sweep). **Added
+  `cmd_run_ch1_ch2_constant()`/`run-ch1-ch2-constant` command**, building
+  on `cmd_run_ch2_constant()` with `ch1_hold_constant=True` too -- with
+  both channels' analog outputs and sequence tables now fully decoupled
+  from the block structure, the ONLY thing anywhere in the AWG still
+  synchronous with the block reference is CH2's marker/Sync output. If
+  the spurious signal disappears here, the mechanism needed CH1's own
+  sequencer transition; if it persists, that isolates the marker/Sync
+  line itself (or something further upstream, e.g. the SDG1062X external
+  trigger, or the lock-in's own reference input circuitry) as the sole
+  remaining candidate. Not yet run on real hardware to confirm.
+- **Found a real confound in every sweep run so far, including the
+  constant-hold diagnostics above: the SDG1062X external trigger
+  frequency changes monotonically across every sweep, tracking tau_mw.**
+  `_configure_external_trigger(sdg, ref_period_s, margin=trigger_margin)`
+  is called every point with `ref_period_s = 2 * n_reps * rep_us`, and
+  `rep_us = laser_us + pre_us + mw_us + post_us` grows with `mw_us` --
+  none of `ch2_hold_constant`/`ch1_hold_constant` touch this, since a
+  segment's LENGTH (unlike its analog value or marker) still depends on
+  `mw_us` regardless. So even with `run-ch2-constant`'s CH2 output truly
+  unchanging, the external trigger's frequency (`margin/ref_period_s`) is
+  still monotonically decreasing across the sweep -- meaning something
+  was still varying with tau_mw even in that "everything held constant"
+  test. Since a monotonic, decaying R vs. tau_mw trend was observed even
+  there, this raised the question of whether that trend reflects
+  anything about tau_mw at all, or is just an artifact of the trigger
+  frequency happening to be a monotonic function of tau_mw in every run
+  collected so far (the two are not distinguishable from any of the data
+  gathered to date). **Fixed, for `cmd_run_ch2_constant()`/
+  `run-ch2-constant` only (not yet applied to `cmd_run()` or the other
+  two constant-hold diagnostics)**: `_run_no_mw_impl()` gained a
+  `fixed_external_trigger` parameter -- when `True`, the SDG1062X's
+  trigger frequency is configured ONCE before the sweep starts (derived
+  from `mw_start_us`, the sweep's shortest rep and therefore its largest
+  bare-minimum trigger requirement -- comfortably fast enough for every
+  longer rep later in the sweep too, per the existing `trigger_margin`
+  safety-factor reasoning) instead of being recomputed every point. If
+  the decaying R vs. tau_mw trend disappears once the trigger frequency
+  stops varying, that confirms it was a trigger-frequency artifact, not
+  a tau_mw-dependent one. **Result on real hardware**: with the trigger
+  fixed, the trend didn't disappear -- it changed shape, from a smooth
+  decay to an oscillation. Consistent with a beat/aliasing effect: CH1's
+  own segment-transition still happens once per block (governed by
+  `rep_us`, which still varies with `mw_us`), but now the external
+  trigger period is fixed and no longer locked to it -- previously the
+  two were always in a fixed ratio (smooth trend), now their relative
+  phase sweeps through different alignments as `mw_us` changes
+  (oscillation), rather than tracking a fixed relationship.
+
+  **This, combined with the CH1/CH2-constant diagnostics above, points
+  conclusively at CH1's OWN internal sequence-table segment transition as
+  the artifact's source, independent of CH2 entirely.** Confirmed on real
+  hardware: `run-ch1-ch2-constant` (both channels held constant, CH1 as a
+  plain unsequenced continuous tone with no DATA:SEQ at all) shows NO
+  signal, while `run-ch2-constant` (CH1 still running its normal two-
+  listing sequence, even though both listings are identical "maintain"
+  content) still shows one. The AWG's sequencer evidently produces a
+  real, synchronous transient on CH1's own analog output whenever it
+  advances between listed segments, REGARDLESS of whether the content
+  differs -- and `cmd_run()`'s real CH1 sequence has exactly this
+  structure (two separate `n_reps` listings of the identical "rep" arb,
+  present purely to mirror CH2's on/off block split, which CH1's own
+  content never actually needed). This means every real Rabi run
+  collected so far (`rabi1`-`rabi8`, `rabi_off_resonance`, etc.) likely
+  carries this same internal artifact on top of (or dominating) whatever
+  real ODMR signal might be present.
+
+  **First attempted fix (collapsing the two listings) did NOT eliminate
+  it on real hardware** -- confirmed the mid-sequence transition between
+  the two `n_reps` listings wasn't the real cause. What's left, and what
+  actually differs from the no-signal `run-ch1-ch2-constant` case: CH1's
+  sequence still had an anchor segment marked `onceWaitTrig`, meaning it
+  still waited on and reacted to the EXTERNAL TRIGGER EDGE (from the
+  SDG1062X into the AWG's Ext Trig BNC -- yet another shared physical
+  connector) once per full block cycle to wrap back around. `run-ch1-
+  ch2-constant`'s plain `FUNC SIN` has no trigger dependency at all. So
+  the real distinguishing variable isn't listing count, it's whether CH1
+  reacts to the external trigger edge in any way. **Fixed (second
+  attempt), for `ch2_hold_constant` only**: `setup_awg_sequences()`'s CH1
+  sequence now drops the anchor/`onceWaitTrig` entirely when
+  `ch2_hold_constant=True` -- a single `"repeat"` segment (`2 * n_reps`
+  reps of `"rep"`) plays immediately on `OUTPUT1 ON` and never needs
+  retriggering, fully decoupling CH1 from the external trigger while
+  still playing its real RF-pulse waveform (unlike `ch1_hold_constant`'s
+  plain sine). Safe specifically for this diagnostic because CH2 isn't
+  gating anything real anymore, so CH1/CH2 relative timing doesn't
+  matter here. `TRIG1:SOUR/SLOP/LEV` writes are skipped too in this case
+  (meaningless without a trigger-gated segment). `cmd_run()`'s normal
+  path (and `cmd_run_no_mw()`) still use the original onceWaitTrig-gated
+  structure, which IS load-bearing there for real CH1/CH2 synchronization
+  -- this fix is diagnostic-only for now. **Confirmed on real hardware:
+  the spurious signal disappeared** with CH1 fully decoupled from the
+  external trigger.
+
+  The mechanism, once understood: it's not electrical crosstalk at all --
+  it's a genuine, physical dip in the LASER OUTPUT ITSELF. Every time
+  CH1's sequence wraps back through its `onceWaitTrig` anchor (once per
+  full off+on cycle), CH1 drops to the anchor level (no RF driving the
+  AOM) and sits there for a small but real, asynchronous dead time before
+  the next available trigger edge arrives and it resumes real pulsing --
+  the same dead time already measured and documented early on as a
+  duty-cycle imperfection (49.18% vs. an exact 50%). This dip lands at
+  ONLY ONE of the two transitions per cycle: the sequence order is
+  `anchor -> gate_off_rep (xN) -> gate_on_rep (xN) -> [wrap through
+  anchor] -> gate_off_rep -> ...`, so the anchor-wait glitch contaminates
+  only the very START of the "off"/low phase every cycle; the "off" to
+  "on" transition mid-cycle is a plain `"repeat"`-to-`"repeat"` handoff
+  with no trigger involved and no glitch. Because the artifact only ever
+  lands on ONE side (not both), it doesn't cancel between the two halves
+  the way a symmetric artifact would -- it demodulates out as a real,
+  nonzero, synchronous "signal" indistinguishable from genuine contrast.
+
+  **Follow-up: reduce (not just relocate) the glitch's impact by making
+  it recur less often.** Since only `onceWaitTrig`-marked segments need a
+  trigger -- a plain `"repeat"` segment loops via its own internal count
+  with zero trigger dependency -- a channel's sequence can list multiple
+  off+on (or "rep") cycles in the table before wrapping back to its
+  anchor, at near-zero cost (each listing just references the SAME
+  already-uploaded arb data by name, not new waveform memory).
+  `setup_awg_sequences()` gained `anchor_free_reps` (default `1`, i.e.
+  unchanged behavior) -- when higher, that many cycles are listed before
+  each channel's anchor, so the trigger-wait glitch recurs once every
+  `anchor_free_reps` cycles instead of every cycle.
+
+  **Bug found and fixed**: `anchor_free_reps` was initially applied to
+  CH2 only, while CH1 either kept its own anchor wrapping every single
+  cycle, or (in `run-ch2-constant`, which had separately dropped CH1's
+  anchor entirely to eliminate the artifact for THAT diagnostic) had no
+  periodic structure at all. Either way, CH1 and CH2 no longer wrapped
+  through their anchors together -- confirmed on real hardware as visible
+  CH1/Sync misalignment on a scope. **Fixed**: `anchor_free_reps` now
+  applies uniformly to BOTH channels' sequences (when neither is held
+  constant/free-running via `ch1_hold_constant`/`ch2_hold_constant`),
+  keeping them wrapping through their own anchors in lockstep at the same
+  cadence, exactly like the original single-cycle design just less
+  often. This also generalizes `anchor_free_reps` to normal, non-
+  diagnostic operation -- it's no longer tied to `ch2_hold_constant` at
+  all, so it can be applied directly to `cmd_run()`'s real sequence
+  (though `cmd_run()` itself doesn't pass it yet -- only `cmd_run_
+  ch2_constant()` defaults it to `20`). Added `tests/rabi_anchor_free_
+  reps_test.ipynb` (using the real `setup_awg_sequences()`/
+  `_configure_external_trigger()`, neither channel held constant) to
+  inspect this directly on a scope before trusting it in a real sweep.
+  Tradeoff: `anchor_free_reps` grows the sequence TABLE size (more listed
+  segments per point), not waveform memory -- worth watching
+  `RESEQUENCE_INTERVAL` if pushed much higher, since that limit is about
+  a different (but related) AWG resource constraint. Not yet run on real
+  hardware to confirm the realignment fix, or to establish how large
+  `anchor_free_reps` needs to be for the residual artifact to become
+  negligible in a real sweep.
+- **SR830 sensitivity auto-rescaling was one-directional: only coarser,
+  never finer again.** `_step_sensitivity_coarser()` + `auto_rescale_on_
+  overload` back out of a real-time `OVERLOAD` by stepping to a LESS
+  sensitive range, but nothing complementary ever steps back to a MORE
+  sensitive range once the real signal has settled to a small fraction of
+  whatever range an earlier transient/overload left it pinned at --
+  `auto_gain()` only runs once, at the very start of a sweep. Symptom seen
+  on real hardware: sensitivity pinned at `1.000e+00 V` (the single
+  coarsest entry in `SR830.SENSITIVITY_V`) for the rest of a run, with
+  `_step_sensitivity_coarser()`'s rescale attempts becoming no-ops
+  (`old_v == new_v`, nowhere coarser to go) on later spurious `OVERLOAD`
+  hits, while the real signal was almost certainly much smaller than that
+  range's full scale by then -- under-resolving X/Y against the SR830's
+  own noise/quantization floor at that range, a plausible extra
+  contributor to `rabi1`/`rabi2`/`rabi3`'s noise on top of the settle-time
+  issue above. **Fixed in `rabi.py` only**: added `_step_sensitivity_
+  finer()` (mirrors `_step_sensitivity_coarser()`, steps one range
+  finer) and a new `auto_rescale_on_underload`/`underload_margin` check in
+  `cmd_run()`'s per-point loop, run after the existing overload-rescale
+  block -- if `R = sqrt(X^2+Y^2)` would still use less than
+  `underload_margin` (default 0.5) of the NEXT finer range's full scale,
+  step down one range for the following point. Checked after saving each
+  point's reading (not urgent the way overload is), so it takes effect on
+  the next point rather than paying an extra `settle_s` wait to re-read
+  immediately. `cw_odmr_lock_in.py` has the identical one-directional gap
+  (confirmed via its own `_step_sensitivity_coarser()`/`auto_rescale_on_
+  overload`, same pattern) but was intentionally NOT changed here, per
+  the standing instruction not to modify that script's behavior after
+  data was already collected under it.
+- **The overload-rescale logic above could overshoot in response to a
+  stale/transient `OVERLOAD` flag, not a genuinely too-sensitive range.**
+  Observed on real hardware: entering a point at 100 uV full scale, the
+  first check reported `OVERLOAD`, coarsened to 200 uV, still reported
+  `OVERLOAD`, coarsened again to 500 uV -- but the reading that finally
+  came back clean was only `1.261e-05 V`, just 2.5% of that 500 uV range.
+  A signal that size would never have overloaded even the original 100 uV
+  range, so the first two `OVERLOAD` reports weren't describing the real
+  steady-state signal. Root cause: `read_overload_status()`'s own
+  docstring already flagged this -- the SR830's `LIAS?` status bits latch
+  until read, so a brief transient (from the AWG being reprogrammed for
+  this point's new mw_us/trigger rate, or from the `SENS` range switch
+  itself causing a momentary input-stage transient) sets a bit that then
+  reads back as "still overloaded" on the NEXT check, even once the
+  signal has genuinely settled fine at the new range. This directly
+  explains why the `auto_rescale_on_underload` fix above immediately
+  stepped back down afterward -- the true signal was small the whole
+  time; the coarsening was chasing a ghost. **Fixed**: added two
+  discard-only `lia.read_overload_status()` calls (return value
+  intentionally unused) to clear stale latched bits before they can be
+  mistaken for a live overload -- one right after `setup_awg_sequences()`/
+  `_configure_external_trigger()` for the point (clears any transient from
+  reprogramming before the settle wait even starts), and one right after
+  each `_step_sensitivity_coarser()` call inside the rescale loop (clears
+  any transient the range switch itself produced before the next
+  iteration's check). Adds one cheap GPIB query per point (and one per
+  rescale attempt) -- negligible next to the existing `settle_s` waits,
+  and doesn't change behavior at all when no overload ever occurs.
+- **The two discard-reads above weren't enough -- spurious `OVERLOAD`s
+  were still happening on EVERY point**, just as single-step bounces
+  (coarsen once, read clean, then `auto_rescale_on_underload` immediately
+  reverts back down) instead of the earlier double-step cascade. Real root
+  cause: the discard right after reconfiguring the AWG only clears flags
+  latched BEFORE the settle wait starts -- but `time.sleep(settle_s)`
+  followed by a single overload check afterward (the code as it stood)
+  catches ANY excursion during the ENTIRE settle window, including the
+  expected transient right at the start as the demodulated output swings
+  from the PREVIOUS point's steady value toward this one before the
+  filter (needing ~9-10 TC to truly converge, see the settle-time fix
+  above) actually settles. That transient is normal step-response
+  behavior, not a real overload of the final reading -- but it happens on
+  literally every point, since every point has that same value-to-value
+  transition. **Fixed**: added `_wait_settle_discarding_transient_
+  overload()`, which splits `settle_s` into two phases -- waits
+  `transient_fraction` (default 0.8) of it, discards whatever overload
+  flag latched during that portion (the expected transition swing), then
+  waits the remainder before the real read/check. A genuine overload
+  still present right up to the actual read (not just an artifact of the
+  transition) still latches during that final portion and is still
+  caught. Used both for the main per-point wait before `lia.read_xy()`
+  and for the re-settle wait after each `_step_sensitivity_coarser()` call
+  in the rescale loop.
+- **The PMT-to-voltage load resistor (1 kOhm, ~0.5 m BNC cable) was
+  checked for RC-bandwidth concerns and is NOT a significant issue at
+  current settings.** Estimated stray capacitance ~80-100 pF (dominated by
+  ~50 pF for 0.5 m of 50-ohm coax at ~100 pF/m, plus SR830's own 25 pF
+  input capacitance, plus a few pF of PMT/socket capacitance) gives
+  `tau = R*C ~= 100 ns`, rise time ~220 ns -- comfortably faster than the
+  2 us laser pulse (settles to >99% within ~500 ns, about a quarter of the
+  pulse) and irrelevant to `tau_mw` timing (the PMT only responds to the
+  laser gate, not the MW pulse itself, so short `tau_mw` values were never
+  actually something this circuit needed to resolve). This was checked
+  because a slow PMT readout stage could in principle produce a
+  monotonic, saturating-looking `R` vs. `tau_mw` curve for a purely
+  instrumental reason, indistinguishable from the physical overdamped-
+  Rabi explanation discussed below -- ruled out at these specific
+  component values, though only estimated from typical cable/tube specs,
+  not directly measured with a fast test pulse.
+- **NV readout window vs. polarization window -- discussed, NOT changed.**
+  Per NV-ODMR literature, spin-dependent PL contrast is highest in
+  roughly the first ~300 ns of a readout laser pulse, then decays/
+  saturates as continued illumination optically re-polarizes the NV back
+  to `ms=0` regardless of starting state. `rabi.py`'s current CH1 sequence
+  uses a single combined `laser_us` pulse (2.0 us) that does double duty
+  across cycle boundaries -- its first ~300 ns reads out the PREVIOUS
+  rep's MW result, the remaining ~1.7 us re-polarizes for THIS rep's
+  upcoming MW pulse -- rather than separate, purpose-built polarize/
+  readout segments. Initially considered this a likely source of
+  contrast dilution needing a fix (either a dedicated readout-gate signal
+  on the PMT side, or splitting CH1's arb into distinct polarize/readout
+  segments), but on closer analysis the concern is smaller than it first
+  seemed: the lock-in demodulates against the BLOCK-level (mw-on-block vs
+  mw-off-block) reference, not anything finer within a single rep, so any
+  part of the laser pulse that's genuinely identical between mw-on and
+  mw-off reps (i.e. the late, fully-re-polarized portion) already cancels
+  in the differential/synchronous detection on its own -- no gate or arb
+  restructuring is strictly required for an unbiased MEAN contrast
+  reading. The remaining real (but secondary) cost of the current
+  single-pulse design is extra photon SHOT NOISE from the additional
+  ~1.7 us of non-informative brightness reaching the PMT, which a
+  dedicated readout gate (blocking that light from ever reaching the
+  lock-in electronically) or a split polarize/readout arb structure could
+  reduce. Decided NOT worth the implementation effort for now -- revisit
+  if SNR remains a limiting factor after other fixes above are validated
+  on real hardware.
 - **Analysis of `rabi1`/`rabi2`/`rabi3`'s R data (taken before the settle-
   time fix above) found no convincing evidence of genuine Rabi
   oscillations yet** -- FFT of the detrended R data shows no low-frequency

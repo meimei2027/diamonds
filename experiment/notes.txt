@@ -24,3 +24,22 @@
 - for a while it was useless data because not aligned
 
 - 80 mhz was never on, for lockin before scan/
+
+
+- everything before rabi6 was taken with 1kOhm
+
+
+- rabi also lock in signal at way off NV resonance
+- blocked path to PMT: no lock-in signal anymore
+- still shows up when directly into load
+- still shows up when switch is just not powered
+- still shows up when rf is completely off
+- still shows up when two power supplies completely off
+- don't show up when the rf for aom turned off
+- shows up even when ch2 is hold constant
+- don't show up when ch1 hold constant
+- why decay?
+    - external trigger constant
+        - instead of decay wildly oscillating
+- no internal repeat => still signal
+    - no wait for trigger => no signal

@@ -430,12 +430,34 @@ class HP8673H:
 
     def resonance_sweep(self, sa, start_hz, stop_hz, coarse_step_hz,
                          fine_span_hz, fine_step_hz, power_dbm,
-                         output_prefix=None, cal_dir=None):
+                         output_prefix=None, cal_dir=None, fine_center_hz=None,
+                         run_fine_sweep=True):
         """
         Run the coarse-then-fine resonance sweep and return the estimate_q()
         result dict, augmented with the raw coarse/fine (freqs_hz, power_dbm)
         arrays. If output_prefix is given, also writes
         "{output_prefix}_coarse.csv" and "{output_prefix}_fine.csv".
+
+        run_fine_sweep=False skips the fine sweep (and therefore the Q/FWHM
+        estimate_q() step, which needs the fine data's resolution) entirely
+        -- only the coarse sweep runs, "{output_prefix}_fine.csv" is not
+        written, and the returned dict has coarse_freqs_hz/coarse_power_dbm
+        plus dip_freq_hz/dip_power_dbm (from the coarse data) instead of the
+        full estimate_q() keys. Useful when a caller (e.g. rabi.py's
+        pre-flight check) just wants a quick reflected-power sanity check
+        around freq_hz without paying for the fine sweep's extra time/GPIB
+        traffic every run.
+
+        fine_center_hz (optional): center the fine sweep here instead of on
+        the coarse sweep's dip. Default (None) keeps the original behavior
+        used by cw_odmr.py/cw_odmr_lock_in.py's use_resonance_sweep -- find
+        f0 by centering the fine sweep on wherever the coarse dip landed.
+        rabi.py's pre-flight reflected-power check is different: freq_hz is
+        already fixed and NOT being re-derived from this sweep, so it wants
+        the fine sweep centered on that fixed operating frequency instead --
+        otherwise, if the coarse dip is offset from freq_hz (e.g. resonance
+        drift, or another nearby dip), the fine/Q results describe the wrong
+        point and don't actually characterize what's being driven.
 
         cal_dir (optional): path to an open-short-load calibration folder
         previously written by calibrate_osl(). If given, dip-finding and the
@@ -480,10 +502,25 @@ class HP8673H:
         dip_freq_hz, dip_power_dbm = self.find_dip(coarse_freqs_hz, dip_source)
         print(f"[resonance_sweep] coarse dip: {dip_freq_hz/1e9:.4f} GHz, {dip_power_dbm:.1f} dBm")
 
-        print(f"[resonance_sweep] fine sweep around {dip_freq_hz/1e9:.4f} GHz, "
+        if not run_fine_sweep:
+            print("[resonance_sweep] run_fine_sweep=False -- skipping fine "
+                  "sweep and Q/FWHM estimate")
+            result = {
+                "coarse_freqs_hz": coarse_freqs_hz,
+                "coarse_power_dbm": coarse_power_dbm,
+                "dip_freq_hz": dip_freq_hz,
+                "dip_power_dbm": dip_power_dbm,
+            }
+            if cal is not None:
+                result["coarse_power_dbm_cal"] = coarse_power_dbm_cal
+            return result
+
+        fine_center = fine_center_hz if fine_center_hz is not None else dip_freq_hz
+        print(f"[resonance_sweep] fine sweep around {fine_center/1e9:.4f} GHz"
+              f"{' (fixed operating frequency, NOT the coarse dip)' if fine_center_hz is not None else ''}, "
               f"span {fine_span_hz/1e6:.2f} MHz, step {fine_step_hz/1e3:.1f} kHz")
         fine_freqs_hz, fine_power_dbm = self.fine_sweep(
-            sa, dip_freq_hz, fine_span_hz, fine_step_hz, power_dbm)
+            sa, fine_center, fine_span_hz, fine_step_hz, power_dbm)
         fine_power_dbm_cal = (
             self.apply_osl_calibration(fine_freqs_hz, fine_power_dbm, cal)
             if cal is not None else None
