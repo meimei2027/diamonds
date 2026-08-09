@@ -1497,6 +1497,26 @@ being verified against before building the real sweep into `rabi.py`.
   with `anchor_free_reps` applied to `cmd_run()` specifically (only the
   standalone notebook and the `run-ch2-constant` diagnostic have been
   tested so far).
+- **`rabi1` through `rabi9` (all data collected before the
+  anchor_free_reps/trigger fixes above) are NOT reliable Rabi
+  measurements and should not be used or reanalyzed as such.** All of
+  that data was taken with `anchor_free_reps=1` (the original, unfixed
+  behavior) -- meaning every single off+on cycle went through the
+  `onceWaitTrig` anchor's trigger-wait dead time, producing the
+  synchronous background artifact described above on every cycle. Given
+  the diagnostic testing found this background artifact persists with
+  the generator RF off, both PSUs off, and CH2 held constant -- i.e. it
+  dominates or entirely constitutes the measured signal under those
+  conditions -- there's no way to separate out how much (if any) of
+  `rabi1`-`rabi9`'s apparent contrast/decay was genuine NV physics versus
+  this artifact. Treat all of it (`rabi1`-`rabi5`, `rabi6_50ohm`,
+  `rabi7_50ohm`, `rabi8`, `rabi9`) as measuring the background, not real
+  ODMR/Rabi signal. `rabi_result.ipynb` (built to plot/compare this data)
+  has been deleted for the same reason -- re-collect fresh data with the
+  anchor_free_reps fix applied before trusting any Rabi oscillation
+  analysis again. (The various `rabi_off_resonance*`/`no_mw*` runs are
+  exempt from this caveat -- those were themselves the diagnostic probes
+  that found this artifact, not intended as real physics measurements.)
 - **SR830 sensitivity auto-rescaling was one-directional: only coarser,
   never finer again.** `_step_sensitivity_coarser()` + `auto_rescale_on_
   overload` back out of a real-time `OVERLOAD` by stepping to a LESS
