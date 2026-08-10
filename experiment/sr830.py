@@ -77,7 +77,25 @@ class SR830:
         print("SR830: connected")
 
     def close(self):
+        # Flush/abort any pending I/O on the GPIB interface before closing
+        # -- without this, a response still in flight (or a write the
+        # instrument hadn't finished processing) can linger and get
+        # misread by the NEXT session opened on this same resource, e.g.
+        # cmd_run_repeat() reconnecting back-to-back within one Python
+        # process (confirmed on real hardware: a garbled, non-numeric
+        # ERRS?/SNAP? response corrupted a later repeat -- see notes.md).
+        # Device clear (IEEE-488.2 selected device clear) is the standard
+        # fix for exactly this. Runs on every close() call, including
+        # Ctrl+C (all three of rabi.py's per-command shutdown blocks
+        # already call close() in their finally clause, so this applies
+        # everywhere without touching those individually) -- wrapped since
+        # a truly wedged instrument could fail the clear itself, and that
+        # shouldn't block the rest of shutdown.
         if self.inst is not None:
+            try:
+                self.inst.clear()
+            except Exception as e:
+                print(f"SR830: WARNING -- device clear failed cleanly ({e})")
             self.inst.close()
 
     def go_to_local(self):

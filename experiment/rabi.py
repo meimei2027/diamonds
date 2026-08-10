@@ -517,22 +517,6 @@ def setup_lock_in(lia, time_constant_s, sensitivity_v, phase_deg, input_coupling
     if not auto_sensitivity:
         lia.set_sensitivity_v(sensitivity_v)
     lia.set_filter_slope_db_oct(24)
-    # Nothing here ever calls lia.reset() (*RST) at connect time, so any
-    # OEXP (offset/expand) left over from a previous session -- another
-    # script, a manual front-panel adjustment -- silently persists and
-    # shrinks the SR830's usable output range, making a nuisance "output
-    # overload" LIAS trip far easier from an otherwise harmless transient
-    # (see notes.md -- caught a real output_overload=True, input_overload=
-    # False spike this way, with no real input signal condition to explain
-    # it). Force a known-clean 0%/1x state on X and Y explicitly rather
-    # than assuming factory defaults, and log whatever was there before in
-    # case it turns out to matter for that investigation.
-    for channel, name in [(1, "X"), (2, "Y")]:
-        offset_percent, expand = lia.get_offset_expand(channel)
-        if offset_percent != 0.0 or expand != 1:
-            print(f"[rabi] setup_lock_in: {name} had offset={offset_percent}%, "
-                  f"expand={expand}x from a previous session -- resetting to 0%/1x")
-        lia.set_offset_expand(channel, 0.0, expand=1)
 
 
 def _step_sensitivity_coarser(lia):
@@ -807,7 +791,15 @@ def cmd_run(file_name, **kw):
 
     mw_values_us = np.arange(mw_start_us, mw_stop_us + mw_step_us / 2, mw_step_us)
 
-    run_path = f"{DATA_DIR}/{file_name}"
+    # Normally the same as file_name -- lets cmd_run_repeat() point many
+    # repeats' saved files at one shared folder (all still prefixed with
+    # their own distinct file_name, e.g. "<file_name>_repeat3_rabi_x.npy")
+    # instead of each repeat getting its own <file_name>_repeat{i}/
+    # directory. Not documented in RUN_PARAMS_HELP since it's an internal
+    # plumbing knob for cmd_run_repeat(), not something to set by hand in
+    # normal use.
+    output_dir = kw.get("output_dir", file_name)
+    run_path = f"{DATA_DIR}/{output_dir}"
     import os
     os.makedirs(run_path, exist_ok=True)
     log_dir = f"{DATA_DIR}/logs"
@@ -1280,6 +1272,110 @@ def cmd_run(file_name, **kw):
                 pass
 
     print("[rabi] done")
+
+
+def cmd_run_repeat(file_name, **kw):
+    """
+    Repeat cmd_run() n_repeats times in a row with IDENTICAL settings, then
+    average X and Y elementwise across the completed repeats (then
+    computing R from the averaged X/Y, not by averaging R directly -- R has
+    a positive noise-rectification bias that averaging after the fact
+    doesn't remove, same convention as cw_odmr_lock_in.py's
+    cmd_sweep_average()).
+
+    Each repeat is a COMPLETELY INDEPENDENT cmd_run() call -- full
+    instrument reconnect, full pre-flight resonance scan (if
+    reflected_power_scan is still true), PSU on/off, from scratch. Slower
+    than reusing one long-lived connection across all repeats, but reuses
+    cmd_run() completely UNMODIFIED -- zero risk of a repeat-batching
+    wrapper introducing a new timing bug into the single-sweep path this
+    session spent so long validating (see notes.md) -- and gives each
+    repeat a genuinely fresh instrument state (no accumulated AWG/SR830
+    state across a very long combined run) rather than a reason to trust
+    it less.
+
+    All repeats' files land in ONE shared folder (D:/rabi/<file_name>/,
+    same as a plain cmd_run() call would use), not one folder per repeat
+    -- distinguished by file name (<file_name>_repeat{i}_rabi_x.npy etc.)
+    via cmd_run()'s output_dir override, not by directory. 100 repeats
+    means 100 sets of files in that one folder, not 100 folders.
+
+    Recognized key=value overrides:
+      n_repeats=10  number of times to repeat the sweep
+      (everything else is passed through to cmd_run() UNCHANGED, once per
+      repeat -- see cmd_run()'s own docstring/RUN_PARAMS_HELP for the full
+      list)
+
+    A repeat that trips the interlock partway through saves a SHORTER
+    mw_us array than a fully-completed one (same as a single cmd_run()
+    call always has) -- such a repeat is excluded from the average
+    entirely (its mw_us grid won't match the first fully-completed
+    repeat's), not padded or partially averaged in.
+
+    Saves each repeat's normal cmd_run() file set (prefixed <file_name>_
+    repeat{i}_...) plus, once at least one repeat completes fully, the
+    average (prefixed <file_name>_avg_...) -- all under
+    D:/rabi/<file_name>/:
+      <file_name>_repeat{i}_rabi_mw_us.npy, _rabi_x.npy, _rabi_y.npy, ...
+      <file_name>_avg_rabi_mw_us.npy, _avg_rabi_x.npy, _avg_rabi_y.npy,
+      _avg_rabi_r.npy, _avg_rabi_metadata.txt (records n_repeats_
+      requested vs. n_repeats_averaged).
+    """
+    n_repeats = int(kw.pop("n_repeats", 10))
+
+    for i in range(n_repeats):
+        repeat_name = f"{file_name}_repeat{i}"
+        print(f"[rabi] repeat {i + 1}/{n_repeats}: running {repeat_name} "
+              f"(saved into {file_name}/)")
+        cmd_run(repeat_name, output_dir=file_name, **kw)
+
+    import os
+    run_path = f"{DATA_DIR}/{file_name}"
+    os.makedirs(run_path, exist_ok=True)
+
+    reference_mw_us = None
+    xs, ys = [], []
+    n_averaged = 0
+    for i in range(n_repeats):
+        repeat_name = f"{file_name}_repeat{i}"
+        mw_us_path = f"{run_path}/{repeat_name}_rabi_mw_us.npy"
+        if not os.path.exists(mw_us_path):
+            print(f"[rabi] repeat {i}: no data saved (0 points completed) -- "
+                  f"excluded from average")
+            continue
+        mw_us = np.load(mw_us_path)
+        if reference_mw_us is None:
+            reference_mw_us = mw_us
+        elif len(mw_us) != len(reference_mw_us) or not np.allclose(mw_us, reference_mw_us):
+            print(f"[rabi] repeat {i}: mw_us grid doesn't match the first "
+                  f"completed repeat's ({len(mw_us)} vs {len(reference_mw_us)} "
+                  f"points) -- partial/tripped repeat, excluded from average")
+            continue
+        xs.append(np.load(f"{run_path}/{repeat_name}_rabi_x.npy"))
+        ys.append(np.load(f"{run_path}/{repeat_name}_rabi_y.npy"))
+        n_averaged += 1
+
+    if n_averaged == 0:
+        print(f"[rabi] repeat: no complete repeats to average -- nothing saved "
+              f"to {run_path}")
+        return
+
+    x_avg = np.mean(xs, axis=0)
+    y_avg = np.mean(ys, axis=0)
+    r_avg = np.sqrt(x_avg ** 2 + y_avg ** 2)
+
+    np.save(f"{run_path}/{file_name}_avg_rabi_mw_us.npy", reference_mw_us)
+    np.save(f"{run_path}/{file_name}_avg_rabi_x.npy", x_avg)
+    np.save(f"{run_path}/{file_name}_avg_rabi_y.npy", y_avg)
+    np.save(f"{run_path}/{file_name}_avg_rabi_r.npy", r_avg)
+    with open(f"{run_path}/{file_name}_avg_rabi_metadata.txt", "w") as fh:
+        fh.write(f"n_repeats_requested={n_repeats}\n")
+        fh.write(f"n_repeats_averaged={n_averaged}\n")
+
+    print(f"[rabi] repeat done: averaged {n_averaged}/{n_repeats} completed "
+          f"repeats, saved {run_path}/{file_name}_avg_rabi_mw_us.npy, "
+          f"_avg_rabi_x.npy, _avg_rabi_y.npy, _avg_rabi_r.npy, "
+          f"_avg_rabi_metadata.txt")
 
 
 def cmd_run_no_mw(file_name, **kw):
@@ -1899,6 +1995,13 @@ the psu_*/coil_*/interlock_*/reflected_power_scan/res_*/fine_* group
 entirely). See each parameter's inline comment in the source (rg the
 name in rabi.py) and notes.md for the reasoning behind non-obvious ones.
 
+'run-repeat' (cmd_run_repeat()) repeats a 'run' n_repeats times (default
+10) with otherwise IDENTICAL settings -- everything below still applies,
+plus n_repeats=10. Each repeat is a fully independent cmd_run() call
+(saved under <file_name>_repeat{i}/), then X/Y are averaged elementwise
+across completed repeats and R computed from the averaged X/Y, saved to
+<file_name>/<file_name>_avg_rabi_*.npy. See cmd_run_repeat()'s docstring.
+
 Sweep range:
     freq_hz=2.843e9            fixed MW frequency for the whole sweep
     drive_power_dbm=0.0        generator power at freq_hz
@@ -1988,6 +2091,8 @@ def main():
 
     if command == "run":
         cmd_run(file_name, **extra)
+    elif command == "run-repeat":
+        cmd_run_repeat(file_name, **extra)
     elif command == "run-no-mw":
         cmd_run_no_mw(file_name, **extra)
     elif command == "run-ch2-constant":
@@ -1998,8 +2103,9 @@ def main():
         cmd_calibrate_phase(file_name, **extra)
     else:
         raise SystemExit(f"unknown command {command!r} "
-                          f"(expected 'run', 'run-no-mw', 'run-ch2-constant', "
-                          f"'run-ch1-ch2-constant', or 'calibrate-phase')")
+                          f"(expected 'run', 'run-repeat', 'run-no-mw', "
+                          f"'run-ch2-constant', 'run-ch1-ch2-constant', or "
+                          f"'calibrate-phase')")
 
 
 if __name__ == "__main__":
