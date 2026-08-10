@@ -850,6 +850,29 @@ See `CLAUDE.md` for the full investigation history behind each of these.
 
 ## Pulsed ODMR (pulsed_odmr.py) -- NOT YET TESTED
 
+**Rewritten from scratch** (the file had been deleted at some point --
+this whole section predates that and was written against an earlier,
+no-longer-present version). New version: frequency-sweep/resonance-
+finding structure copied from `cw_odmr_lock_in.py`'s `cmd_run()`, pulse
+sequence copied from `rabi.py`'s `setup_awg_sequences()` (same
+onceWaitTrig-anchor combined-arb design, `anchor_free_reps`, `extra_settle_s` fixes
+from this session's whole background-artifact investigation) with
+`tau_mw_us` FIXED (default 5.0) instead of swept -- only `freq_hz` varies
+point to point, the mirror image of `rabi.py`'s own sweep. Confirmed still
+consistent with the design constraints recorded below: does NOT use
+`PHASe:SYNChronize` (the onceWaitTrig anchor mechanism is the validated
+CH1/CH2 sync fix instead, already built into `setup_awg_sequences()`), and
+reuses `setup_awg_sequences()` unchanged so it also inherits the `VOLTage`
+-not-`FUNC:ARB:PTP` amplitude fix. Since the pulse sequence never changes
+across frequency points (only the generator's frequency does), `setup_awg_
+sequences()` runs ONCE before the frequency loop, not per point -- avoids
+the whole reconfigure-per-point artifact class by construction. The
+periodic interlock check still races with the AWG's own anchor timing the
+same way it did in `rabi.py` (see that investigation above), so the same
+ABOR-plus-`extra_settle_s` fix is included unchanged. STILL NOT TESTED ON
+REAL HARDWARE -- validate with the same controls mentioned below (laser
+off, far off-resonance) before trusting any result from it.
+
 - Uses `[SOURce[1|2]:]PHASe:SYNChronize` (confirmed via Keysight's own
   Trueform SCPI documentation) to align CH1 (laser sequence) and CH2 (MW
   gate, via the ZYSWA switch) after both are independently started --
@@ -2241,3 +2264,138 @@ being verified against before building the real sweep into `rabi.py`.
   independent kwargs rather than deriving one from the other, since
   that's cheap to compute in each real run's own math via
   `_configure_external_trigger`'s prints anyway).
+
+- **Milestone: the electronic/reconfigure-side background artifact
+  investigation is resolved as far as it can meaningfully go.** With
+  `extra_settle_s` increased further (beyond the initially-validated
+  1.0 s -- exact value not recorded here, bump it up from real usage if
+  revisiting) on top of `anchor_free_reps=1000`, tested on real hardware:
+  - Input terminated (50 ohm, no PMT): noise reduced from the ~1.5e-4 V
+    rail spikes seen throughout this investigation down to a much smaller
+    residual.
+  - PMT connected: ~4 uV noise floor -- a workable SNR (~2.5:1) against
+    the ~10 uV CW-ODMR signal, a large improvement over noise being
+    comparable to or exceeding signal (the state at the start of this
+    investigation).
+  - **PMT off (with these same current settings): much quieter than the
+    ~4 uV PMT-connected floor.** This is the key result -- it confirms the
+    remaining ~4 uV is NOT the electronic/reconfigure-side artifact this
+    entire investigation has been chasing (that's now below the PMT's own
+    contribution), but something in the actual PMT/optical signal chain
+    instead: PMT gain/bias, dark counts, ambient light leakage, preamp
+    noise, or similar. Further noise reduction from here is a DIFFERENT
+    investigation, not an AWG-sequencing/lock-in-reference one.
+
+  Current best-known-good settings for real data collection, pending
+  further tuning: `anchor_free_reps=1000` (default), `extra_settle_s`
+  set explicitly (not yet re-confirmed what value was last used --
+  check the actual `cmd_run()` invocation when resuming), `resequence_
+  interval` at its default (4) since `extra_settle_s` was validated
+  specifically as an alternative to needing `resequence_interval=1`.
+  `rabi_result.ipynb` was deleted and is being rebuilt fresh going
+  forward -- this whole investigation's data (`rabi1`-`rabi9`, `rabi_new`
+  through `rabi_new20`, `rabi_off_resonance_fix_long`) still lives in
+  `D:/rabi/` if old runs need referencing again, just no longer plotted
+  in a live notebook.
+
+  **Follow-up isolation of the remaining ~4 uV (PMT-connected) floor,
+  same current settings**: RF amplifier OFF -- noise still there (rules
+  out MW/RF leakage/EMI as the cause). Laser OFF (PMT still connected/
+  powered) -- much quieter. Full chain: amp off doesn't help, PMT off
+  fixes it, laser off ALSO fixes it -- the remaining noise is LASER-
+  DRIVEN OPTICAL noise reaching the PMT, not PMT dark counts/electronics
+  (which wouldn't need light to appear), not MW/RF-related, and not
+  anything AWG-reference-side (already resolved above). Likely
+  candidates: scattered/reflected excitation laser light leaking past
+  whatever filtering sits before the PMT, laser intensity noise (RIN)
+  contributing broadband shot-noise-like noise, or genuine background
+  fluorescence from the substrate/optics unrelated to the NV center.
+  Consistent with CH1 (laser gate) firing identically during both on-
+  cycle and off-cycle halves of the reference (no reference-synchronous
+  difference in laser drive, unlike CH2) -- a coherent laser-driven
+  signal shouldn't demodulate into X/Y at all, so this reads as
+  fluctuating broadband noise (~4 uV) rather than a discrete artifact,
+  consistent with real optical shot noise rather than another timing
+  glitch. This is now an OPTICS investigation (laser filtering before
+  the PMT, beam path stray reflections, RIN, collection optics), not an
+  AWG-sequencing/lock-in-reference one -- separate from everything above.
+
+  **Confirmed by physically blocking the beam path to the PMT (not just
+  turning the laser off electronically) -- quieter.** This is a stronger
+  result than the laser-off test: it isolates that actual PHOTONS from
+  the laser are reaching the PMT (via scatter, reflection, or leakage
+  past whatever filtering exists), not electrical crosstalk from the
+  laser driver/AOM electronics (turning the laser off electronically
+  would also remove any such electrical coupling, so it alone couldn't
+  distinguish the two -- physically blocking the beam while everything
+  electrical stays running rules electrical crosstalk out specifically).
+  Next steps are physical/optical, not code: check whether the excitation
+  filter before the PMT (notch/longpass/bandpass, whichever is installed)
+  is appropriate for the laser wavelength and not degraded/bypassed;
+  check the beam path for uncovered optics, loose mounts, or reflective
+  surfaces near the collection path that could scatter excitation light
+  toward the PMT; check any pinhole/spatial-filtering/fiber-coupling
+  alignment, since misalignment lets in more background light than
+  intended.
+
+- **Side investigation while chasing the optics noise: tested `n_reps=50`
+  (down from 250) to see if noise scales with the laser/AOM's switching-
+  edge count rather than total light dose -- but the FIRST attempt was
+  confounded.** `anchor_free_reps=1000` was sized for `n_reps=250`;
+  dropping to `n_reps=50` without scaling it up shrinks `anchor_period_s`
+  proportionally (`ref_period_s` scales with `n_reps`) -- from ~2.0 s down
+  to ~0.4 s, far under the ~1.9 s dwell window (`settle_s + extra_settle_
+  s`). This reintroduced the exact anchor-wrap problem `anchor_free_reps`
+  exists to prevent, confirmed directly on real hardware: `reference_
+  unlock=True` (the first time this bit has ever been seen set in this
+  whole investigation) alongside the classic `output_overload`/rail-value
+  signature. **Not evidence about laser-switching noise** -- re-tested
+  with `anchor_free_reps=5000` (computed to restore the same margin
+  `n_reps=250` had) and `reference_unlock` stayed `False` across the
+  whole sweep.
+
+  That re-test surfaced a real, separate bug though: point 1 (the only
+  point that went through the periodic interlock check, `interlock_
+  check_interval=5` default) still hit the classic rail value
+  (`output_overload=True`, `X=Y=-1.09222e-4`) while every other point was
+  clean. Traced it to a gap in the `extra_settle_s` fix: the interlock-
+  check path has its OWN `awg.write("ABOR")` (added earlier specifically
+  to force a known state after the ~1s GPIB round trip -- see the
+  "spikes near interlock checks" entry above), which is a SEPARATE
+  reconfigure event from the main `setup_awg_sequences()` call, but went
+  straight into `_wait_settle_discarding_transient_overload(settle_s)`
+  with no `extra_settle_s` buffer at all -- `extra_settle_s` had only
+  been added after the main `setup_awg_sequences()` call, not after this
+  second ABOR. **Fixed**: added the same `time.sleep(extra_settle_s)`
+  right after this ABOR too (`rabi.py`, inside the `interlock_during_
+  sweep` block). Not yet re-run on real hardware to confirm this
+  specific point is now also clean, but the mechanism is well understood
+  from the exact parallel to the already-validated main-path fix.
+
+  The underlying laser-switching-vs-light-dose question (why `n_reps=50`
+  test was started) is still open -- needs a clean re-run with `anchor_
+  free_reps` properly scaled for `n_reps=50` AND this interlock-path fix
+  in place before it's a fair comparison against `n_reps=250`.
+
+  **Clean re-run done (`backgroundfree13_less_reps` at `n_reps=50` with
+  `anchor_free_reps` properly scaled, vs `backgroundfree14` at
+  `n_reps=250`, both at 2.14 GHz, `sensitivity_v=1e-4`): both came back
+  fully clean (no `reference_unlock`, no rail spikes), confirming the
+  fix.** `n_reps=50` was actually QUIETER, not noisier -- mean R 4.20 uV
+  (std 1.07) vs 5.52 uV (std 2.75) at `n_reps=250`, max 6.03 uV vs
+  9.52 uV. Only 5 points each, so not a lot of statistical weight, but
+  this argues AGAINST "more laser-switching edges -> more noise": the two
+  runs have the identical AOM switching RATE per second regardless of
+  `n_reps` (`rep_us` is fixed by `laser_us+pre_us+mw_us+post_us`,
+  independent of `n_reps` -- `n_reps` only changes how many switches
+  happen before the lock-in's OWN reference toggles, not the AOM's
+  physical switching cadence). What differs between the two runs is the
+  reference/chop frequency itself (`n_reps=50` chops ~5x faster), and the
+  faster-chop run being quieter is more consistent with ordinary 1/f-type
+  noise (common in environmental, electronic, and laser RIN sources) than
+  with a distinct AOM-switching-count effect. The laser-driven optical
+  noise identified earlier (beam-block test) is real, but this particular
+  n_reps comparison doesn't point to switching-edge COUNT as its
+  mechanism -- worth keeping in mind if pursuing the optics investigation
+  further (e.g. RIN, or genuinely lower background dose, matter more than
+  switching frequency per this data).

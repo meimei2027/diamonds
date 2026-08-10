@@ -1089,8 +1089,18 @@ def cmd_run(file_name, **kw):
                         # from its anchor -- a single, bounded (<= one
                         # trigger period) dead time right at the start of
                         # settle_s, which the transient-discard wait below is
-                        # already designed to absorb.
+                        # already designed to absorb. Also apply extra_
+                        # settle_s here, same as after setup_awg_sequences()
+                        # -- this ABOR is a SEPARATE reconfigure event from
+                        # that one, so it needs its own margin too (found on
+                        # real hardware: with a normal-cadence interlock
+                        # check, this was the ONLY point in an otherwise-
+                        # clean sweep that still hit the output_overload
+                        # rail, since this path went straight into settle_s
+                        # with no extra_settle_s buffer at all).
                         awg.write("ABOR")
+                        if extra_settle_s > 0:
+                            time.sleep(extra_settle_s)
 
                     _wait_settle_discarding_transient_overload(lia, settle_s)
 
@@ -1880,9 +1890,96 @@ def cmd_calibrate_phase(file_name, **kw):
     print("[rabi] phase calibration done")
 
 
+RUN_PARAMS_HELP = """
+'run' (cmd_run()) key=value overrides, with their current defaults --
+also apply to 'run-no-mw'/'run-ch2-constant'/'run-ch1-ch2-constant'
+(_run_no_mw_impl()) except where noted, though several defaults differ
+there (that impl never touches the generator/PSUs/interlock, so it skips
+the psu_*/coil_*/interlock_*/reflected_power_scan/res_*/fine_* group
+entirely). See each parameter's inline comment in the source (rg the
+name in rabi.py) and notes.md for the reasoning behind non-obvious ones.
+
+Sweep range:
+    freq_hz=2.843e9            fixed MW frequency for the whole sweep
+    drive_power_dbm=0.0        generator power at freq_hz
+    threshold_dbm=-10.0        reflected-power interlock trip threshold
+    mw_start_us=0.02           tau_mw sweep start
+    mw_stop_us=5.0             tau_mw sweep stop
+    mw_step_us=0.02            tau_mw sweep step
+    n_reps=250                 on+off reps per point's combined arb
+
+Pulse timing:
+    laser_us=2.0               laser/AOM gate duration per rep
+    pre_us=1.0                 dead time before the MW pulse
+    post_us=1.0                dead time after the MW pulse
+
+Lock-in:
+    time_constant_s=0.1        SR830 RC time constant
+    settle_periods=5.0         min wait, in reference periods
+    settle_time_constants=9.0  min wait, in time constants (usually dominant)
+    sensitivity_v=5e-3         SR830 full-scale sensitivity (run-no-mw etc.: 5e-3)
+    auto_sensitivity=true      AGAN once at the first point
+    phase_deg=0.0              SR830 reference phase
+    input_coupling=ac          SR830 input coupling ("ac"/"dc")
+
+Overload/underload auto-rescaling:
+    auto_rescale_on_overload=true
+    max_rescale_attempts=3
+    auto_rescale_on_underload=true
+    underload_margin=0.5
+    underload_persistence=3    consecutive underload points before stepping finer
+    fixed_sensitivity=false    true disables all three rescale flags above,
+                               using sensitivity_v as-is for the whole sweep
+
+Amplifier/coil PSUs (run only -- not in run-no-mw/etc.):
+    psu_voltage_v=12.0
+    psu_current_limit_a=1.9
+    coil_current_a=2.0
+    coil_voltage_margin=1.5
+
+Interlock (run only):
+    interlock_check_interval=5     points between periodic reflected-power checks
+    interlock_hold_periods=3.0     MAX HOLD duration, in reference periods
+    interlock_during_sweep=true    false skips the PERIODIC check entirely
+                                    (the pre-flight check before the sweep
+                                    always still runs) -- no protection
+                                    while sweeping if false, use with care
+
+AWG sequencing / background-artifact avoidance (see notes.md's "spurious
+off-resonance/no-MW-near-sample signal" entry for the full investigation):
+    resequence_interval=4 (module RESEQUENCE_INTERVAL)
+                                    points between full awg.reset() (*RST)
+    extra_settle_s=0.0              extra wait after each point's reupload/
+                                     re-arm, before settle_s's own countdown --
+                                     1.0 confirmed to eliminate the rare large
+                                     (~1.5e-4 V) output_overload rail spikes
+    ch1_vpp=0.632
+    ch2_vpp=5.0
+    ch2_offset_v=2.5
+    trigger_margin=3.0 (run-no-mw etc.: 100)
+    anchor_free_reps=1000 (run-no-mw etc.: 1, run-ch2-constant: 20)
+                                    if you raise extra_settle_s, raise this
+                                    too -- anchor_period_s must still exceed
+                                    extra_settle_s + settle_s at the sweep's
+                                    shortest tau_mw
+    fixed_external_trigger=true (run-no-mw etc.: false)
+
+Pre-flight reflected-power scan (run only):
+    reflected_power_scan=true
+    res_span_hz=100e6
+    coarse_step_hz=2e6
+    fine_span_hz=20e6
+    fine_step_hz=50e3
+    res_power_dbm=-40.0
+    res_cal_dir=None
+    fine_sweep=true                 false skips just the fine stage
+""".strip("\n")
+
+
 def main():
     if len(sys.argv) < 3:
         print(__doc__)
+        print(RUN_PARAMS_HELP)
         raise SystemExit(1)
 
     command = sys.argv[1]
