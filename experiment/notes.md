@@ -1600,6 +1600,88 @@ being verified against before building the real sweep into `rabi.py`.
   rescaling kept happening). Fixed by moving the override block to AFTER
   all three flags (and `underload_margin`/`underload_persistence`) are
   parsed, in both `cmd_run()` and `_run_no_mw_impl()`.
+- **Solved the ~250-listing sequence-table ceiling properly, instead of
+  just capping `anchor_free_reps` under it.** Investigated the actual
+  Keysight 33500/33600 manual's `<marker mode>` options for `DATA:SEQ`
+  segments: `maintain`, `lowAtStart`, `highAtStart`, and
+  `highAtStartGoLow` ("force marker high at start of segment and then low
+  at marker position", where `<marker point>` is a sample index into the
+  arb, required to be in `[4, N-3]`). This 4th mode makes it possible to
+  bake a FULL off+on cycle (`n_reps` copies of on-content followed by
+  `n_reps` copies of off-content) into ONE combined arb, with
+  `marker_point` set to the sample where off-content begins, instead of
+  needing two separate listings (one per half) each relying on the
+  segment's own `repeat_count` field. Open question before implementing:
+  does `highAtStartGoLow`'s assert-then-negate pattern re-fire on EVERY
+  repeat of a `"repeat"`-type segment (needed for this to work), or only
+  once across the whole multi-repeat block (the previously-confirmed
+  behavior for the simpler `highAtStart`-only mode, which doesn't
+  generalize automatically since it's a different mechanism -- a hold-
+  only mode has nothing to "redo" per repeat, while a sample-relative
+  negate point plausibly resets with each repeat's own sample counter).
+  **Confirmed on real hardware** (`tests/rabi_combined_arb_marker_
+  test.ipynb`, standalone, didn't touch `rabi.py`): it DOES re-fire every
+  repeat, correctly reproducing the HIGH/LOW block pattern
+  `anchor_free_reps` times over -- tested up to 1000 repeats (~60 ms) at
+  small `N_REPS=5`, and separately confirmed the arb upload itself works
+  fine at real production size (`n_reps=500`).
+
+  **Applied to `setup_awg_sequences()`, replacing the old two-listing-
+  per-cycle design entirely** (not just adding a variant): both CH1
+  ("ch1_combined": `2*n_reps` copies of the same "rep" content, one
+  listing, `maintain` marker) and CH2 ("ch2_combined": `n_reps` on-copies
+  + `n_reps` off-copies, one listing, `highAtStartGoLow` with computed
+  `marker_point`) are now built once and listed with `repeat_count=
+  anchor_free_reps` -- a SINGLE table entry regardless of how large
+  `anchor_free_reps` is, exactly like `n_reps` itself already was free.
+  This removes the ~250-listing ceiling entirely (confirmed: no longer
+  capped by table size at all) -- the tradeoff moves from "table entries"
+  to "waveform memory / per-point upload time" instead, since the
+  combined arb is `n_reps` times bigger than a single rep (confirmed
+  fine on real hardware up to `n_reps=500`). This also means
+  `anchor_free_reps` can now be set large enough to make one combined-arb
+  stretch reliably exceed `settle_s` at EVERY `mw_us` in the sweep
+  (unlike the old ~250-listing cap, which fell short at the shortest
+  `mw_us` values) -- potentially eliminating the anchor-wrap dead-time
+  glitch from landing inside any point's read window at all, not just
+  reducing how often it does.
+
+  **Bug found and fixed along the way**: an earlier edit (unifying
+  `anchor_free_reps` across both channels) had removed CH1's old
+  "decoupled from trigger when `ch2_hold_constant`" special case from the
+  sequence-BUILDING code, but left a stale `if not ch2_hold_constant:`
+  guard around the `TRIG1:SOUR/SLOP/LEV` writes in the output-CONFIG
+  code -- meaning CH1's (now-always-present) `onceWaitTrig` anchor could
+  end up with no trigger source configured when `ch2_hold_constant=True`.
+  Fixed by making CH1's trigger configuration unconditional, matching the
+  fact its sequence always has an anchor now regardless of
+  `ch2_hold_constant`.
+
+  `cmd_run_ch2_constant()`'s `anchor_free_reps` default (`20`) predates
+  this fix and is now more conservative than structurally necessary, but
+  wasn't changed since there's no urgency. Docstrings updated throughout
+  to describe the combined-arb design instead of the retired two-listing
+  one. Not yet run on real hardware with this applied to a full `cmd_run()`
+  sweep at real parameters (only the standalone notebook and isolated
+  upload timing test have been confirmed so far).
+
+  **`RESEQUENCE_INTERVAL` lowered from `20` to `4`.** Flagged above as not
+  yet re-validated -- now addressed. The combined-arb design bakes
+  `n_reps` (up to hundreds) copies of on/off content into ONE waveform per
+  channel per point, so each point's arb data is orders of magnitude
+  bigger than the old per-rep arbs, even though the *sequence table* itself
+  is now tiny (2 listed segments instead of up to ~401). `RESEQUENCE_
+  INTERVAL`'s `awg.reset()` was originally tuned only against the
+  "too many sequences defined" limit (accumulated distinct sequence names
+  across points), a concern from the old design that's now much less
+  pressing. The new concern it also needs to cover is accumulated/
+  fragmented ARB WAVEFORM MEMORY across many large uploads -- each point's
+  `SOUR1:DATA:VOL:CLE`/`SOUR2:DATA:VOL:CLE` calls should free the previous
+  point's arb before uploading the new one, but with per-point arbs this
+  much larger, a periodic full reset every 4 points (vs. every 20) gives
+  the AWG's memory management a cleaner slate more often as a margin of
+  safety. Not yet stress-tested on real hardware at this new interval;
+  revisit if upload errors or slowdowns appear over a long sweep.
 - **SR830 sensitivity auto-rescaling was one-directional: only coarser,
   never finer again.** `_step_sensitivity_coarser()` + `auto_rescale_on_
   overload` back out of a real-time `OVERLOAD` by stepping to a LESS
@@ -1796,3 +1878,366 @@ being verified against before building the real sweep into `rabi.py`.
   parallel (~25 ohms combined), under-matching the amplifier further --
   use a proper 50 ohm splitter (50 ohms at each output port) rather than a
   plain T with two separate terminators.
+
+- **`rabi_new11_fix_anchor` showed `anchor_free_reps=200` (the old
+  `cmd_run()` default) isn't long enough to keep an anchor-wrap out of
+  every point's settle window.** At its parameters (n_reps=250, tau_mw
+  0.02-3.02 us), `ref_period_s` ranges 2.01-3.51 ms, so the anchor period
+  (`ref_period_s * anchor_free_reps`) was only 0.40-0.70 s -- shorter than
+  `settle_s=0.9s` (dominated by `settle_time_constants*time_constant_s`)
+  everywhere in the sweep, guaranteeing 1-2 anchor-wrap glitches inside
+  every single settle window. Needed `anchor_free_reps > 0.9 /
+  2.01e-3 ~= 448` (worst case, shortest tau_mw) just to make it possible
+  for a window to land clean. **Fixed**: `cmd_run()`'s `anchor_free_reps`
+  default raised from `200` to `500` (comfortably past that threshold
+  across the default sweep range too -- 500-rep anchor periods run
+  1.0-2.0 s at `mw_start_us=0.02`-`mw_stop_us=5.0`, both above
+  `settle_s=0.9s`), already confirmed safe up to 1000 repeats on real
+  hardware in `tests/rabi_combined_arb_marker_test.ipynb`.
+
+  Side effect: since a full 500-rep anchor cycle (1.0-2.0 s) now runs
+  LONGER than `settle_s` (0.9 s) itself, the per-point loop always moves
+  on to the next point mid-cycle -- the AWG is never idled back at its
+  anchor, waiting for a trigger, by the time `setup_awg_sequences()` gets
+  called again. This isn't new (it already happened at `anchor_free_
+  reps=200` whenever a cycle ran long, and DATA:VOL:CLE-while-playing has
+  worked fine on real hardware across every `rabi_new*` run so far), but
+  it's now the ALWAYS case rather than the occasional one. **Hardened
+  anyway**: added `awg.write("ABOR")` right before the `SOUR1/2:DATA:VOL:
+  CLE` calls at the top of `setup_awg_sequences()`, so the previous
+  point's sequence is explicitly stopped before its arb memory gets
+  cleared and replaced, instead of relying on clear-while-playing being
+  safe. Not yet re-run on real hardware with this combination (`anchor_
+  free_reps=500` default + `ABOR`) at full `cmd_run()` sweep scale.
+
+- **`rabi_new13_fix_anchor2` (500 default + ABOR) still showed 4/31
+  outlier points, but NOT random -- pooling `rabi_new11/12/13` (123 points
+  total) and bucketing by offset from the nearest periodic interlock check
+  (`interlock_check_interval=5`) showed the check point itself is the
+  CLEANEST (0/27 near the sensitivity rail) while points at offset +1/+2
+  are the WORST (33% near the rail, ~2x the mean of offset 0) -- a period-5
+  pattern, matching `interlock_check_interval`, not `RESEQUENCE_INTERVAL`
+  (4) or anything n_reps/anchor-period related. Traced the actual
+  synchronization: `settle_s` is a blind `time.sleep()` in Python that
+  starts counting AFTER `setup_awg_sequences()` returns, `lia.read_
+  overload_status()`'s discard, and (if this point runs one) the interlock
+  check -- there is NO handshake with the AWG confirming it has actually
+  resumed real signal output; the code just assumes real content resumes
+  almost immediately after upload. Meanwhile the external trigger (SDG1062X,
+  `fixed_external_trigger=true`) free-runs continuously and totally
+  independent of Python's loop timing.
+
+  **Root cause**: `HP8673H.read_max_hold_reflected_power_dbm()`'s GPIB
+  round trip measured at **~1s on real hardware** -- squarely comparable to
+  `anchor_period_s` (`ref_period_s * anchor_free_reps`, ~1.0-1.5s across
+  most of this sweep's `mw_us` range at the new `anchor_free_reps=500`
+  default). Since the interlock check runs BEFORE `settle_s` starts (same
+  point, `cmd_run()`'s per-point loop), ordinary GPIB timing variance is
+  enough to occasionally push the check's duration past `anchor_period_s`
+  -- meaning the AWG's current anchor_free_reps-repeat run SOMETIMES
+  finishes and wraps back to its onceWaitTrig anchor DURING the check, and
+  sometimes doesn't. That's a genuine race, not a fixed offset -- exactly
+  the kind of thing that produces sporadic, unpredictable spikes rather
+  than a clean, reproducible pattern, and explains why it clusters near
+  (though doesn't perfectly align point-for-point with) the periodic
+  check rather than showing up uniformly across the sweep.
+
+  **Fixed**: rather than trying to guess a margin big enough to keep the
+  check reliably under `anchor_period_s` (fragile, and still a race), added
+  an unconditional `awg.write("ABOR")` right after the interlock check
+  block (whenever `i % interlock_check_interval == 0`), before `_wait_
+  settle_discarding_transient_overload()`. This forces the AWG into a
+  KNOWN state -- stopped, idle at its anchor, waiting for the next trigger
+  edge -- every time a check runs, instead of leaving "mid-run or already
+  re-idled?" ambiguous. The resulting dead time (bounded by one trigger
+  period, ~0.3s at current settings) is the same kind of transient the
+  existing discard-at-80%-of-settle_s logic already absorbs, just now
+  guaranteed to occur (and be covered) rather than randomly sometimes
+  needed and sometimes not. No reupload needed -- the sequence/arb data is
+  untouched, ABOR just stops playback; the next trigger edge resumes it
+  from segment 1 (the anchor) same as ever.
+
+  Also added a diagnostic print (timing of the interlock check vs. that
+  point's `anchor_period_s`) right before this fix, which is what
+  confirmed the ~1s check duration in the first place -- left in place
+  since it's cheap and directly useful if this ever needs re-diagnosing at
+  different `anchor_free_reps`/`n_reps`/`mw_us` combinations.
+
+  **Re-tested on real hardware: the post-check `ABOR` did NOT eliminate
+  the spikes.** So the race with `anchor_period_s` either isn't the whole
+  story, or `ABOR` itself doesn't cleanly force the assumed known state
+  (e.g. maybe it doesn't fully suppress whatever the check's GPIB/RF
+  activity couples into the signal path, independent of the AWG's own
+  play state). Rather than keep guessing at the exact mechanism, added an
+  `interlock_during_sweep` option (default `true`) to `cmd_run()` that
+  skips the PERIODIC per-point check entirely (the `i % interlock_check_
+  interval == 0` block, including this `ABOR` and the timing diagnostic)
+  when set `false` -- lets the periodic check be removed as a variable
+  altogether to isolate whether it's the cause at all, without touching
+  the PRE-FLIGHT reflected-power check (`reflected_power_scan`'s coarse/
+  fine sweep + the single operating-point check right before the sweep
+  loop starts, `rabi.py:~775-849`), which always still runs regardless of
+  this flag. Caution: `interlock_during_sweep=false` means NO reflected-
+  power protection while sweeping tau_mw -- only use for short diagnostic
+  runs at power levels already confirmed safe, not routine data
+  collection. Not yet run on real hardware with this option.
+
+- **`rabi_new17_no_interlock` (interlock_during_sweep=false, zero periodic
+  checks) still showed the same spikes, at the same near-identical clipped
+  magnitude (~1.545e-4) as every prior test run** -- this ruled out the
+  interlock/GPIB-timing race entirely (it was a real, confirmed ~1s-vs-
+  anchor_period_s race, but not THE cause of the background artifact).
+  Re-examined by bucketing `rabi_new14/15/16/17` (123 points) by distance
+  from the nearest periodic `awg.reset()` (`RESEQUENCE_INTERVAL`, then
+  still 4) instead of the interlock check: `i%4==0` (just reset) was clean
+  (0/16 near the rail), while `i%4==1/2/3` got progressively worse
+  (15%/25%/26%) right up to the point before the next reset -- a clean
+  monotonic climb-then-flush pattern, not noise.
+
+  `awg.reset()` (`ks33600a.py:34`) is `*RST` + `*CLS` -- a full instrument
+  reset. Every other point only gets `ABOR` (in `setup_awg_sequences()`)
+  before clearing/reuploading arb memory -- a much lighter operation.
+  Leading theory: `ABOR` isn't fully flushing something in the AWG's
+  trigger input logic (most plausibly a buffered/stale external trigger
+  edge) that `*RST` does -- so per-point `ABOR`-only reconfigures let
+  timing uncertainty compound across the `RESEQUENCE_INTERVAL` window
+  until the next full reset flushes it clean.
+
+  **Made `RESEQUENCE_INTERVAL` a runtime override** (`resequence_interval`
+  kwarg, `cmd_run()` and `_run_no_mw_impl()`, defaults to the module
+  constant) instead of only a hardcoded module constant, specifically to
+  let this theory be tested directly: `resequence_interval=1` resets the
+  AWG every single point (slow -- full `*RST` per point -- but a clean
+  pass/fail test).
+
+  **Confirmed on real hardware**: `rabi_new18_resets` (`resequence_
+  interval=1`, otherwise identical params to new14-17) came back
+  completely clean -- max R = 6.7e-5, nowhere near the ~1.5e-4 rail, 0/16
+  points anomalous. This is the first test-sweep run at these tight
+  (`fixed_sensitivity=true`, 100 uV) settings with NO spikes at all.
+  Confirms the theory: full `*RST` per point (not just `ABOR`) is what
+  actually keeps the AWG's trigger/timing state clean.
+
+  **Not yet resolved**: running `*RST` every single point is slow and not
+  practical for long, fine-grained sweeps (hundreds of points). Still
+  need to find whichever SPECIFIC piece of `*RST` (beyond `ABOR`) is doing
+  the flushing -- so it can be replicated cheaply every point without a
+  full instrument reset -- or otherwise settle on a resequence_interval
+  low enough to keep this acceptable for real sweeps without paying full
+  `*RST` cost every point.
+
+- **Investigated what specifically about `*RST` (vs. plain `ABOR`) fixes
+  it, by tracing the actual command sequence rather than guessing.**
+  `setup_awg_sequences()` unconditionally rewrites `TRIG1:SOUR EXT`/
+  `TRIG2:SOUR EXT` every single point, regardless of whether that point
+  went through `ABOR` or a full reset. On a normal `ABOR`-only point,
+  `TRIG:SOUR` was already `EXT` before this write and stays `EXT` after --
+  a same-value re-assertion, not a real transition. But Keysight 33500/
+  33600-series `*RST` resets `TRIG:SOUR` to its factory default,
+  `IMMediate` -- so on a just-reset point, `setup_awg_sequences()`'s own
+  `TRIG:SOUR EXT` write causes a REAL `IMM -> EXT` transition.
+
+  **Leading theory**: `*RST` fixing the spikes is incidental to its main
+  purpose -- the actual fix is that `IMM -> EXT` transition flushing a
+  stale/latched external trigger edge sitting in the AWG's trigger input
+  circuitry, something a same-value `EXT -> EXT` write never touches. A
+  same-value write and a genuine transition are not guaranteed to behave
+  identically at the hardware level even though the end state looks
+  identical from software.
+
+  **Tried, FALSIFIED on real hardware**: added `awg.write("TRIG1:SOUR
+  IMM")` / `awg.write("TRIG2:SOUR IMM")` right after `ABOR` at the top of
+  `setup_awg_sequences()`, forcing an `IMM -> EXT` round trip every point.
+  `rabi_new20_test` (6 points, `mw_us` 0.02-1.02) still hit the same
+  ~1.3-1.5e-4 rail at 2 of 6 points with the toggle in place -- the
+  trigger-source-transition theory is wrong (or at least not sufficient).
+  Removed the toggle (`rabi.py:326`) rather than leave dead code from a
+  disproven theory in place.
+
+  **Next candidate, more directly justified**: `FUNCtion:ARBitrary:
+  SYNChronize` -- a real, documented Keysight 33500/33600-series command
+  (normally used to re-align coupled channels' arb phase after changing
+  sample rate/frequency), not a guess about a side effect. Added `awg.
+  write("SOUR1:FUNC:ARB:SYNC")` / `awg.write("SOUR2:FUNC:ARB:SYNC")` at
+  the end of `setup_awg_sequences()`, right after both channels' sequences
+  are freshly selected and armed (`OUTPut:SYNC:SOURce CH2` line) -- forces
+  each point's freshly-loaded sequence to start from a known phase before
+  it ever sees a trigger edge, rather than inheriting whatever phase the
+  AWG's internal clock/DDS happened to be at from continuous free-running
+  operation since the last real reset.
+
+  **Also FALSIFIED on real hardware**: `rabi_new20_test` (`FUNC:ARB:SYNC`
+  in place, normal `resequence_interval`) still hit the identical rail
+  value (`1.092e-4`) at 4 of 16 points -- same magnitude, same rate as
+  before. This candidate doesn't fix it either.
+
+- **Major reframing: the background artifact is NOT on the signal path at
+  all.** With the PMT turned off entirely, `~10 uV` signals persisted --
+  ruling out anything optical. Then, with the SR830's signal input
+  properly TERMINATED with 50 ohm (not just disconnected/floating, which
+  would still act as a pickup antenna) and `resequence_interval=1` (the
+  one AWG-side fix that had looked reliable), the EXACT SAME rail value
+  (`X=Y=1.092190e-04`) still appeared at 1 of 6 points. A 50-ohm-terminated
+  input has nothing left on the signal side for anything to couple into --
+  this rules out the PMT, its cable, ground loops on the signal path, and
+  radiated pickup landing on a floating antenna, all at once.
+
+  This reframes the whole investigation: the artifact must originate from
+  the REFERENCE path or from something internal to the SR830 itself, not
+  the signal path -- meaning `anchor_free_reps`, `ABOR`, `FUNC:ARB:SYNC`,
+  and `resequence_interval` were all attempts to fix something on the AWG/
+  sequencing side, but every one of them still necessarily disrupts the
+  reference (CH2's Sync output) somehow when a point's `mw_us` changes --
+  that disruption may be unavoidable by construction, not a bug in any one
+  approach. Leading hypothesis: reference feedthrough -- a lock-in's
+  reference conditioning and signal preamp are never perfectly isolated
+  internally, and while a STEADY periodic reference contributes zero net
+  DC to X/Y (it averages out over a cycle), an IRREGULAR/discontinuous
+  reference edge (exactly what happens every time the AWG reconfigures)
+  would not average out, showing up as a transient, roughly fixed-
+  magnitude artifact -- consistent with the same numeric value recurring
+  across totally different AWG-side conditions.
+
+  **Added diagnostic**: `cmd_run()` now also queries the SR830's own
+  measured reference frequency (`SR830.get_frequency_hz()`, wraps `FREQ?`)
+  right after `read_xy()` each point, saved to a new `_rabi_ref_freq_hz.
+  npy` file, printed every point (changed from only-on->1%-deviation to a
+  plain per-point print, per request, since scanning full console output
+  for a rare warning is more friction than just seeing every value).
+
+  **Tested on real hardware -- frequency looks completely normal at spike
+  points.** A live run showed `X=Y=1.092220e-04`-type spikes at points 4
+  and 6, and BOTH printed a reference frequency matching the expected
+  `1/ref_period_s` to well under 0.01% (e.g. `432.901000 Hz` vs expected
+  `432.900433 Hz`). This rules out a gross reference frequency error or
+  lock loss lasting long enough to skew `FREQ?`'s reading -- but `FREQ?`
+  is presumably an averaged/tracked measurement, so a single brief edge
+  glitch (a missing/extra/jittered edge, not a sustained frequency error)
+  wouldn't necessarily show up in it at all.
+
+  **More sensitive follow-up added**: the SR830's `LIAS?` status byte has
+  a bit 3 = reference unlock, which `sr830.py`'s `read_overload_status()`
+  wasn't decoding (only bits 0-2, the overload bits). Added it as a new
+  `reference_unlock` key on the returned dict (kept separate from `"any"`,
+  which still only covers the overload bits, since nothing currently
+  rescues sensitivity in response to an unlock and callers gating overload
+  -rescue logic on `"any"` shouldn't have that logic triggered by it).
+  Unlike `FREQ?`, `LIAS?` bits LATCH until read (see `read_overload_
+  status()`'s docstring), so this should catch even a brief unlock event
+  that occurred any time since the last read, not just the exact instant
+  read. `cmd_run()` now reads this unconditionally right after `read_xy()`
+  (previously the only `read_overload_status()` call was gated behind
+  `auto_rescale_on_overload`, which `fixed_sensitivity=true` -- used for
+  every test run in this whole investigation -- disables, meaning
+  reference_unlock was never actually being checked at all until now).
+  Prints it every point and saves it to a new `_rabi_reference_unlock.
+  npy` file.
+
+  **Confirmed on real hardware: `reference_unlock=False` at a spike
+  point**, with frequency also spot-on (`243.307000 Hz` vs expected
+  `243.309002 Hz`) -- rules out the reference-side theory entirely. Also
+  added `input_overload`/`filter_overload`/`output_overload` to the same
+  print (already fetched in the same `LIAS?` read, no extra query) since
+  only `reference_unlock` had been wired up. That print immediately paid
+  off: **`output_overload=True`, `input_overload=False`** at a spike
+  point (`X=Y=1.092190e-04`). This is a real, distinct finding -- the
+  analog front end never saw anything too large (consistent with a 50 ohm
+  -terminated input and no PMT), but the INTERNAL DEMODULATED OUTPUT
+  calculation transiently exceeded its representable range. First
+  concrete evidence the artifact originates inside the SR830's own signal
+  processing, not from anything external on the signal OR reference path
+  (both already ruled out above).
+
+  **Found a real, independent contributing factor while investigating
+  this**: `setup_lock_in()` (shared by all three `rabi.py` entry points)
+  never calls `lia.reset()` at connect time, and nothing anywhere sets
+  OEXP (offset/expand). Any nonzero offset or >1x expand left over from a
+  PREVIOUS session (another script, e.g. `cw_odmr_lock_in.py`, or a manual
+  front-panel adjustment) would silently persist across every `rabi.py`
+  run indefinitely, shrinking the SR830's usable output range and making
+  a nuisance `output_overload` trip far easier to hit from an otherwise
+  harmless transient -- with NO relation to the actual input signal or
+  any of the AWG-timing work. **Fixed**: added `get_offset_expand()`/
+  `set_offset_expand()` to `sr830.py` (wraps `OEXP?`/`OEXP`), and
+  `setup_lock_in()` now queries and logs whatever was there before,
+  then forces both X and Y to a known-clean 0%/1x state on every run.
+  Also added `check_sr830_offset_expand.py`, a standalone script to
+  spot-check the instrument's current offset/expand state directly
+  without running a full sweep. Confirmed on real hardware: X and Y
+  (the only two channels `rabi.py` ever actually reads, via `SNAP? X,Y`)
+  were already clean (0%/1x) -- only R had a negligible 0.09% offset,
+  irrelevant since R is always computed from X/Y in software, never read
+  from the instrument directly. Offset/expand is NOT the explanation.
+
+- **Isolated the artifact from the real sweep entirely with two new
+  scripts, `debug_repeat_one_point.py` (`with-reupload`/`no-reupload`
+  commands) and `check_sr830_offset_expand.py`** -- both connect ONLY to
+  the AWG, its SDG1062X external trigger, and the SR830, deliberately
+  never touching the MW generator, either PSU, or the interlock analyzer,
+  so they're safe to run with the MW generator/amplifier physically off.
+
+  **`no-reupload`** (uploads once, then repeats `_wait_settle_discarding_
+  transient_overload()` + `read_xy()` forever on that same never-touched
+  sequence) showed the TRUE noise floor is far quieter than anything seen
+  in this whole investigation: iteration 0 (right after the one-time
+  upload) showed a modest ~6-11 uV bump, but by iteration 1 it had already
+  settled to tens of NANOvolts and stayed there. This means the true
+  noise floor, once nothing is reconfiguring, is comfortably below the
+  ~10 uV CW-ODMR signal -- not comparable to it like the earlier stale
+  `rabi_off_resonance_fix_long` measurement suggested (that measurement
+  predates this whole investigation and used different sensitivity
+  settings -- see the "off-resonance noise floor is comparable to the CW-
+  ODMR signal" entry above). It also directly confirms a reconfigure event
+  causes a real transient (the iter-0 bump) that fully decays within one
+  normal settle_s window -- but that's the everyday few-uV bump, not the
+  rare ~1.5e-4 V rail spikes chased throughout this investigation.
+
+  **`with-reupload` + new `extra_settle_s` override** (a flat extra wait
+  added right after `setup_awg_sequences()`'s reupload/re-arm, before
+  settle_s's own countdown starts) tested whether the BIG rail spikes
+  specifically need more margin after a reconfigure event, at a normal
+  every-point-reupload cadence (unlike `resequence_interval=1`, this
+  doesn't need a full `*RST`, just a longer wait after the normal `ABOR`+
+  reupload). **Confirmed on real hardware: `extra_settle_s=1.0` showed
+  zero rail spikes across several iterations of every-point reupload** --
+  values stayed in the ~1e-7-1e-8 V range throughout, no `output_overload`
+  or magic-rail values at all. This is the first fix in this whole
+  investigation that's actually been validated against the BIG spikes at
+  a normal reconfigure cadence (not just the everyday small bump, and not
+  requiring a full-reset-every-point workaround).
+
+  **Applied to `rabi.py` itself**: added `extra_settle_s` (default `0.0`,
+  no behavior change) to both `cmd_run()` and `_run_no_mw_impl()`, added
+  right after each's `setup_awg_sequences()` call via `time.sleep()`,
+  before the settle-and-read logic. Not yet swept to find the MINIMUM
+  sufficient value (1.0s was just what was tested) -- worth trying smaller
+  values (e.g. 0.2, 0.5) to avoid needlessly slowing down a real sweep,
+  now that `debug_repeat_one_point.py with-reupload extra_settle_s=<x>`
+  gives a fast, MW-generator-free way to test values without spending
+  real sweep time. Also still an open question WHY extra dwell right
+  after reconfigure specifically fixes this (a real transient that needs
+  more decay time before being read, presumably) rather than a deeper
+  mechanistic understanding -- but it's now an empirically validated,
+  practical mitigation for real data collection.
+
+- **`extra_settle_s` interacts with `anchor_free_reps` -- raising one
+  without the other reintroduces the wrap-mid-window problem.**
+  `anchor_free_reps` was sized (`rabi_new11_fix_anchor` onward) so
+  `anchor_period_s` (`ref_period_s * anchor_free_reps`) comfortably
+  exceeds the dwell time before a point's read -- but that dwell used to
+  just be `settle_s`. With `extra_settle_s` now adding a wait BEFORE
+  `settle_s`'s own countdown starts, the real dwell to cover is
+  `extra_settle_s + settle_s`. At `extra_settle_s=1.0` (the validated
+  value) and `settle_s=0.9` (default sweep params), that's ~1.9 s total,
+  needing `anchor_free_reps > ~945` at the shortest `tau_mw` to still
+  cover it -- the old default of 500 falls well short, which would let
+  the sequence wrap and need an uncontrolled retrigger mid-window again,
+  the exact failure mode `anchor_free_reps` exists to prevent. **Fixed**:
+  raised `cmd_run()`'s `anchor_free_reps` default from `500` to `1000`
+  (confirmed fine on real hardware up to that value already, per `tests/
+  rabi_combined_arb_marker_test.ipynb`). If `extra_settle_s` is raised
+  further, `anchor_free_reps` needs to go up correspondingly too -- noted
+  in the code comment, not automatically computed (kept as two
+  independent kwargs rather than deriving one from the other, since
+  that's cheap to compute in each real run's own math via
+  `_configure_external_trigger`'s prints anyway).

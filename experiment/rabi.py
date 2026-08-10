@@ -51,7 +51,8 @@ Usage:
         recording the SR830's X/Y at each point. See cmd_run()'s docstring
         for the full list of key=value overrides. Saves
         data/<file_name>/<file_name>_rabi_mw_us.npy, _rabi_x.npy,
-        _rabi_y.npy, _rabi_reflected_dbm.npy, _rabi_metadata.txt.
+        _rabi_y.npy, _rabi_reflected_dbm.npy, _rabi_ref_freq_hz.npy,
+        _rabi_reference_unlock.npy, _rabi_metadata.txt.
 
     python rabi.py run-no-mw <file_name> [key=value ...]
         Crosstalk-isolation diagnostic -- a separate, self-contained sweep
@@ -133,10 +134,15 @@ AMP_PSU_RESOURCE = "USB0::0xF4EC::0x1410::SPD13DCQ7R0986::INSTR"
 
 DATA_DIR = "D:\\rabi"
 
-RESEQUENCE_INTERVAL = 20  # reset the AWG this often to clear out accumulated
-                           # DATA:SEQ sequences before hitting its "too many
-                           # sequences defined" limit -- same lesson as
-                           # t1_test.py's RESEQUENCE_INTERVAL
+RESEQUENCE_INTERVAL = 4  # reset the AWG this often to clear out accumulated
+                          # DATA:SEQ sequences before hitting its "too many
+                          # sequences defined" limit -- same lesson as
+                          # t1_test.py's RESEQUENCE_INTERVAL. Lowered from 20
+                          # now that each point's combined arb (n_reps copies
+                          # of on/off baked into one waveform) is much larger,
+                          # so resetting more often also keeps the AWG's arb
+                          # waveform memory from accumulating/fragmenting
+                          # across points, not just the sequence table.
                            # NOT yet re-validated against anchor_free_reps:
                            # each point's own sequence is now much larger
                            # (up to ~2*anchor_free_reps+1 listed segments,
@@ -194,21 +200,23 @@ def setup_awg_sequences(awg, mw_us, n_reps, laser_us, pre_us, post_us,
 
     ch2_hold_constant=True (crosstalk-isolation diagnostic, see notes.md's
     "spurious off-resonance/no-MW-near-sample signal" entry and
-    cmd_run_ch2_constant()'s docstring): the marker (highAtStart/
-    lowAtStart, which is what the lock-in's reference is actually derived
-    from via OUTPut:SYNC:SOURce CH2) and CH2's own ANALOG output value are
-    independent attributes of a DATA:SEQ segment -- normally they change
-    together (gate_off_rep => lowAtStart, gate_on_rep => highAtStart), but
-    they don't have to. With this on, BOTH segments in CH2's sequence use
-    "gate_off_rep" (constant, physically off -- normalized -1.0, i.e. 0V
-    once ch2_offset_v is applied) while keeping their marker flags
-    unchanged -- so CH2's real analog output voltage never actually
-    changes at all (no physical switching happens downstream), but the
-    lock-in still receives an identical, correctly-toggling reference.
-    Isolates whether a spurious signal genuinely requires CH2's own
-    analog output to physically switch, or only requires the marker/sync
-    output to toggle (which alone would point at the marker/Sync BNC
-    circuitry specifically, not CH2's analog DAC/switch-driving output).
+    cmd_run_ch2_constant()'s docstring): the marker (asserted/negated via
+    "highAtStartGoLow", which is what the lock-in's reference is actually
+    derived from via OUTPut:SYNC:SOURce CH2) and CH2's own ANALOG output
+    value are independent attributes of a DATA:SEQ segment -- normally
+    they change together (the combined arb's on-half uses gate_on_rep's
+    real gate content, off-half uses gate_off_rep), but they don't have
+    to. With this on, the arb's "on" half is built from gate_off_rep's
+    content too (constant, physically off -- normalized -1.0, i.e. 0V
+    once ch2_offset_v is applied) while the marker still asserts/negates
+    at the same marker_point -- so CH2's real analog output voltage never
+    actually changes at all (no physical switching happens downstream),
+    but the lock-in still receives an identical, correctly-toggling
+    reference. Isolates whether a spurious signal genuinely requires
+    CH2's own analog output to physically switch, or only requires the
+    marker/sync output to toggle (which alone would point at the marker/
+    Sync BNC circuitry specifically, not CH2's analog DAC/switch-driving
+    output).
 
     anchor_free_reps (applies to BOTH channels, regardless of
     ch2_hold_constant/ch1_hold_constant -- see notes.md's "spurious
@@ -221,35 +229,32 @@ def setup_awg_sequences(awg, mw_us, n_reps, laser_us, pre_us, post_us,
     external trigger edge arrives, delaying exactly when the next cycle's
     real content resumes -- a real, reproducible glitch landing at the
     SAME point in every cycle (see cmd_run_ch2_constant()'s docstring for
-    how this was isolated on real hardware). With anchor_free_reps=1
-    (default, original behavior), both channels wrap through their
-    anchor every single off+on cycle. Setting it higher lists that many
-    consecutive off+on/rep pairs in each channel's table before wrapping
-    back to its anchor -- cheap (each listing just references the SAME
-    already-uploaded arb data by name, no new waveform memory) -- so the
-    dead-time glitch only recurs once every anchor_free_reps cycles
-    instead of every cycle. CH1 and CH2 MUST use the same anchor_free_reps
-    value and wrap together -- confirmed on real hardware that applying
-    it to only one channel visibly misaligns them (CH1's pulses drift
-    relative to the Sync/marker output once CH1 stops wrapping in lock-
-    step with CH2). Larger values grow the sequence TABLE (more listed
-    segments, not more waveform memory) -- watch RESEQUENCE_INTERVAL if
-    pushed very high.
+    how this was isolated on real hardware). anchor_free_reps sets how
+    many full off+on (or 2*n_reps-rep, for CH1) cycles play as ONE
+    combined, pre-baked arb before wrapping back to the anchor -- CH1 and
+    CH2 MUST use the same value and wrap together (confirmed on real
+    hardware that applying it to only one channel visibly misaligns them,
+    CH1's pulses drifting relative to the Sync/marker output). Each
+    channel's combined arb is listed exactly ONCE with repeat_count=
+    anchor_free_reps -- a SINGLE table entry regardless of how large
+    anchor_free_reps is (repeat count is free, like n_reps already is),
+    unlike an earlier version of this that listed anchor_free_reps
+    separate off+on/rep PAIRS (2*anchor_free_reps table entries), which
+    hit a real ~250-listing AWG sequence-table ceiling on real hardware.
+    The tradeoff moved from table-entry count to waveform memory/upload
+    time instead: the combined arb is n_reps times bigger than a single
+    rep -- confirmed working on real hardware up to n_reps=500 (see
+    tests/rabi_combined_arb_marker_test.ipynb).
 
     ch1_hold_constant=True (paired crosstalk-isolation diagnostic, see
     cmd_run_ch1_ch2_constant()'s docstring): configures CH1 as a plain,
     non-sequenced continuous FUNC SIN at 80 MHz / ch1_vpp instead of
-    building/uploading its own DATA:SEQ sequence at all -- no "rep"/
-    "anchor" arbs, no onceWaitTrig, no external-trigger dependency for
-    CH1. Even with ch2_hold_constant also on, CH1's OWN sequence table
-    still transitions between two separately-listed "rep" segments at
-    exactly the same block boundary as CH2 (both marked "maintain", so
-    the ANALOG output never visibly changes, but the AWG's internal
-    sequencer still processes a segment-advance event there) -- this
-    couldn't be ruled out as an internal source on its own. With
-    ch1_hold_constant on, CH1 is fully decoupled from the block structure
-    -- if ch2_hold_constant is also on, the ONLY thing left anywhere in
-    the AWG still synchronous with the block reference is CH2's marker.
+    building/uploading its own DATA:SEQ sequence at all -- no "anchor"/
+    "ch1_combined" arbs, no onceWaitTrig, no external-trigger dependency
+    for CH1. With ch1_hold_constant on, CH1 is fully decoupled from the
+    block structure -- if ch2_hold_constant is also on, the ONLY thing
+    left anywhere in the AWG still synchronous with the block reference
+    is CH2's marker.
 
     REVERTED an attempted split (configure_awg_outputs() called once,
     output-stage config removed from here) that was meant to cut down on
@@ -260,13 +265,17 @@ def setup_awg_sequences(awg, mw_us, n_reps, laser_us, pre_us, post_us,
     confirmed-working behavior. See notes.md for the (now retracted) theory
     and this revert.
 
-    CH1: "rep" (bright laser pulse of laser_us, then a flat dark gap of
-    pre_us + mw_us + post_us -- CH1 doesn't care about the MW pulse's
-    internal position, just the total gap length).
+    CH1: "ch1_combined" -- 2*n_reps copies of a bright laser pulse
+    (laser_us) followed by a flat dark gap (pre_us + mw_us + post_us),
+    concatenated into one arb -- CH1 doesn't care about the MW pulse's
+    internal position or which half of the cycle is "on" vs. "off", just
+    the total gap length, so it's the same content repeated throughout.
 
-    CH2: "gate_on_rep" (low for laser_us+pre_us, high for mw_us, low for
-    post_us) and "gate_off_rep" (low for the entire rep), each with the
-    SAME sample count as CH1's "rep" (checked with an assert) so the two
+    CH2: "ch2_combined" -- gate_on_rep's content (high for mw_us, low for
+    laser_us+pre_us+post_us) repeated n_reps times, followed by
+    gate_off_rep's content (low for the entire rep) repeated n_reps times,
+    concatenated into ONE arb. Each underlying rep has the SAME sample
+    count as CH1's rep content (checked with an assert) so the two
     channels' blocks don't drift out of step.
 
     Both channels' sequences start with a brief "anchor" segment
@@ -279,10 +288,17 @@ def setup_awg_sequences(awg, mw_us, n_reps, laser_us, pre_us, post_us,
     brief wrong-level glitch on whichever channel doesn't use a 0-centered
     convention (confirmed on real hardware for CH2).
 
-    The lock-in reference marker lives on CH2's sequence (highAtStart on
-    the real mw-on block, lowAtStart on mw-off) -- OUTPut:SYNC:SOURce is
-    set to CH2 here so the shared Sync/Marker BNC reflects it, independent
-    of CH1/CH2 relative timing.
+    The lock-in reference marker lives on CH2's sequence -- the
+    "ch2_combined" listing is marked "highAtStartGoLow" (assert the
+    marker high at the start of the segment, negate it low at
+    marker_point, the sample index where the arb's on-content ends and
+    off-content begins) -- OUTPut:SYNC:SOURce is set to CH2 here so the
+    shared Sync/Marker BNC reflects it, independent of CH1/CH2 relative
+    timing. Confirmed on real hardware that "highAtStartGoLow" re-fires
+    on EVERY repeat of the segment, not just once across the whole
+    anchor_free_reps-repeat block (see tests/rabi_combined_arb_marker_
+    test.ipynb) -- this is what makes collapsing to one listing per
+    channel actually give the same alternating reference as before.
 
     Clears both channels' volatile arb memory first: DATA:ARBitrary errors
     if an arb name already exists, and upload_waveform() doesn't check for
@@ -301,6 +317,19 @@ def setup_awg_sequences(awg, mw_us, n_reps, laser_us, pre_us, post_us,
     without it, both channels sit forever at their anchor outputting
     nothing.
     """
+    # Stop whatever sequence is currently playing before clearing/
+    # reuploading arb memory. Previously relied on DATA:VOL:CLE alone to
+    # safely replace an actively-playing arb -- worked in practice, but
+    # with anchor_free_reps now often long enough that a point's sequence
+    # is still mid-cycle (not idled back at its anchor) when we move to
+    # the next point (see notes.md), abort first so the old sequence is
+    # actually stopped rather than implicitly cut off by the clear.
+    awg.write("ABOR")
+    # NOTE: forcing TRIG1/2:SOUR through an IMM->EXT transition here (on
+    # the theory that *RST's benefit was incidentally flushing a stale
+    # trigger edge via that transition) was tried and DID NOT fix it --
+    # rabi_new20_test still hit the same ~1.3-1.5e-4 rail at 2 of 6 points
+    # with the toggle in place. That theory is falsified; see notes.md.
     awg.write("SOUR1:DATA:VOL:CLE")
     awg.write("SOUR2:DATA:VOL:CLE")
 
@@ -326,45 +355,60 @@ def setup_awg_sequences(awg, mw_us, n_reps, laser_us, pre_us, post_us,
             "two channels' blocks will drift out of step"
         )
         anchor_ch1 = _const(ANCHOR_SAMPLES, 0.0)
-        awg.upload_waveform(ch1_rep, arb_name="rep", ch=1, sample_rate=sample_rate_hz)
         awg.upload_waveform(anchor_ch1, arb_name="anchor", ch=1, sample_rate=sample_rate_hz)
 
-        # CH1 keeps its own onceWaitTrig anchor and wraps through it at
-        # the SAME anchor_free_reps cadence as CH2 below -- both channels
-        # MUST wrap together, or they drift out of relative alignment
-        # (confirmed on real hardware: applying anchor_free_reps to CH2
-        # only, while CH1 either kept wrapping every single cycle or was
-        # decoupled from the trigger entirely, visibly misaligned CH1
-        # against the Sync/marker output on a scope). See notes.md's
+        # ONE combined arb covering a full 2*n_reps-rep cycle (CH1 never
+        # distinguishes on/off, so it's just 2*n_reps copies of the same
+        # "rep" content back to back), listed ONCE with repeat_count=
+        # anchor_free_reps -- a single table entry regardless of how large
+        # anchor_free_reps is, unlike the old two-separate-n_reps-listing-
+        # pair-repeated-anchor_free_reps-times approach (2*anchor_free_reps
+        # entries, which hit a real ~250-listing AWG ceiling on real
+        # hardware). Confirmed working on real hardware up to n_reps=500
+        # via tests/rabi_combined_arb_marker_test.ipynb. See notes.md's
         # "spurious off-resonance/no-MW-near-sample signal" entry.
-        ch1_pair = [
-            ["rep", str(n_reps), "repeat", "maintain", 10],
-            ["rep", str(n_reps), "repeat", "maintain", 10],
-        ]
+        ch1_combined = np.concatenate([ch1_rep] * (2 * n_reps))
+        awg.upload_waveform(ch1_combined, arb_name="ch1_combined", ch=1, sample_rate=sample_rate_hz)
+
         block1 = build_block_descriptor(sequence_name_ch1, [
             ["anchor", "1", "onceWaitTrig", "maintain", 10],
-            *(seg for _ in range(anchor_free_reps) for seg in ch1_pair),
+            ["ch1_combined", str(anchor_free_reps), "repeat", "maintain", 10],
         ])
         awg.write(f"DATA:SEQ {block1}")  # unprefixed -> channel 1
 
     anchor_ch2 = _const(ANCHOR_SAMPLES, -1.0)
-    awg.upload_waveform(gate_on_rep, arb_name="gate_on_rep", ch=2, sample_rate=sample_rate_hz)
-    awg.upload_waveform(gate_off_rep, arb_name="gate_off_rep", ch=2, sample_rate=sample_rate_hz)
     awg.upload_waveform(anchor_ch2, arb_name="anchor", ch=2, sample_rate=sample_rate_hz)
 
-    # ch2_hold_constant: reference "on" segment's arb data with the SAME
-    # constant, physically-off "gate_off_rep" used by the "off" segment --
-    # CH2's real output voltage never changes -- while keeping its marker
-    # flag as "highAtStart", so the lock-in's reference still toggles
-    # exactly as it does normally.
-    on_segment_arb = "gate_off_rep" if ch2_hold_constant else "gate_on_rep"
-    off_on_pair = [
-        ["gate_off_rep", str(n_reps), "repeat", "lowAtStart", 10],
-        [on_segment_arb, str(n_reps), "repeat", "highAtStart", 10],
-    ]
+    # ch2_hold_constant: use gate_off_rep's content for BOTH halves of the
+    # combined arb -- CH2's real analog output never changes -- while the
+    # marker still toggles via highAtStartGoLow at the same marker_point,
+    # so the lock-in's reference is unaffected.
+    #
+    # ONE combined arb per cycle: on-content (n_reps copies) followed by
+    # off-content (n_reps copies), marked "highAtStartGoLow" -- per the
+    # Keysight manual, this asserts the marker high at the start of the
+    # segment and negates it low at <marker point> (a sample index into
+    # the arb, required to be in [4, N-3]). Confirmed on real hardware
+    # (tests/rabi_combined_arb_marker_test.ipynb) that this re-fires on
+    # EVERY repeat of the segment (not just once across the whole
+    # anchor_free_reps-repeat block), giving the exact same alternating
+    # low/high reference as the old two-listing "lowAtStart"/"highAtStart"
+    # pair, but as ONE table entry regardless of anchor_free_reps --
+    # confirmed working up to n_reps=500 real hardware.
+    on_content = gate_off_rep if ch2_hold_constant else gate_on_rep
+    ch2_combined = np.concatenate([on_content] * n_reps + [gate_off_rep] * n_reps)
+    marker_point = len(on_content) * n_reps
+    assert 4 <= marker_point <= len(ch2_combined) - 3, (
+        f"marker_point={marker_point} outside the manual's required "
+        f"[4, {len(ch2_combined) - 3}] range for a {len(ch2_combined)}-"
+        f"sample arb -- shouldn't happen at any realistic n_reps/mw_us, "
+        f"but check if it does"
+    )
+    awg.upload_waveform(ch2_combined, arb_name="ch2_combined", ch=2, sample_rate=sample_rate_hz)
+
     block2 = build_block_descriptor(sequence_name_ch2, [
         ["anchor", "1", "onceWaitTrig", "lowAtStart", 10],
-        *(seg for _ in range(anchor_free_reps) for seg in off_on_pair),
+        ["ch2_combined", str(anchor_free_reps), "repeat", "highAtStartGoLow", str(marker_point)],
     ])
     awg.write(f"SOUR2:DATA:SEQ {block2}")
 
@@ -390,14 +434,13 @@ def setup_awg_sequences(awg, mw_us, n_reps, laser_us, pre_us, post_us,
                                               # real hardware that it doesn't
                                               # actually update the channel's
                                               # real amplitude register here
-        if not ch2_hold_constant:
-            awg.write("TRIG1:SOUR EXT")
-            awg.write("TRIG1:SLOP POS")
-            awg.write("TRIG1:LEV 1.5")
-        # else: ch2_hold_constant's CH1 sequence has no onceWaitTrig
-        # segment at all (see above), so it's never trigger-gated -- these
-        # writes would be meaningless (TRIG:SOURce only applies to a
-        # trigger-gated segment).
+        # CH1's sequence always has a onceWaitTrig anchor now (unified
+        # anchor_free_reps applies to both channels regardless of
+        # ch2_hold_constant -- see setup_awg_sequences()'s docstring), so
+        # it always needs a real trigger source configured.
+        awg.write("TRIG1:SOUR EXT")
+        awg.write("TRIG1:SLOP POS")
+        awg.write("TRIG1:LEV 1.5")
     awg.write("OUTPUT1 ON")
 
     # CH2: MW gate -> ZYSWA switch control.
@@ -413,6 +456,20 @@ def setup_awg_sequences(awg, mw_us, n_reps, laser_us, pre_us, post_us,
     awg.write("OUTPUT2 ON")
 
     awg.write("OUTPut:SYNC:SOURce CH2")
+
+    # Next candidate for what *RST does that ABOR doesn't (the IMM->EXT
+    # trigger-source toggle tried before this was falsified on real
+    # hardware -- rabi_new20_test still spiked -- see notes.md).
+    # FUNCtion:ARBitrary:SYNChronize resets/aligns the start phase of the
+    # currently-selected arb on a channel (normally used after changing
+    # sample rate/frequency to re-align coupled channels) -- a real,
+    # documented resync primitive, unlike the trigger-source guess. Placed
+    # here, after both channels' sequences are freshly selected and armed,
+    # to force each point's freshly-loaded sequence to start from a known
+    # phase before it ever sees a trigger edge. Not yet confirmed on real
+    # hardware.
+    awg.write("SOUR1:FUNC:ARB:SYNC")
+    awg.write("SOUR2:FUNC:ARB:SYNC")
 
 
 def _configure_external_trigger(sdg, ref_period_s, margin=100):
@@ -460,6 +517,22 @@ def setup_lock_in(lia, time_constant_s, sensitivity_v, phase_deg, input_coupling
     if not auto_sensitivity:
         lia.set_sensitivity_v(sensitivity_v)
     lia.set_filter_slope_db_oct(24)
+    # Nothing here ever calls lia.reset() (*RST) at connect time, so any
+    # OEXP (offset/expand) left over from a previous session -- another
+    # script, a manual front-panel adjustment -- silently persists and
+    # shrinks the SR830's usable output range, making a nuisance "output
+    # overload" LIAS trip far easier from an otherwise harmless transient
+    # (see notes.md -- caught a real output_overload=True, input_overload=
+    # False spike this way, with no real input signal condition to explain
+    # it). Force a known-clean 0%/1x state on X and Y explicitly rather
+    # than assuming factory defaults, and log whatever was there before in
+    # case it turns out to matter for that investigation.
+    for channel, name in [(1, "X"), (2, "Y")]:
+        offset_percent, expand = lia.get_offset_expand(channel)
+        if offset_percent != 0.0 or expand != 1:
+            print(f"[rabi] setup_lock_in: {name} had offset={offset_percent}%, "
+                  f"expand={expand}x from a previous session -- resetting to 0%/1x")
+        lia.set_offset_expand(channel, 0.0, expand=1)
 
 
 def _step_sensitivity_coarser(lia):
@@ -538,7 +611,8 @@ def cmd_run(file_name, **kw):
     underload_margin, underload_persistence, fixed_sensitivity,
     psu_voltage_v,
     psu_current_limit_a, coil_current_a, coil_voltage_margin,
-    interlock_check_interval, interlock_hold_periods, ch1_vpp, ch2_vpp,
+    interlock_check_interval, interlock_hold_periods, interlock_during_sweep,
+    resequence_interval, extra_settle_s, ch1_vpp, ch2_vpp,
     ch2_offset_v, trigger_margin, anchor_free_reps, fixed_external_trigger,
     reflected_power_scan, res_span_hz, coarse_step_hz, fine_span_hz,
     fine_step_hz, res_power_dbm, res_cal_dir, fine_sweep -- see the
@@ -641,6 +715,40 @@ def cmd_run(file_name, **kw):
     coil_voltage_margin = float(kw.get("coil_voltage_margin", 1.5))
     interlock_check_interval = int(kw.get("interlock_check_interval", 5))
     interlock_hold_periods = float(kw.get("interlock_hold_periods", 3.0))
+    # The PERIODIC per-point check below (not the pre-flight coarse/fine
+    # scan + operating-point check before the sweep starts, which always
+    # runs regardless of this flag) turned out to be a real source of the
+    # background-artifact spikes: its ~1s GPIB round trip to the HP8673H
+    # is comparable to anchor_period_s, so it races with the AWG's own
+    # anchor-wrap timing (see notes.md). ABOR-ing after every check
+    # (added to remove that race) did NOT fully eliminate the spikes on
+    # real hardware, so this lets the periodic check be skipped entirely
+    # during the sweep as a further isolation step -- MW is still being
+    # driven at whatever power was validated at the pre-flight check, just
+    # without periodic re-verification while sweeping tau_mw. Use with
+    # care: no periodic reflected-power protection while this is false.
+    interlock_during_sweep = str(kw.get("interlock_during_sweep", "true")).lower() == "true"
+    # Overrides the module-level RESEQUENCE_INTERVAL default for this run.
+    # Bucketing rabi_new14/15/16/17 by distance from the nearest awg.reset()
+    # showed points right after a reset are clean (0% hitting the ~1.5e-4
+    # rail) while points 1-3 after it get progressively worse (15%/25%/26%)
+    # -- ABOR alone (used every other point in setup_awg_sequences()) isn't
+    # fully flushing whatever *RST does. Set to 1 to reset every point as a
+    # direct test of that theory (slow -- full *RST every point -- but a
+    # clean pass/fail check before looking for a cheaper fix). See
+    # notes.md.
+    resequence_interval = int(kw.get("resequence_interval", RESEQUENCE_INTERVAL))
+    # Extra fixed wait added right after setup_awg_sequences() (the ABOR/
+    # clear/reupload/FUNC:ARB:SYNC/re-arm), before settle_s's own countdown
+    # starts. Validated in debug_repeat_one_point.py's with-reupload mode:
+    # 1.0s here eliminated the rare, large (~1.5e-4 V) output_overload rail
+    # spikes across several iterations at a normal every-point-reupload
+    # cadence -- the everyday few-uV bump was already shown to settle out
+    # within one normal settle_s window (no-reupload mode), but the bigger
+    # rail spikes evidently needed more margin specifically right after
+    # the reconfigure event itself. 0 by default (no behavior change) --
+    # see notes.md for the full investigation.
+    extra_settle_s = float(kw.get("extra_settle_s", 0.0))
     ch1_vpp = float(kw.get("ch1_vpp", 0.632))
     ch2_vpp = float(kw.get("ch2_vpp", 5.0))
     ch2_offset_v = float(kw.get("ch2_offset_v", 2.5))
@@ -653,15 +761,29 @@ def cmd_run(file_name, **kw):
     # dead time is a tiny fraction of the much longer period -- a modest
     # margin is "just enough" without needlessly fast triggering.
     trigger_margin = float(kw.get("trigger_margin", 3.0))
-    # Real-hardware testing (tests/rabi_anchor_free_reps_test.ipynb) found
-    # ~250 off+on-pair listings is close to this AWG's actual sequence-
-    # table capacity (consistent with the ~512-sequence-steps-per-channel
-    # spec estimated for this series: 512 - 1 anchor, /2 per pair ~= 255).
-    # 200 leaves a bit of headroom below that observed ceiling rather than
-    # running right up against it. See setup_awg_sequences()'s docstring
-    # and notes.md's "spurious off-resonance/no-MW-near-sample signal"
-    # entry for the full history/reasoning.
-    anchor_free_reps = int(kw.get("anchor_free_reps", 200))
+    # Since the combined-arb rewrite, anchor_free_reps is a free repeat
+    # count (one table entry regardless of size), so it's no longer bound
+    # by the old ~250-listing sequence-table ceiling -- it's tuned instead
+    # against covering the FULL dwell before a point's read, which is now
+    # extra_settle_s + settle_s (not just settle_s) since extra_settle_s
+    # adds a wait BEFORE settle_s's own countdown starts. rabi_new11_fix_
+    # anchor (n_reps=250, tau_mw 0.02-3.02 us) found the old default of
+    # 200 gave an anchor period (0.40-0.70 s) SHORTER than settle_s alone
+    # (0.9 s, dominated by settle_time_constants*time_constant_s),
+    # guaranteeing at least one anchor-wrap glitch inside every point's
+    # window. 500 covered settle_s alone comfortably, but with extra_
+    # settle_s=1.0 (validated in debug_repeat_one_point.py -- see
+    # notes.md), the total dwell is up to ~1.9 s, which at the shortest
+    # tau_mw needs anchor_free_reps > ~945 to still cover it -- 1000
+    # confirmed fine on real hardware up to that value in tests/
+    # rabi_combined_arb_marker_test.ipynb. If you raise extra_settle_s
+    # further, raise this too so anchor_period_s (= ref_period_s *
+    # anchor_free_reps) still comfortably exceeds extra_settle_s +
+    # settle_s at your sweep's SHORTEST tau_mw -- otherwise the sequence
+    # can wrap and need an uncontrolled retrigger mid-window again, the
+    # exact problem this parameter exists to avoid. See notes.md's
+    # "spurious off-resonance/no-MW-near-sample signal" entry.
+    anchor_free_reps = int(kw.get("anchor_free_reps", 1000))
     # Fixes the SDG1062X trigger at a single rate for the WHOLE sweep
     # (derived from mw_start_us, the sweep's shortest rep and therefore
     # its largest bare-minimum trigger requirement -- comfortably fast
@@ -829,16 +951,26 @@ def cmd_run(file_name, **kw):
             x_values = np.full(len(mw_values_us), np.nan)
             y_values = np.full(len(mw_values_us), np.nan)
             reflected_dbm_arr = np.full(len(mw_values_us), np.nan)
+            # Diagnostic for the "spikes persist even with the SR830 input
+            # terminated" finding (see notes.md) -- rules out the signal
+            # path (PMT, cable, ground loops) entirely, pointing at the
+            # reference path or something internal to the SR830 instead.
+            # Logging FREQ? (the SR830's own measured reference frequency)
+            # alongside X/Y lets us check directly whether a spike
+            # coincides with an anomalous reference reading, rather than
+            # needing a scope on the Sync line.
+            ref_freq_hz_arr = np.full(len(mw_values_us), np.nan)
+            reference_unlock_arr = np.zeros(len(mw_values_us), dtype=bool)
             n_completed = 0
             tripped = False
             underload_streak = 0
 
             try:
                 for i, mw_us in enumerate(mw_values_us):
-                    if i > 0 and i % RESEQUENCE_INTERVAL == 0:
+                    if i > 0 and i % resequence_interval == 0:
                         print(f"[rabi] point {i + 1}/{len(mw_values_us)}: resetting AWG "
                               f"to clear its sequence table (every "
-                              f"{RESEQUENCE_INTERVAL} points)")
+                              f"{resequence_interval} points)")
                         awg.reset()
                         awg.write("SOUR1:DATA:VOL:CLE")
                         awg.write("SOUR2:DATA:VOL:CLE")
@@ -872,6 +1004,8 @@ def cmd_run(file_name, **kw):
                         ch1_vpp=ch1_vpp, ch2_vpp=ch2_vpp, ch2_offset_v=ch2_offset_v,
                         anchor_free_reps=anchor_free_reps,
                     )
+                    if extra_settle_s > 0:
+                        time.sleep(extra_settle_s)
 
                     # Clears anything latched from BEFORE this point's own
                     # settle window even starts (e.g. left over from the
@@ -897,11 +1031,29 @@ def cmd_run(file_name, **kw):
                               f"{actual_sensitivity_v:.3e} V full scale")
                         sensitivity_v = actual_sensitivity_v
 
-                    if i % interlock_check_interval == 0:
+                    if interlock_during_sweep and i % interlock_check_interval == 0:
                         hold_s = interlock_hold_periods * ref_period_s
+                        anchor_period_s_for_check = ref_period_s * anchor_free_reps
+                        check_start_s = time.monotonic()
                         power_dbm = HP8673H.read_max_hold_reflected_power_dbm(
                             ilock_sa, freq_hz, hold_s)
+                        check_elapsed_s = time.monotonic() - check_start_s
                         reflected_dbm_arr[i] = power_dbm if power_dbm is not None else np.nan
+
+                        # Diagnostic for the "spikes near interlock checks"
+                        # investigation (see notes.md): if this GPIB round
+                        # trip takes longer than anchor_period_s, the AWG's
+                        # current anchor_free_reps-repeat run has already
+                        # finished and wrapped back to its onceWaitTrig
+                        # anchor by the time settle_s starts below -- a
+                        # fresh, uncontrolled trigger-wait dead time then
+                        # lands inside the settle window instead of settle_s
+                        # overlapping an already-steady, mid-run signal.
+                        print(f"[rabi] interlock check timing (point {i + 1}/"
+                              f"{len(mw_values_us)}): took {check_elapsed_s:.3f} s "
+                              f"(nominal hold_s={hold_s:.3f} s) vs. this point's "
+                              f"anchor_period_s={anchor_period_s_for_check:.3f} s -- "
+                              f"{'EXCEEDS anchor period, AWG likely re-idled' if check_elapsed_s > anchor_period_s_for_check else 'within anchor period'}")
 
                         if power_dbm is not None:
                             print(f"[rabi] interlock check (point {i + 1}/"
@@ -922,14 +1074,53 @@ def cmd_run(file_name, **kw):
                             tripped = True
                             break
 
+                        # The GPIB round trip above takes a real, variable
+                        # amount of time (confirmed ~1s on real hardware --
+                        # comparable to anchor_period_s itself), so whether
+                        # this point's sequence is still mid-run or has
+                        # already wrapped back to its onceWaitTrig anchor by
+                        # now is a race, not a known state -- sometimes
+                        # settle_s below overlaps already-steady signal,
+                        # sometimes it needs a fresh, uncontrolled retrigger
+                        # partway through. ABOR forces the latter every time
+                        # instead of leaving it to chance: the sequence data
+                        # is untouched (no reupload needed), just stopped, so
+                        # the very next external trigger edge restarts it
+                        # from its anchor -- a single, bounded (<= one
+                        # trigger period) dead time right at the start of
+                        # settle_s, which the transient-discard wait below is
+                        # already designed to absorb.
+                        awg.write("ABOR")
+
                     _wait_settle_discarding_transient_overload(lia, settle_s)
 
                     x, y = lia.read_xy()
+                    ref_freq_hz = lia.get_frequency_hz()
+                    ref_freq_hz_arr[i] = ref_freq_hz
+                    expected_ref_freq_hz = 1.0 / ref_period_s
+                    # Read unconditionally (not just when auto_rescale_on_
+                    # overload is set -- fixed_sensitivity=true disables
+                    # that, which would otherwise skip this entirely) so
+                    # reference_unlock is always checked, per the
+                    # "background artifact isn't on the signal path"
+                    # investigation in notes.md. Reused below as the first
+                    # rescale-loop iteration's status instead of querying
+                    # LIAS? again immediately after (it latches until read).
+                    initial_status = lia.read_overload_status()
+                    reference_unlock_arr[i] = initial_status["reference_unlock"]
+                    print(f"[rabi] point {i + 1}/{len(mw_values_us)}: SR830 reference "
+                          f"reads {ref_freq_hz:.6f} Hz (expected {expected_ref_freq_hz:.6f} Hz), "
+                          f"reference_unlock={initial_status['reference_unlock']}, "
+                          f"input_overload={initial_status['input']}, "
+                          f"filter_overload={initial_status['filter']}, "
+                          f"output_overload={initial_status['output']}")
 
                     overloaded_this_point = False
                     if auto_rescale_on_overload:
+                        overload_status = initial_status
                         for attempt in range(max_rescale_attempts):
-                            overload_status = lia.read_overload_status()
+                            if attempt > 0:
+                                overload_status = lia.read_overload_status()
                             if not overload_status["any"]:
                                 break
                             overloaded_this_point = True
@@ -1001,11 +1192,15 @@ def cmd_run(file_name, **kw):
             x_values = x_values[:n_completed]
             y_values = y_values[:n_completed]
             reflected_dbm_arr = reflected_dbm_arr[:n_completed]
+            ref_freq_hz_arr = ref_freq_hz_arr[:n_completed]
+            reference_unlock_arr = reference_unlock_arr[:n_completed]
 
             if n_completed == 0:
                 print("[rabi] step 3/3 FAILED: no points completed -- nothing to save")
             else:
                 np.save(f"{run_path}/{file_name}_rabi_mw_us.npy", mw_values_us_trimmed)
+                np.save(f"{run_path}/{file_name}_rabi_ref_freq_hz.npy", ref_freq_hz_arr)
+                np.save(f"{run_path}/{file_name}_rabi_reference_unlock.npy", reference_unlock_arr)
                 np.save(f"{run_path}/{file_name}_rabi_x.npy", x_values)
                 np.save(f"{run_path}/{file_name}_rabi_y.npy", y_values)
                 np.save(f"{run_path}/{file_name}_rabi_reflected_dbm.npy", reflected_dbm_arr)
@@ -1025,7 +1220,8 @@ def cmd_run(file_name, **kw):
                       f"{' (PARTIAL -- interlock tripped)' if tripped else ''}: "
                       f"saved {run_path}/{file_name}_rabi_mw_us.npy "
                       f"({n_completed} points), _rabi_x.npy, _rabi_y.npy, "
-                      f"_rabi_reflected_dbm.npy, _rabi_metadata.txt")
+                      f"_rabi_reflected_dbm.npy, _rabi_ref_freq_hz.npy, "
+                      f"_rabi_reference_unlock.npy, _rabi_metadata.txt")
         finally:
             print("[rabi] shutting down")
             try:
@@ -1140,7 +1336,7 @@ def cmd_run_ch2_constant(file_name, **kw):
     disconnect them yourself before running this too) and additionally
     holds CH2's own ANALOG output constant (physically off, never
     switching) via setup_awg_sequences(ch2_hold_constant=True), while the
-    marker/reference it derives from (highAtStart/lowAtStart, routed to
+    marker/reference it derives from ("highAtStartGoLow", routed to
     the lock-in via OUTPut:SYNC:SOURce CH2) still toggles exactly as
     normal -- see that function's docstring for exactly what changes.
 
@@ -1190,17 +1386,19 @@ def cmd_run_ch2_constant(file_name, **kw):
     its own analog LEVEL matches gate_off_rep's anyway (unlike CH1's
     former anchor, this one isn't visibly "wrong" -- the concern is the
     trigger-wait DEAD TIME delaying exactly when each off/on cycle
-    starts). anchor_free_reps lists that many off+on cycles in the table
-    before needing to wrap back through the anchor, so the trigger-wait
-    glitch recurs only once every anchor_free_reps cycles instead of
-    every cycle -- diluting its contribution to whatever gets averaged
-    over settle_s, cheaply (each listing just references the same
-    already-uploaded arb data, no new waveform memory). Set
+    starts). anchor_free_reps sets the repeat_count on CH2's ONE combined
+    arb listing, so the trigger-wait glitch recurs only once every
+    anchor_free_reps cycles instead of every cycle -- diluting its
+    contribution to whatever gets averaged over settle_s. Set
     anchor_free_reps=1 to restore the original every-cycle behavior.
-    anchor_free_reps applies to CH1 too (via setup_awg_sequences(), which
-    keeps both channels wrapping through their anchors together) --
-    confirmed on real hardware that applying it to CH2 alone visibly
-    misaligns CH1 against the Sync/marker output over time.
+    Applies to CH1 too (via setup_awg_sequences(), which keeps both
+    channels wrapping through their anchors together) -- confirmed on
+    real hardware that applying it to CH2 alone visibly misaligns CH1
+    against the Sync/marker output over time. This default of 20 predates
+    the combined-arb fix that removed the old ~250-listing sequence-table
+    ceiling (see setup_awg_sequences()'s docstring) -- there's no longer
+    a structural reason to keep it this low, it just hasn't been revisited
+    since.
 
     Same key=value overrides as cmd_run_no_mw() (see its docstring) --
     this is a thin wrapper that also sets ch2_hold_constant=True and
@@ -1298,6 +1496,10 @@ def _run_no_mw_impl(file_name, ch2_hold_constant, ch1_hold_constant=False,
     ch2_offset_v = float(kw.get("ch2_offset_v", 2.5))
     trigger_margin = float(kw.get("trigger_margin", 100))
     anchor_free_reps = int(kw.get("anchor_free_reps", 1))
+    # See cmd_run()'s resequence_interval comment.
+    resequence_interval = int(kw.get("resequence_interval", RESEQUENCE_INTERVAL))
+    # See cmd_run()'s extra_settle_s comment.
+    extra_settle_s = float(kw.get("extra_settle_s", 0.0))
 
     mw_values_us = np.arange(mw_start_us, mw_stop_us + mw_step_us / 2, mw_step_us)
 
@@ -1358,10 +1560,10 @@ def _run_no_mw_impl(file_name, ch2_hold_constant, ch1_hold_constant=False,
 
             try:
                 for i, mw_us in enumerate(mw_values_us):
-                    if i > 0 and i % RESEQUENCE_INTERVAL == 0:
+                    if i > 0 and i % resequence_interval == 0:
                         print(f"[rabi] point {i + 1}/{len(mw_values_us)}: resetting AWG "
                               f"to clear its sequence table (every "
-                              f"{RESEQUENCE_INTERVAL} points)")
+                              f"{resequence_interval} points)")
                         awg.reset()
                         awg.write("SOUR1:DATA:VOL:CLE")
                         awg.write("SOUR2:DATA:VOL:CLE")
@@ -1383,6 +1585,8 @@ def _run_no_mw_impl(file_name, ch2_hold_constant, ch1_hold_constant=False,
                         ch1_hold_constant=ch1_hold_constant,
                         anchor_free_reps=anchor_free_reps,
                     )
+                    if extra_settle_s > 0:
+                        time.sleep(extra_settle_s)
 
                     lia.read_overload_status()
 

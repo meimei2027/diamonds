@@ -133,6 +133,22 @@ class SR830:
         fundamental). n * reference_freq_hz must stay <= 102 kHz."""
         self.write(f"HARM {n}")
 
+    def get_offset_expand(self, channel):
+        """channel: 1=X, 2=Y, 3=R. Returns (offset_percent, expand) where
+        expand is 1, 10, or 100. A nonzero offset or >1x expand shrinks the
+        SR830's usable output range, making a nuisance "output overload"
+        LIAS bit trip much easier from an otherwise harmless transient,
+        with no relation to the actual input signal -- worth checking for
+        stale settings left over from a previous session/experiment before
+        chasing a real-signal explanation for an output overload."""
+        offset_str, expand_code_str = self.query(f"OEXP? {channel}").split(",")
+        return float(offset_str), [1, 10, 100][int(expand_code_str)]
+
+    def set_offset_expand(self, channel, offset_percent, expand=1):
+        """channel: 1=X, 2=Y, 3=R. expand must be 1, 10, or 100."""
+        expand_code = [1, 10, 100].index(expand)
+        self.write(f"OEXP {channel},{offset_percent},{expand_code}")
+
     def set_sine_output_vrms(self, vrms):
         """Internal reference's sine output amplitude, 0.004-5.000 Vrms."""
         self.write(f"SLVL {vrms}")
@@ -237,23 +253,31 @@ class SR830:
         Query the LIA status byte (LIAS?) and decode the overload bits, per
         the SR830 manual's status byte definition: bit 0 = input/reserve
         overload, bit 1 = filter (time constant) overload, bit 2 = output
-        (X/Y/R) overload. NOT YET VERIFIED against the front-panel OVLD LED
-        on this specific unit -- cross-check once on real hardware (force
-        an overload deliberately, e.g. with sensitivity set far too
-        sensitive for the current signal, and confirm this matches the LED)
-        before trusting it unattended for anything safety-critical.
+        (X/Y/R) overload, bit 3 = reference unlock. NOT YET VERIFIED against
+        the front-panel OVLD/UNLOCK LEDs on this specific unit -- cross-
+        check once on real hardware (force an overload deliberately, e.g.
+        with sensitivity set far too sensitive for the current signal, and
+        confirm this matches the LED) before trusting it unattended for
+        anything safety-critical.
 
         Returns a dict: {"input": bool, "filter": bool, "output": bool,
-        "any": bool} -- "any" is True if any of the three bits are set.
+        "reference_unlock": bool, "any": bool} -- "any" covers only the
+        three OVERLOAD bits (0-2), not reference_unlock -- kept separate
+        since it's a different condition (nothing currently rescales
+        sensitivity in response to it) and callers that gate overload-
+        rescue logic on "any" shouldn't have that logic triggered by an
+        unlock event.
         """
         status = int(self.query("LIAS?"))
         input_overload = bool(status & 0x01)
         filter_overload = bool(status & 0x02)
         output_overload = bool(status & 0x04)
+        reference_unlock = bool(status & 0x08)
         return {
             "input": input_overload,
             "filter": filter_overload,
             "output": output_overload,
+            "reference_unlock": reference_unlock,
             "any": input_overload or filter_overload or output_overload,
         }
 
