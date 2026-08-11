@@ -51,3 +51,14 @@ don't forget ref for lockin comes from ch2, not sync
 
 
 python rabi.py run rabi_new4_fix_trigger threshold_dbm=-5 freq_hz=2.844e9 mw_start_us=0.02 mw_stop_us=1 mw_step_us=0.01 fine_sweep=false
+
+
+python rabi.py run-repeat measurement14 n_repeats=5 freq_hz=2.842e9 threshold_dbm=-5 use_resonance_freq=true coil_scan_start_a=1.0 coil_scan_stop_a=4.0 coil_scan_step_a=0.1 coil_scan_tau_mw_us=0.5 coil_scan_n_repeats=20 fixed_sensitivity=true sensitivity_v=1e-4 mw_start_us=0.005 mw_stop_us=1 mw_step_us=0.05 extra_settle_s=1
+[rabi] repeat 1/5: running measurement14_repeat0 (saved into measurement14/)
+
+
+python rabi.py run-repeat measurement17 laser_us=5 constant_shot_period=true pad_min_us=0.1 n_repeats=5 freq_hz=2.842e9 threshold_dbm=-5 use_resonance_freq=true coil_scan_start_a=1.0 coil_scan_stop_a=5.0 coil_scan_step_a=0.1 coil_scan_tau_mw_us=0.5 coil_scan_n_repeats=5 mw_start_us=0.005 mw_stop_us=0.5 mw_step_us=0.01 extra_settle_s=1
+
+
+
+python pulsed_odmr.py run pulsed4 extra_settle_s=1 threshold_dbm=-5 freq_step_hz=100e3 laser_us=5 use_resonance_sweep=false start_hz=2.83e9 stop_hz=2.85e9 anchor_free_reps=80000 coil_current_a=2.5 tau_mw_us=2

@@ -2660,3 +2660,385 @@ being verified against before building the real sweep into `rabi.py`.
   hardware -- worth re-calibrating phase with this fixed version before
   trusting any `phase_deg` obtained from the OLD version, since it may
   have been silently affected by the anchor_free_reps=1 issue.
+
+  **Follow-up bug found on real hardware**: `WARNING: reference unlock or
+  overload flagged right at the auto-phase reading` persisted
+  (`reference_unlock=True, output_overload=True`) even at
+  `anchor_free_reps=3000` -- well above the margin the anchor-wrap math
+  requires (`anchor_period_s` came out to ~7.5x the settle window, vs.
+  ~2.5x margin already considered fine at the `anchor_free_reps=1000`
+  default). Anchor-wrap timing wasn't actually the problem this time.
+  Root cause: unlike `cmd_run()`'s per-point loop (which calls `lia.
+  read_overload_status()` right after `setup_awg_sequences()`/`extra_
+  settle_s`, specifically to discard the transient reference-unlock/
+  overload latch caused by the reconfigure itself -- see the
+  `anchor_free_reps` entry above), `cmd_calibrate_phase()` went straight
+  from `setup_awg_sequences()` into the `settle_s` sleep with no such
+  discard read. `setup_awg_sequences()`'s own `ABOR`+clear+reupload
+  momentarily stops CH2's marker output, which the SR830 reads as a
+  reference dropout and LATCHES `reference_unlock` (and often an
+  `output_overload` from the resulting glitch) until the status is next
+  read -- with no discard read here, that stale latch survives the
+  entire settle/auto-gain/auto-phase sequence and gets misreported by the
+  final diagnostic as if it happened during the actual auto-phase
+  measurement, even though the reference had already relocked well before
+  then. **Fixed**: added the same discard `lia.read_overload_status()`
+  call right after `setup_awg_sequences()`/`extra_settle_s`, before the
+  `settle_s` sleep, matching `cmd_run()`'s pattern exactly. Not yet
+  re-run on real hardware to confirm the warning clears.
+
+  **Confirmed on real hardware, and a second distinct bug found underneath
+  it.** Added per-stage diagnostic prints (reconfigure/discard, after 1st
+  settle, after auto_gain, after auto_phase) to localize exactly where a
+  persisting warning was coming from at `anchor_free_reps=3000, mw_us=0.5,
+  coil_current_a=5.0`. Result: `reference_unlock` DID clear after the
+  discard read (confirming the fix above works) and stayed `False` for
+  the rest of the run -- but `output_overload` flipped `False` -> `True`
+  right after `auto_gain()` and never cleared. Two separate conditions
+  had been getting reported as one ambiguous warning the whole time
+  (`if reference_unlock or any_overload`), which is why re-running with a
+  bigger `anchor_free_reps` (correctly fixing the unlock half) looked like
+  it did nothing.
+
+  Root cause of the overload half: SR830's `AGAN` (auto-gain) only steps
+  sensitivity ONE range per call (per the manual) -- `cmd_run()`'s
+  per-point loop already accounts for this with a `_step_sensitivity_
+  coarser()` rescale-retry loop after its own single `auto_gain()` call,
+  but `cmd_calibrate_phase()` never had one, just a single `auto_gain()` +
+  settle with no fallback. `mw_us`/`coil_current_a` picked to maximize
+  Rabi contrast for a good auto-phase reading (per this function's own
+  docstring) are exactly the conditions most likely to overshoot a single
+  AGAN step. **Fixed**: added the same `_step_sensitivity_coarser()` +
+  settle + re-check retry loop (`max_rescale_attempts=5`) right after
+  `auto_gain()`, before `auto_phase()`. Confirmed on real hardware: the
+  rescale loop correctly clears an `AGAN`-undershoot overload in one
+  attempt (`1e-4 V -> 2e-4 V`), and the resulting `phase_deg` reading is
+  reproducible (~-67 deg) across runs regardless.
+
+  **Third gap found in the same investigation**: even with both fixes
+  above, the FINAL diagnostic (after `auto_phase()` + settle) still
+  intermittently showed `output_overload=True` -- but the actual settled
+  X/Y values printed alongside it (`X=2.644410e-05 V, Y=-6.016380e-07 V`)
+  are tiny, nowhere near overloaded for any plausible sensitivity in use.
+  Root cause: `APHS` (auto-phase) steps the reference phase, which
+  transiently redistributes signal between X/Y while the filter catches
+  up -- the exact same category of transient as `setup_awg_sequences()`'s
+  reconfigure glitch and the SENS-range-switch glitch (both already
+  discarded elsewhere in this function), just one more un-discarded spot.
+  With no read between `auto_phase()` and the final check, that transient
+  survives the whole final `settle_s` sleep and gets misreported as if
+  the final, already-settled reading were overloaded. **Fixed**: added a
+  discard `lia.read_overload_status()` call right after `auto_phase()`,
+  before the final settle. Not yet re-run on real hardware to confirm
+  this closes out the warning for good -- if it recurs again, it's not a
+  transient-discard gap anymore and needs fresh diagnosis.
+
+  **It recurred, and the anchor-wrap theory is now ruled out.** Re-tested
+  with `anchor_free_reps` raised to `20000` (`anchor_period_s` ~45s,
+  comfortably longer than the whole calibration procedure could plausibly
+  take) -- the exact same "works once, fails once" alternating pattern
+  persisted at the SAME settings across consecutive runs. A >6x increase
+  in anchor margin not changing the failure rate at all means this isn't
+  a timing/latch bug anymore. Current best explanation: `calibrate-phase`
+  is deliberately run at the `mw_us`/`coil_current_a` that give the
+  STRONGEST signal (best Rabi contrast / coil-scan optimum, per this
+  function's own docstring), and the rescale-retry loop only backs off
+  enough to clear overload ONCE -- leaving the chosen sensitivity range
+  right at the edge, where ordinary real signal fluctuation (mechanical,
+  thermal, RF drift) can intermittently tip it back into overload on a
+  run-to-run basis. Supporting evidence: `phase_deg` has stayed consistent
+  across every run regardless of the warning (~-66 to -70 deg), i.e. the
+  auto-phase result itself isn't actually corrupted by this -- consistent
+  with "borderline range, occasionally trips" rather than "corrupted
+  reading." **Mitigated** (not a bug fix, a headroom tradeoff): added one
+  more deliberate `_step_sensitivity_coarser()` step after the rescale
+  loop clears, trading resolution for margin against exactly this. Not
+  yet confirmed on real hardware whether this actually reduces the
+  intermittent-overload rate, or whether it's simply an inherent property
+  of calibrating right at peak signal that occasional re-runs are the
+  practical answer to (the warning's own "consider re-running" guidance
+  may just be correct as originally written).
+
+  **The extra-margin mitigation overcorrected -- reverted.** Confirmed on
+  real hardware: the overload warning went away, but `phase_deg` then
+  swung wildly run-to-run (70 deg -> 40 deg) instead of the previously
+  reproducible ~-66 to -70 deg. `auto_phase()`'s null is `atan2(Y, X)` --
+  pushing the sensitivity too far below full scale put X/Y close enough
+  to the SR830's own noise floor that the null angle became noise-
+  dominated rather than signal-dominated, exactly the "needs a real,
+  reasonably strong signal" caveat already in this function's own
+  docstring. An intermittently-overloading-but-reproducible phase reading
+  was the better tradeoff. **Fixed**: reverted the extra deliberate
+  coarsening step. **Also added**: a signal-strength diagnostic (R as a
+  percentage of the active sensitivity's full scale, printed after
+  `auto_phase()`, warning if under 5%) -- overload only ever catches the
+  TOO-STRONG failure mode; there was nothing at all catching the TOO-WEAK
+  one, which is exactly what silently broke this. Not yet re-run on real
+  hardware to confirm `phase_deg` is reproducible again with the revert
+  in place.
+
+- **Coil current scan (`use_resonance_freq`'s coil-scan block) had no
+  overload protection at all -- signal confirmed saturating partway
+  through the scan on real hardware.** The scan sweeps a physical field
+  (`coil_scan_start_a` to `coil_scan_stop_a`), so unlike `tau_mw` in the
+  main sweep (a timing parameter that doesn't itself change signal
+  strength independent of contrast), signal strength genuinely varies --
+  often non-monotonically -- across the current range, and the
+  sensitivity chosen before the scan started can saturate partway
+  through. The main `tau_mw` sweep loop already had a per-point rescale-
+  retry loop for exactly this; the coil-scan block, added later, never
+  got one -- it just called `lia.read_xy()` directly per repeat with no
+  overload check. **Fixed**: added the same `auto_rescale_on_overload`/
+  `max_rescale_attempts`-gated rescale loop (`_step_sensitivity_coarser()`
+  + re-settle + re-check, reusing `cmd_run()`'s own settings for both)
+  right before each repeat's `read_xy()` inside the coil-scan's per-
+  current loop. Since X/Y are absolute-volt readings (not normalized to
+  the active sensitivity), a sensitivity change partway through the scan
+  doesn't bias the R comparison across currents as long as no point is
+  actually clipped -- only ever steps coarser (never finer) since the
+  scan is a monotonic increasing current sweep and saturation is expected
+  to occur going forward (higher current/signal), not backward. Not yet
+  confirmed on real hardware.
+
+- **Added the same coil current scan to `pulsed_odmr.py`.** Physics
+  reasoning (from the user): the resonance sweep (`use_resonance_sweep`,
+  `E4403B`-based, low power) finds `f0_hz` -- the MW delivery resonator's
+  OWN peak, an antenna/circuit property, not the NV's. `coil_current_a`
+  sets the static field and therefore the NV's Zeeman-shifted transition
+  frequency. Scanning coil current while driving AT `f0_hz` with the real
+  pulsed sequence and watching the lock-in signal finds the field that
+  brings the NV's actual transition into coincidence with the resonator's
+  peak -- maximizing the signal the subsequent frequency sweep (still
+  centered on `f0_hz`/`fwhm_hz`) then traces the lineshape around. Same
+  idea as `rabi.py`'s `use_resonance_freq` coil scan, but simpler here:
+  `pulsed_odmr.py` already fixes `tau_mw_us` and uploads the pulse
+  sequence ONCE in step 1 (unlike `rabi.py`, which sweeps `tau_mw` and
+  needed its own `coil_scan_tau_mw_us`) -- so the coil scan just reuses
+  `tau_mw_us` and the already-configured AWG/trigger directly, no
+  reconfigure needed. Inserted right after `f0_hz`/`fwhm_hz` are found
+  (before computing `start_hz`/`stop_hz`), gated on `use_resonance_sweep`
+  (same gating rabi.py uses for its coil scan, since it needs a resolved
+  peak frequency to drive at). New params: `coil_scan_start_a=1.0`,
+  `coil_scan_stop_a=4.0`, `coil_scan_step_a=0.5`,
+  `coil_scan_n_repeats=5`, `coil_scan_current_settle_s=2.0` (same
+  defaults as `rabi.py`'s). Includes the same per-current overload
+  rescale-retry loop as `rabi.py`'s coil scan (reusing `rabi.
+  _step_sensitivity_coarser()`/`auto_rescale_on_overload`/
+  `max_rescale_attempts`), since signal strength genuinely varies across
+  the current range and can saturate whatever sensitivity was picked
+  beforehand. `coil_current_a` is now also written to
+  `_pulsed_odmr_metadata.txt` (wasn't tracked there before). RF/gen is
+  left on at `f0_hz` after the scan -- harmless, since the frequency loop
+  does its own `gen.preset()`/`set_frequency_hz(freqs_hz[0])`/`rf_on()`
+  before starting anyway. Not yet run on real hardware.
+
+- **Bug caught by the user before ever running `pulsed_odmr.py` on real
+  hardware: the ZYSWA switch wasn't held static during the resonance
+  sweep.** `pulsed_odmr.py`'s step 1 configured the REAL gated pulse
+  sequence (`rabi.setup_awg_sequences()`, CH2 toggling per the MW on/off
+  gate) BEFORE step 2's `resonance_sweep()` call -- so CH2 was already
+  chopping between the sample path and the dump path while the spectrum
+  analyzer tried to read a clean reflected-power trace, exactly the
+  problem `cw_odmr_lock_in.py`'s `set_switch_static()` exists to prevent
+  (see its docstring: "if CH2 is already chopping while resonance_sweep()
+  reads the analyzer, the analyzer sees RF flipping between the sample
+  path and the dump path on every chop cycle -- amplitude-modulation
+  sidebands/garbage riding on top of the resonance dip, not a clean
+  reflected-power trace").
+
+  Fix is NOT as simple as calling `set_switch_static()` before an
+  otherwise-unchanged step 1, though, because `rabi.py`'s `setup_awg_
+  sequences()` requires CH1 and CH2 to wrap together via the shared
+  `onceWaitTrig` anchor mechanism (its own docstring: "CH1 and CH2 MUST
+  use the same value and wrap together... applying it to only one channel
+  visibly misaligns them") -- there's no safe partial state where CH1
+  pulses normally while CH2 sits static, unlike `cw_odmr_lock_in.py` where
+  CH1 is just a plain continuous carrier with no synchronization
+  dependency on CH2 at all. **Fixed** by restructuring the ordering
+  instead of patching around it: step 1 now holds CH2 static (`set_
+  switch_static(awg, route_to_sample=True)`) and does NOT configure the
+  real pulse sequence or the SDG1062X external trigger yet when `use_
+  resonance_sweep=true`; CH1 is left unconfigured too (harmless -- the
+  resonance sweep is a pure RF reflection/transmission measurement via
+  the spectrum analyzer, entirely independent of the laser/PMT signal
+  path). Once `resonance_sweep()` finds `f0_hz`/`fwhm_hz`, a new step 2
+  block calls `rabi._configure_external_trigger()` + `rabi.setup_awg_
+  sequences()` for the first time, starting the real synchronized pulse
+  sequence -- THEN the coil-current scan and frequency sweep run as
+  before, both of which genuinely need the real gated lock-in detection.
+  When `use_resonance_sweep=false` (no resonance sweep, manual `start_hz`/
+  `stop_hz`), the pulse sequence is configured immediately in step 1 as
+  before, since there's no low-power scan to interfere with. Not yet run
+  on real hardware.
+
+- **`anchor_free_reps` sized like rabi.py's per-point case is NOT enough
+  for `pulsed_odmr.py` -- caught by the user reasoning about it, then
+  confirmed against real data (`pulsed1`/`pulsed2`/`pulsed3`).** rabi.py
+  calls `setup_awg_sequences()` FRESH at the start of every point's settle
+  window, so as long as `anchor_period_s` (`ref_period_s * anchor_free_
+  reps`) exceeds that ONE settle window, the sequence's wrap simply hasn't
+  happened yet by the time that point's measurement is taken --
+  deterministic non-overlap. `pulsed_odmr.py` uploads the sequence ONCE
+  and free-runs it, wrapping over and over, asynchronously, for the
+  ENTIRE multi-point sweep (often 100+ points, minutes long) -- whether
+  any given point's `time.sleep()`-timed settle window happens to overlap
+  a wrap is essentially random, and sizing `anchor_free_reps` against a
+  single settle window (rabi.py's reasoning) only reduces the wrap RATE,
+  not the total number of wrap events across a long sweep.
+
+  Back-of-envelope check against the observed data: at `anchor_free_
+  reps=1000`, `tau_mw_us=5.0`, `n_reps=250` -> `anchor_period_s=6.0 s`,
+  `dwell_settle_s=0.9 s`; `pulsed1`'s ~137s estimated sweep duration ->
+  ~23 wrap events, each with a naive `dwell_settle_s/anchor_period_s`
+  (~15%) chance of clipping some point's settle window -> ~3.4 expected
+  corrupted points. Observed: 5/144. Same order of magnitude, confirming
+  the mechanism (this is NOT the same "stale reconfigure-transient latch"
+  class of bug fixed elsewhere -- it's a real, ongoing, probabilistic
+  overlap that persists for the entire run at this `anchor_free_reps`).
+
+  **Fixed**: moved `start_hz`/`stop_hz`/`freqs_hz` computation to run
+  immediately after `resonance_sweep()` finds `f0_hz`/`fwhm_hz` (previously
+  computed later, after the coil scan) so the real sweep length is known
+  before the pulse sequence is uploaded. Added a new warning check
+  comparing `anchor_period_s` against an ESTIMATED TOTAL sweep duration
+  (coil-current scan duration + main frequency sweep duration, both of
+  which run on the same uploaded sequence) rather than just one settle
+  window, printing a suggested `anchor_free_reps` (with 1.5x margin) sized
+  to exceed the whole run if the current setting is insufficient. Doesn't
+  auto-resize (would silently change the SDG1062X trigger rate to
+  something potentially very slow without the user choosing it) -- just
+  gives an actionable number, same spirit as the existing single-settle-
+  window warning at the top of `cmd_run()`. Making `anchor_period_s`
+  exceed the whole sweep is essentially free: `anchor_free_reps` is a
+  sequence-table REPEAT COUNT, not a re-uploaded waveform, so it doesn't
+  cost AWG memory (see `setup_awg_sequences()`'s docstring). Not yet run
+  on real hardware to confirm the suggested value actually eliminates the
+  unlocks.
+
+- **The suggested fix above (`anchor_free_reps=50000`) caused a much worse
+  regression on real hardware -- a design flaw in `_configure_external_
+  trigger()`'s call sites, not another anchor-wrap coincidence.** At
+  `anchor_free_reps=50000`, `reference_unlock=True` stopped being an
+  occasional flag and became PERSISTENT across many consecutive points,
+  with the SR830's reported reference frequency stuck at `999.989 Hz`
+  (not the expected `166.667 Hz`) -- consistent with the SR830 free-
+  running at its own internal default when the reference input has been
+  genuinely ABSENT for a while, not a brief dropout.
+
+  Root cause: `_configure_external_trigger(sdg, anchor_period_s, margin=
+  trigger_margin)` derives the SDG1062X's retrigger rate directly from
+  `anchor_period_s` (`= ref_period_s * anchor_free_reps`) -- fine when
+  `anchor_free_reps` is modest (1000), but at `50000` this stretched the
+  trigger's own period out to `anchor_period_s / trigger_margin ~= 100s`.
+  The periodic interlock check does its own `awg.write("ABOR")`, which
+  forces the sequence back to its `onceWaitTrig` anchor waiting for the
+  NEXT trigger edge -- which could then be up to ~100s away. Every point
+  measured during that window reads garbage (no real reference at all),
+  explaining the long, persistent run of corrupted points instead of the
+  previous rare, brief ones.
+
+  The real issue: the SDG's retrigger rate and `anchor_free_reps` answer
+  two DIFFERENT questions that had been coupled through the same `anchor_
+  period_s` value. `anchor_free_reps` should be large, to make the
+  sequence's OWN natural wrap rare across a long sweep (the fix two
+  entries up). But the trigger itself should always stay FAST, so recovery
+  from ANY reset -- a natural wrap OR a forced `ABOR` -- is quick,
+  regardless of how large `anchor_free_reps` is sized for the sequence
+  table. **Fixed**: added `trigger_retrigger_free_reps` (default `1000`,
+  independent of `anchor_free_reps`) and `trigger_period_s = ref_period_s
+  * min(anchor_free_reps, trigger_retrigger_free_reps)`, used at both
+  `_configure_external_trigger()` call sites instead of `anchor_period_s`
+  directly -- keeps the same validated `anchor_free_reps=1000`-equivalent
+  trigger rate this codebase has always used, no matter how large `anchor_
+  free_reps` itself is sized for a long sweep. `trigger_period_s` is now
+  also printed alongside `anchor_period_s` in the startup log for
+  visibility. Not yet re-run on real hardware to confirm this resolves the
+  persistent-unlock regression.
+
+- **Raised `rabi.py`'s `max_rescale_attempts` default from `3` to `10`**
+  (`cmd_run()` and `cmd_run_no_mw()`; `RUN_PARAMS_HELP` updated to match).
+  Each rescale attempt only steps ONE sensitivity range coarser
+  (`_step_sensitivity_coarser()`) out of 27 total (`SR830.SENSITIVITY_V`),
+  so 3 attempts isn't much headroom if the actual signal is many ranges
+  away from whatever sensitivity was active when an overload hits (e.g.
+  right after a big coil-current jump or a resonance shift) -- the old
+  default would give up and save an as-is (likely still railed/clipped)
+  reading well before reaching the correct range in that case. `cmd_
+  calibrate_phase()`'s own hardcoded `max_rescale_attempts=5` (added
+  earlier, see the phase-calibration overload entry above) was left
+  as-is, since it was already above the old default of 3.
+
+- **Added log-spaced `tau_mw` sweeping to `cmd_run()`.** New `mw_spacing`
+  (default `linear`, unchanged behavior) and `mw_log_ratio` (default
+  `1.15`) params: `mw_spacing=log` builds `mw_values_us` as a geometric
+  progression (`mw_start_us * mw_log_ratio ** arange(n)`) instead of
+  `np.arange(mw_start_us, mw_stop_us, mw_step_us)`, stopping at the last
+  point not exceeding `mw_stop_us`; `mw_step_us` is ignored in this mode.
+  Lets a single sweep cover a wide `tau_mw` range (e.g. 10 ns to 3 us,
+  example from the user) with fine resolution at short `tau_mw` (where
+  the Rabi oscillation is fastest) without the huge point count a linear
+  step fine enough for that would need all the way to the long end.
+  `mw_start_us` must be > 0 in this mode (raises `ValueError` otherwise --
+  a geometric progression can't start at 0). Verified the math directly:
+  `mw_start_us=0.01, mw_stop_us=3.0, mw_log_ratio=1.15` gives 41 points
+  from 0.01 to ~2.68 us, never exceeding `mw_stop_us`. Only implemented in
+  `cmd_run()` (the main Rabi sweep) -- not added to `cmd_run_ch1_ch2_
+  constant()` (the crosstalk-isolation diagnostic variant, which has an
+  identical `mw_start_us`/`mw_stop_us`/`mw_step_us` block) since that's
+  out of scope for what was asked. Metadata doesn't need updating for
+  this -- it already doesn't record `mw_start_us`/`mw_stop_us`/`mw_step_
+  us` at all, since the actual realized sweep points are captured
+  directly via the saved `_rabi_mw_us.npy` array regardless of spacing
+  mode. Not yet run on real hardware.
+
+- **Added `calibrate-phase` to `pulsed_odmr.py`** (`python pulsed_odmr.py
+  calibrate-phase <file_name> freq_hz=... [key=value ...]`). pulsed_odmr.
+  py had no phase-calibration path at all before this -- `cmd_run()`
+  applies whatever `phase_deg` is passed in, same gap `rabi.py`'s own
+  `cmd_calibrate_phase()` exists to fill. Adapted line-for-line from
+  `rabi.py`'s version (reusing `rabi.setup_lock_in()`/`rabi.setup_awg_
+  sequences()`/`rabi._configure_external_trigger()`/`rabi._step_
+  sensitivity_coarser()` via the existing `import rabi`), with the ONE
+  meaningful difference: `rabi.py`'s version fixes `tau_mw` and requires
+  a `freq_hz`; this one fixes `tau_mw_us` (this module's convention,
+  matching `cmd_run()`) and requires a `freq_hz` to run at -- pick
+  whatever frequency showed the strongest signal in a previous `cmd_run()`
+  ODMR sweep, same "needs real contrast, not an arbitrary point" guidance
+  as `rabi.py`'s docstring. Carries over every real-hardware fix already
+  found in `rabi.py`'s version: discard reads after `setup_awg_sequences()`
+  and after `auto_phase()` (clears reconfigure/phase-step transients),
+  the `AGAN`-undershoot rescale-retry loop, and the R-vs-full-scale
+  signal-strength check (catches the too-weak failure mode overload alone
+  misses). Also uses this module's own `trigger_period_s`/`trigger_
+  retrigger_free_reps` decoupling from `anchor_free_reps` (added earlier
+  this session) for consistency, though a single calibration point is
+  short enough that it rarely matters in practice. Not yet run on real
+  hardware.
+
+- **Added `run-repeat` to `pulsed_odmr.py`** (`python pulsed_odmr.py
+  run-repeat <file_name> n_repeats=10 [key=value ...]`). Adapted from
+  `rabi.py`'s `cmd_run_repeat()` -- same subprocess-per-repeat design
+  (avoids cross-repeat resource accumulation), same shared-folder-via-
+  `output_dir`-override pattern (which `cmd_run()` didn't have at all
+  until now -- added `output_dir` the same way `rabi.py`'s `cmd_run()`
+  has it, defaulting to `file_name`), same repeat-0-pins-later-repeats
+  idea. Two adaptations for this module's different sweep axis:
+  (1) `rabi.py` pins a single resolved `freq_hz`; this module sweeps
+  FREQUENCY, so what `use_resonance_sweep` resolves is a whole RANGE --
+  repeat 0's actual realized `start_hz`/`stop_hz` are read back from its
+  saved `_pulsed_odmr_freqs_hz.npy` (min/max) rather than a metadata
+  field, and passed explicitly (with `use_resonance_sweep=false`) to
+  every later repeat. (2) `rabi.py`'s version keeps a separate coarse-
+  sweep-plus-pre-flight-check running on pinned repeats, only skipping
+  the fine stage; this module has no equivalent standalone pre-flight
+  check outside `resonance_sweep()` itself, so pinned repeats skip the
+  WHOLE resonance sweep -- doesn't lose any independent safety check,
+  since `interlock_during_sweep`'s periodic check during the main
+  frequency loop is the real per-point safety net and stays active on
+  every repeat regardless. `coil_current_a` pinning (for when `use_
+  resonance_sweep` also ran the coil-current scan) works the same as
+  `rabi.py`'s version -- read back from repeat 0's metadata. Saves
+  `_avg_pulsed_odmr_freqs_hz.npy`/`_x.npy`/`_y.npy`/`_r.npy`/`_metadata.
+  txt` (records `n_repeats_requested` vs. `n_repeats_averaged`), same
+  convention as `rabi.py`'s `_avg_rabi_*` files. Not yet run on real
+  hardware.

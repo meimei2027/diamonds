@@ -649,6 +649,14 @@ def cmd_run(file_name, **kw):
     mw_start_us = float(kw.get("mw_start_us", 0.02))
     mw_stop_us = float(kw.get("mw_stop_us", 5.0))
     mw_step_us = float(kw.get("mw_step_us", 0.02))
+    # log: geometric progression from mw_start_us, each point mw_log_ratio
+    # times the last, up to (and not exceeding) mw_stop_us -- mw_step_us
+    # is ignored in this mode. Useful for covering a wide tau_mw range
+    # (e.g. 10 ns to 3 us) with fine resolution at short tau_mw (where the
+    # Rabi oscillation is fastest) without the huge point count a linear
+    # step size that fine would need all the way out to the long end.
+    mw_spacing = str(kw.get("mw_spacing", "linear")).lower()
+    mw_log_ratio = float(kw.get("mw_log_ratio", 1.15))
     n_reps = int(kw.get("n_reps", 250))
     laser_us = float(kw.get("laser_us", 2.0))
     pre_us = float(kw.get("pre_us", 1.0))
@@ -682,7 +690,12 @@ def cmd_run(file_name, **kw):
     phase_deg = float(kw.get("phase_deg", 0.0))
     input_coupling = str(kw.get("input_coupling", "ac"))
     auto_rescale_on_overload = str(kw.get("auto_rescale_on_overload", "true")).lower() == "true"
-    max_rescale_attempts = int(kw.get("max_rescale_attempts", 3))
+    # Raised from 3 -- confirmed on real hardware that 3 attempts wasn't
+    # enough headroom to recover from a large overload (e.g. right after a
+    # big coil-current jump or resonance shift), each attempt only steps
+    # ONE sensitivity range coarser (_step_sensitivity_coarser()) out of
+    # 27 total ranges (SR830.SENSITIVITY_V).
+    max_rescale_attempts = int(kw.get("max_rescale_attempts", 10))
     # See _step_sensitivity_finer()'s docstring -- auto_rescale_on_overload
     # only ever coarsens; without this, sensitivity stays pinned wherever
     # an early transient/overload left it for the rest of the sweep, even
@@ -870,7 +883,17 @@ def cmd_run(file_name, **kw):
     # doesn't drift point-to-point from re-finding resonance every repeat.
     use_resonance_freq = str(kw.get("use_resonance_freq", "false")).lower() == "true"
 
-    mw_values_us = np.arange(mw_start_us, mw_stop_us + mw_step_us / 2, mw_step_us)
+    if mw_spacing == "log":
+        if mw_start_us <= 0:
+            raise ValueError("mw_start_us must be > 0 for mw_spacing=log "
+                              "(a geometric progression can't start at 0)")
+        if mw_log_ratio <= 1.0:
+            raise ValueError("mw_log_ratio must be > 1.0 for mw_spacing=log")
+        n_log_points = int(np.floor(
+            np.log(mw_stop_us / mw_start_us) / np.log(mw_log_ratio))) + 1
+        mw_values_us = mw_start_us * mw_log_ratio ** np.arange(n_log_points)
+    else:
+        mw_values_us = np.arange(mw_start_us, mw_stop_us + mw_step_us / 2, mw_step_us)
     # The sweep's actual realized max, not the nominal mw_stop_us -- see
     # constant_shot_period's comment above for why this matters.
     mw_max_us = float(mw_values_us.max())
@@ -891,8 +914,10 @@ def cmd_run(file_name, **kw):
     log_path = f"{log_dir}/{file_name}_rabi.txt"
 
     with _tee_stdout(log_path):
+        spacing_desc = (f"log, ratio {mw_log_ratio}x" if mw_spacing == "log"
+                         else f"linear, step {mw_step_us} us")
         print(f"[rabi] tau_mw sweep: {mw_start_us}-{mw_stop_us} us, "
-              f"step {mw_step_us} us ({len(mw_values_us)} points), "
+              f"{spacing_desc} ({len(mw_values_us)} points), "
               f"n_reps={n_reps}, fixed frequency {freq_hz/1e9:.5f} GHz, "
               f"{drive_power_dbm} dBm")
 
@@ -1064,6 +1089,43 @@ def cmd_run(file_name, **kw):
                     repeat_y = np.empty(coil_scan_n_repeats)
                     for ri in range(coil_scan_n_repeats):
                         _wait_settle_discarding_transient_overload(lia, coil_scan_settle_s)
+
+                        # The coil scan sweeps a physical field, not a
+                        # sensitivity-neutral timing parameter -- signal
+                        # strength genuinely varies (often non-monotonically,
+                        # e.g. crossing a resonance-shift optimum) across
+                        # coil_scan_start_a..coil_scan_stop_a, and can
+                        # saturate the sensitivity chosen before the scan
+                        # even started. That sensitivity is fixed for the
+                        # whole scan otherwise, unlike the main tau_mw sweep
+                        # below, which already has this same rescale loop.
+                        # Confirmed on real hardware: signal saturating
+                        # partway through the coil scan with nothing to
+                        # correct it. Reuses cmd_run()'s own auto_rescale_
+                        # on_overload/max_rescale_attempts settings and
+                        # _step_sensitivity_coarser(), same pattern as the
+                        # main sweep loop's per-point overload handling.
+                        if auto_rescale_on_overload:
+                            status = lia.read_overload_status()
+                            for attempt in range(max_rescale_attempts):
+                                if not status["any"]:
+                                    break
+                                old_v = lia.get_sensitivity_v()
+                                new_v = _step_sensitivity_coarser(lia)
+                                lia.read_overload_status()  # discard the range-switch transient
+                                print(f"[rabi] coil scan OVERLOAD at current="
+                                      f"{current_a:.3f} A: rescaling sensitivity "
+                                      f"{old_v:.3e} V -> {new_v:.3e} V full scale, "
+                                      f"re-settling (attempt {attempt + 1}/"
+                                      f"{max_rescale_attempts})")
+                                _wait_settle_discarding_transient_overload(lia, coil_scan_settle_s)
+                                status = lia.read_overload_status()
+                            else:
+                                print(f"[rabi] coil scan: still overloading at "
+                                      f"current={current_a:.3f} A after "
+                                      f"{max_rescale_attempts} rescale attempts -- "
+                                      f"this point's X/Y may be railed/clipped")
+
                         repeat_x[ri], repeat_y[ri] = lia.read_xy()
                     # Average X/Y across repeats, THEN compute R from the
                     # averaged X/Y -- not averaging R directly, same
@@ -1879,7 +1941,8 @@ def _run_no_mw_impl(file_name, ch2_hold_constant, ch1_hold_constant=False,
     phase_deg = float(kw.get("phase_deg", 0.0))
     input_coupling = str(kw.get("input_coupling", "ac"))
     auto_rescale_on_overload = str(kw.get("auto_rescale_on_overload", "true")).lower() == "true"
-    max_rescale_attempts = int(kw.get("max_rescale_attempts", 3))
+    # See cmd_run()'s comment -- raised from 3 for the same reason.
+    max_rescale_attempts = int(kw.get("max_rescale_attempts", 10))
     auto_rescale_on_underload = str(kw.get("auto_rescale_on_underload", "true")).lower() == "true"
     underload_margin = float(kw.get("underload_margin", 0.5))
     # See cmd_run()'s underload_persistence comment -- same overload/
@@ -2233,12 +2296,89 @@ def cmd_calibrate_phase(file_name, **kw):
             if extra_settle_s > 0:
                 time.sleep(extra_settle_s)
 
+            # Discards the reference_unlock/overload latch caused by
+            # setup_awg_sequences() itself (its ABOR+clear+reupload
+            # momentarily stops CH2's marker output, which the SR830 reads
+            # as a reference dropout and latches until read) -- without
+            # this, that transient survives the settle/auto-gain/auto-
+            # phase sequence below and gets misreported by the diagnostic
+            # at the end as if it happened during the actual measurement.
+            # Same fix as cmd_run()'s per-point loop; see notes.md.
+            #
+            # Per-stage diagnostic prints added below (temporary, for
+            # localizing WHERE a persisting reference_unlock/overload
+            # re-appears after this discard read -- see notes.md's
+            # "WARNING persists even at anchor_free_reps=3000" entry)
+            # -- each read_overload_status() call clears the latch, so
+            # printing at every stage boundary shows exactly which gap
+            # it re-appears in instead of only the final, ambiguous
+            # end-of-function snapshot.
+            def _print_status(label):
+                s = lia.read_overload_status()
+                print(f"[rabi] diagnostic ({label}): reference_unlock="
+                      f"{s['reference_unlock']}, input_overload={s['input']}, "
+                      f"filter_overload={s['filter']}, output_overload={s['output']}")
+                return s
+
+            _print_status("right after setup_awg_sequences (discard)")
+
             print(f"[rabi] settling {settle_s * 1e3:.0f} ms, then auto-gain + auto-phase")
             time.sleep(settle_s)
+            _print_status("after 1st settle_s, before auto_gain")
             lia.auto_gain()
             time.sleep(settle_s)
+            status = _print_status("after auto_gain + 2nd settle_s, before auto_phase")
 
+            # AGAN only steps sensitivity ONE range per call (SR830 manual) --
+            # if the real signal is far from whatever range was already
+            # selected (very plausible right at a Rabi contrast peak /
+            # coil-scan optimum, as calibrate-phase is meant to be run at),
+            # a single call can undershoot and leave it still overloaded, as
+            # confirmed on real hardware (output_overload=True right after
+            # auto_gain here, at mw_us=0.5/coil_current_a=5.0). Same rescale-
+            # retry loop cmd_run()'s per-point overload handling uses
+            # (_step_sensitivity_coarser() + settle + re-check) instead of
+            # trusting a single AGAN call.
+            max_rescale_attempts = 5
+            for attempt in range(max_rescale_attempts):
+                if not status["any"]:
+                    break
+                old_v = lia.get_sensitivity_v()
+                new_v = _step_sensitivity_coarser(lia)
+                lia.read_overload_status()  # discard the range-switch transient
+                print(f"[rabi] OVERLOAD after auto_gain: rescaling sensitivity "
+                      f"{old_v:.3e} V -> {new_v:.3e} V full scale, re-checking "
+                      f"(attempt {attempt + 1}/{max_rescale_attempts})")
+                time.sleep(settle_s)
+                status = _print_status(f"after rescale attempt {attempt + 1}")
+            else:
+                print(f"[rabi] WARNING: still overloading after "
+                      f"{max_rescale_attempts} rescale attempts -- phase_deg "
+                      f"below may still be corrupted")
+
+            # REVERTED the extra deliberate coarsening step tried here --
+            # confirmed on real hardware it overcorrected: overload went
+            # away, but auto_phase() then gave wildly inconsistent readings
+            # run-to-run (70 deg -> 40 deg) instead of the previously
+            # reproducible ~-66 to -70 deg. auto_phase()'s null is atan2(Y,
+            # X) -- pushed too far below full scale, X/Y sit close enough to
+            # the SR830's own noise floor that the null angle is dominated
+            # by noise rather than the real signal, exactly the "needs a
+            # real, reasonably strong signal" caveat in this function's own
+            # docstring. An intermittently-overloading-but-reproducible
+            # phase reading (the pre-this-mitigation behavior) was the
+            # better tradeoff. See notes.md.
             lia.auto_phase()
+            # APHS steps the reference phase, which transiently redistributes
+            # signal between X/Y while the filter catches up -- confirmed on
+            # real hardware that this alone latches output_overload even
+            # when the final settled X/Y (tens of uV) are nowhere near the
+            # active sensitivity's full scale. Same category of transient as
+            # setup_awg_sequences()'s reconfigure glitch and the SENS-switch
+            # glitch above, both already discarded -- this was the one
+            # remaining gap. Discard here so the final check below reflects
+            # the actual settled state, not this phase-step transient.
+            lia.read_overload_status()
             time.sleep(settle_s)
             phase_deg = lia.get_phase_deg()
             x, y = lia.read_xy()
@@ -2248,15 +2388,32 @@ def cmd_calibrate_phase(file_name, **kw):
             # artifact that used to be caused by anchor_free_reps=1, or
             # anything else) would otherwise look identical to a clean
             # auto-phase result with no way to tell the difference.
-            status = lia.read_overload_status()
-            print(f"[rabi] diagnostic: reference_unlock={status['reference_unlock']}, "
-                  f"input_overload={status['input']}, "
-                  f"filter_overload={status['filter']}, "
-                  f"output_overload={status['output']}")
+            status = _print_status("after auto_phase + 3rd settle_s (final)")
             if status["reference_unlock"] or status["any"]:
                 print("[rabi] WARNING: reference unlock or overload flagged right "
                       "at the auto-phase reading -- this phase_deg may be corrupted, "
                       "consider re-running before trusting it")
+
+            # R relative to the active sensitivity's full scale -- overload
+            # only catches the TOO-STRONG failure mode; a signal that's too
+            # WEAK relative to full scale silently degrades auto_phase()'s
+            # atan2(Y, X) null into a noise-dominated (and therefore
+            # run-to-run inconsistent) estimate with no overload flag at
+            # all to catch it. Confirmed on real hardware: backing
+            # sensitivity off an extra step to avoid intermittent overload
+            # cleared the warning but made phase_deg swing 70 deg -> 40 deg
+            # across runs -- exactly this failure mode. Printed so a weak-
+            # signal miscalibration is visible instead of silently trusted.
+            r = (x ** 2 + y ** 2) ** 0.5
+            active_sensitivity_v = lia.get_sensitivity_v()
+            fraction_of_full_scale = r / active_sensitivity_v
+            print(f"[rabi] signal check: R={r:.3e} V is {fraction_of_full_scale * 100:.1f}% "
+                  f"of the active {active_sensitivity_v:.3e} V full scale")
+            if fraction_of_full_scale < 0.05:
+                print("[rabi] WARNING: R is under 5% of full scale -- auto_phase()'s "
+                      "null may be noise-dominated rather than signal-dominated, giving "
+                      "an inconsistent phase_deg run-to-run; pick a stronger mw_us or a "
+                      "finer sensitivity range before trusting this")
 
             print(f"[rabi] auto-phase result: phase_deg={phase_deg:.3f} deg "
                   f"(X={x:.6e} V, Y={y:.6e} V after nulling)")
@@ -2343,9 +2500,19 @@ Sweep range:
     freq_hz=2.843e9            fixed MW frequency for the whole sweep
     drive_power_dbm=0.0        generator power at freq_hz
     threshold_dbm=-10.0        reflected-power interlock trip threshold
-    mw_start_us=0.02           tau_mw sweep start
+    mw_start_us=0.02           tau_mw sweep start (must be > 0 if
+                               mw_spacing=log)
     mw_stop_us=5.0             tau_mw sweep stop
-    mw_step_us=0.02            tau_mw sweep step
+    mw_step_us=0.02            tau_mw sweep step (mw_spacing=linear only)
+    mw_spacing=linear          "log" for a geometric progression instead
+                               (each point mw_log_ratio times the last,
+                               from mw_start_us up to mw_stop_us) -- covers
+                               a wide range (e.g. 10 ns to 3 us) with fine
+                               resolution at short tau_mw without the huge
+                               point count a linear step that fine would
+                               need all the way to the long end
+    mw_log_ratio=1.15          geometric ratio between points, mw_spacing=
+                               log only (must be > 1.0)
     n_reps=250                 on+off reps per point's combined arb
 
 Pulse timing:
@@ -2364,7 +2531,12 @@ Lock-in:
 
 Overload/underload auto-rescaling:
     auto_rescale_on_overload=true
-    max_rescale_attempts=3
+    max_rescale_attempts=10   raised from 3 -- confirmed on real hardware
+                              that 3 wasn't enough headroom to recover
+                              from a large overload (e.g. right after a
+                              big coil-current jump), since each attempt
+                              only steps ONE sensitivity range coarser out
+                              of 27 total (SR830.SENSITIVITY_V)
     auto_rescale_on_underload=true
     underload_margin=0.5
     underload_persistence=3    consecutive underload points before stepping finer
