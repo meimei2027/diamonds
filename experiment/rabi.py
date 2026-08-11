@@ -189,7 +189,8 @@ def setup_awg_sequences(awg, mw_us, n_reps, laser_us, pre_us, post_us,
                          sequence_name_ch1, sequence_name_ch2,
                          ch1_vpp=0.632, ch2_vpp=5.0, ch2_offset_v=2.5,
                          sample_rate_hz=1e9, ch2_hold_constant=False,
-                         ch1_hold_constant=False, anchor_free_reps=1):
+                         ch1_hold_constant=False, anchor_free_reps=1,
+                         pad_us=0.0):
     """
     Uploads CH1's laser-pulse-train arb and CH2's mw-on/mw-off gate arbs
     for one rep at the current mw_us, then builds and uploads a DATA:SEQ
@@ -255,6 +256,17 @@ def setup_awg_sequences(awg, mw_us, n_reps, laser_us, pre_us, post_us,
     block structure -- if ch2_hold_constant is also on, the ONLY thing
     left anywhere in the AWG still synchronous with the block reference
     is CH2's marker.
+
+    pad_us (default 0.0, no effect): extra "off" dead time appended to the
+    END of every rep (after post_us), on BOTH channels, before the next
+    rep starts -- lets a caller (cmd_run()'s constant_shot_period) hold
+    the TOTAL rep period (and therefore the reference frequency and the
+    laser's duty cycle) IDENTICAL across an entire tau_mw sweep by
+    compensating for the varying mw_us: pad_us = (mw_max_us - mw_us) +
+    pad_min_us, so laser_us+pre_us+mw_us+post_us+pad_us is the same
+    constant at every point regardless of mw_us. 0.0 (skips adding the
+    segment at all, not just a zero-length one) reproduces the exact
+    sample counts this function has always produced.
 
     REVERTED an attempted split (configure_awg_outputs() called once,
     output-stage config removed from here) that was meant to cut down on
@@ -337,19 +349,31 @@ def setup_awg_sequences(awg, mw_us, n_reps, laser_us, pre_us, post_us,
     pre_samples = _us_to_samples(pre_us, sample_rate_hz)
     mw_samples = _us_to_samples(mw_us, sample_rate_hz)
     post_samples = _us_to_samples(post_us, sample_rate_hz)
+    # 0 (not _us_to_samples(0, ...), which would still return 1 -- see its
+    # own "max(1, ...)" floor) so pad_us=0.0 reproduces the exact sample
+    # counts this function has always produced, with no extra segment at
+    # all.
+    pad_samples = _us_to_samples(pad_us, sample_rate_hz) if pad_us > 0 else 0
 
-    gate_on_rep = np.concatenate([
+    gate_on_rep_segments = [
         _const(laser_samples + pre_samples, -1.0),
         _const(mw_samples, 1.0),
         _const(post_samples, -1.0),
-    ])
-    gate_off_rep = _const(laser_samples + pre_samples + mw_samples + post_samples, -1.0)
+    ]
+    if pad_samples > 0:
+        gate_on_rep_segments.append(_const(pad_samples, -1.0))
+    gate_on_rep = np.concatenate(gate_on_rep_segments)
+    gate_off_rep = _const(
+        laser_samples + pre_samples + mw_samples + post_samples + pad_samples, -1.0)
 
     if not ch1_hold_constant:
-        ch1_rep = np.concatenate([
+        ch1_rep_segments = [
             _rf_pulse(80e6, laser_samples, sample_rate_hz),
             _const(pre_samples + mw_samples + post_samples, 0.0),
-        ])
+        ]
+        if pad_samples > 0:
+            ch1_rep_segments.append(_const(pad_samples, 0.0))
+        ch1_rep = np.concatenate(ch1_rep_segments)
         assert len(ch1_rep) == len(gate_on_rep) == len(gate_off_rep), (
             "CH1 and CH2 rep arbs must have identical sample counts, or the "
             "two channels' blocks will drift out of step"
@@ -599,8 +623,10 @@ def cmd_run(file_name, **kw):
     resequence_interval, extra_settle_s, ch1_vpp, ch2_vpp,
     ch2_offset_v, trigger_margin, anchor_free_reps, fixed_external_trigger,
     reflected_power_scan, res_span_hz, coarse_step_hz, fine_span_hz,
-    fine_step_hz, res_power_dbm, res_cal_dir, fine_sweep -- see the
-    parameter-parsing block below for defaults and notes.md for the
+    fine_step_hz, res_power_dbm, res_cal_dir, fine_sweep, use_resonance_freq,
+    coil_scan_start_a, coil_scan_stop_a, coil_scan_step_a, coil_scan_tau_mw_us,
+    coil_scan_n_repeats, coil_scan_current_settle_s, constant_shot_period,
+    pad_min_us -- see the parameter-parsing block below for defaults and notes.md for the
     reasoning behind non-obvious ones.
 
     If reflected_power_scan=true (default), runs a coarse-then-fine
@@ -627,6 +653,23 @@ def cmd_run(file_name, **kw):
     laser_us = float(kw.get("laser_us", 2.0))
     pre_us = float(kw.get("pre_us", 1.0))
     post_us = float(kw.get("post_us", 1.0))
+    # Holds the TOTAL rep period (laser_us+pre_us+mw_us+post_us+pad_us)
+    # constant across the whole tau_mw sweep by padding out the tail of
+    # every rep to compensate for the varying mw_us: pad_us = (mw_max_us
+    # - mw_us) + pad_min_us, where mw_max_us is the sweep's actual
+    # largest tau_mw (mw_values_us.max(), not the nominal mw_stop_us --
+    # np.arange's stop+step/2 rounding can realize a value slightly past
+    # mw_stop_us, and using the nominal value here could make pad_us go
+    # negative for that point). Without this, ref_period_s (and therefore
+    # the reference frequency and the laser's duty cycle) varies point to
+    # point across the sweep purely because mw_us does -- fixed_external_
+    # trigger already keeps the EXTERNAL TRIGGER rate constant regardless,
+    # but the AWG's own actual rep period still isn't, so the laser fires
+    # at a different duty cycle/effective rate at each point. Off by
+    # default -- see setup_awg_sequences()'s pad_us docstring for what
+    # pad_us=0.0 preserves exactly.
+    constant_shot_period = str(kw.get("constant_shot_period", "false")).lower() == "true"
+    pad_min_us = float(kw.get("pad_min_us", 0.0))
     time_constant_s = float(kw.get("time_constant_s", 0.1))
     settle_periods = float(kw.get("settle_periods", 5.0))
     # Raised from 5.0: setup_lock_in() uses a 24 dB/oct (4-pole) filter,
@@ -697,6 +740,30 @@ def cmd_run(file_name, **kw):
     psu_current_limit_a = float(kw.get("psu_current_limit_a", 1.9))
     coil_current_a = float(kw.get("coil_current_a", 2.0))
     coil_voltage_margin = float(kw.get("coil_voltage_margin", 1.5))
+    # When use_resonance_freq=true, ALSO scan coil_current_a (between
+    # coil_scan_start_a and coil_scan_stop_a) at a fixed tau_mw, right
+    # after resonance is found and before the real tau_mw sweep starts --
+    # picks whichever current gives the largest measured R and uses that
+    # for the rest of the run, instead of trusting the coil_current_a
+    # value passed in. NOTE: the coil field shifts the NV resonance
+    # frequency itself (Zeeman splitting) -- this scan does NOT re-find
+    # resonance at each current, it stays at the ALREADY-resolved f0_hz
+    # throughout, so what's actually being optimized is "signal at the
+    # ORIGINAL resonance frequency as a function of current" -- if the
+    # true resonance shifts enough across the scanned current range, R
+    # could look artificially low at currents where the line has drifted
+    # off f0_hz, not because signal is genuinely weaker there. Fine for a
+    # narrow scan range relative to the linewidth; be aware of this if
+    # coil_scan_stop_a - coil_scan_start_a is large.
+    coil_scan_start_a = float(kw.get("coil_scan_start_a", 1.0))
+    coil_scan_stop_a = float(kw.get("coil_scan_stop_a", 4.0))
+    coil_scan_step_a = float(kw.get("coil_scan_step_a", 0.5))
+    coil_scan_tau_mw_us = float(kw.get("coil_scan_tau_mw_us", 0.5))
+    coil_scan_n_repeats = int(kw.get("coil_scan_n_repeats", 5))
+    # Extra wait after changing the coil current, before measuring -- lets
+    # the coil's field (and any eddy-current effects in nearby metal)
+    # actually settle, not just the PSU's own output.
+    coil_scan_current_settle_s = float(kw.get("coil_scan_current_settle_s", 2.0))
     interlock_check_interval = int(kw.get("interlock_check_interval", 5))
     interlock_hold_periods = float(kw.get("interlock_hold_periods", 3.0))
     # The PERIODIC per-point check below (not the pre-flight coarse/fine
@@ -788,8 +855,25 @@ def cmd_run(file_name, **kw):
     # this just trims the fine half when you only want a quick coarse
     # sanity check around freq_hz without the fine sweep's extra time.
     fine_sweep = str(kw.get("fine_sweep", "true")).lower() == "true"
+    # Changes what the pre-flight coarse(+fine) sweep is FOR: instead of
+    # just a diagnostic check at the fixed freq_hz (fine sweep re-centered
+    # on freq_hz itself, freq_hz never changes -- the default), freq_hz
+    # becomes the SEARCH MIDPOINT and the actual drive frequency is
+    # resolved from wherever the sweep's dip actually is (fine sweep
+    # re-centered on the coarse dip, same as cw_odmr_lock_in.py's
+    # use_resonance_sweep) -- the sweep runs regardless of
+    # reflected_power_scan, and always includes the fine stage regardless
+    # of fine_sweep, since a coarse-only dip isn't precise enough to drive
+    # at. See cmd_run_repeat()'s handling: only the FIRST repeat resolves
+    # a frequency this way -- later repeats reuse it via an explicit
+    # freq_hz override with this left false, so a whole averaged batch
+    # doesn't drift point-to-point from re-finding resonance every repeat.
+    use_resonance_freq = str(kw.get("use_resonance_freq", "false")).lower() == "true"
 
     mw_values_us = np.arange(mw_start_us, mw_stop_us + mw_step_us / 2, mw_step_us)
+    # The sweep's actual realized max, not the nominal mw_stop_us -- see
+    # constant_shot_period's comment above for why this matters.
+    mw_max_us = float(mw_values_us.max())
 
     # Normally the same as file_name -- lets cmd_run_repeat() point many
     # repeats' saved files at one shared folder (all still prefixed with
@@ -845,7 +929,7 @@ def cmd_run(file_name, **kw):
                 gen.trip_interlock("spectrum analyzer not reachable at startup")
                 return
 
-            if reflected_power_scan:
+            if reflected_power_scan or use_resonance_freq:
                 # Hold CH2 static on the sample path (RF2), not chopping --
                 # setup_awg_sequences() hasn't run yet at this point (it's
                 # inside the sweep loop below), so without this CH2 is in
@@ -858,24 +942,37 @@ def cmd_run(file_name, **kw):
                 set_switch_static(awg, route_to_sample=True)
                 print(f"[rabi] pre-flight: reflected-power sweep around "
                       f"{freq_hz/1e9:.5f} GHz (+/- {res_span_hz/2/1e6:.1f} MHz), "
-                      f"{res_power_dbm} dBm")
-                gen.resonance_sweep(
+                      f"{res_power_dbm} dBm"
+                      f"{' -- RESOLVING drive frequency from this scan' if use_resonance_freq else ''}")
+                effective_fine_sweep = fine_sweep or use_resonance_freq
+                result = gen.resonance_sweep(
                     ilock_sa, freq_hz - res_span_hz / 2, freq_hz + res_span_hz / 2,
                     coarse_step_hz, fine_span_hz, fine_step_hz, res_power_dbm,
                     output_prefix=f"{run_path}/{file_name}_resonance",
                     cal_dir=res_cal_dir,
-                    # Center the fine sweep on the fixed freq_hz we're
-                    # actually driving, not wherever the coarse sweep's dip
-                    # happened to land -- this is a pre-flight check of the
-                    # frequency in use, not a resonance-finding step (see
-                    # cmd_run()'s docstring: reflected_power_scan does NOT
-                    # change freq_hz).
-                    fine_center_hz=freq_hz,
-                    run_fine_sweep=fine_sweep,
+                    # use_resonance_freq: DON'T pin the fine sweep to
+                    # freq_hz -- let it center on wherever the coarse
+                    # sweep's dip actually landed, same as cw_odmr_lock_
+                    # in.py's use_resonance_sweep, since the whole point
+                    # here is finding real resonance, not checking a fixed
+                    # point. Otherwise (default): center the fine sweep on
+                    # the fixed freq_hz we're actually driving -- this is
+                    # a pre-flight check of the frequency in use, not a
+                    # resonance-finding step, and freq_hz never changes.
+                    fine_center_hz=None if use_resonance_freq else freq_hz,
+                    run_fine_sweep=effective_fine_sweep,
                 )
+                if use_resonance_freq:
+                    old_freq_hz = freq_hz
+                    freq_hz = result["f0_hz"]
+                    print(f"[rabi] pre-flight: resolved drive frequency "
+                          f"{old_freq_hz/1e9:.5f} GHz (search midpoint) -> "
+                          f"{freq_hz/1e9:.5f} GHz (found resonance), "
+                          f"FWHM = {result['fwhm_hz']/1e6:.3f} MHz, "
+                          f"Q ~= {result['Q']:.0f}")
                 print(f"[rabi] pre-flight done: saved "
                       f"{run_path}/{file_name}_resonance_coarse.csv"
-                      f"{', _resonance_fine.csv' if fine_sweep else ' (fine_sweep=false -- fine.csv not written)'}")
+                      f"{', _resonance_fine.csv' if effective_fine_sweep else ' (fine_sweep=false -- fine.csv not written)'}")
 
             gen.preset()
             gen.set_power_dbm(drive_power_dbm)
@@ -924,12 +1021,99 @@ def cmd_run(file_name, **kw):
                                         f"{drive_power_dbm} dBm)")
                     return
 
+            if use_resonance_freq:
+                print(f"[rabi] coil current scan: {coil_scan_start_a}-"
+                      f"{coil_scan_stop_a} A, step {coil_scan_step_a} A, "
+                      f"tau_mw={coil_scan_tau_mw_us} us, "
+                      f"{coil_scan_n_repeats} repeats/point, at "
+                      f"freq_hz={freq_hz/1e9:.5f} GHz (found above -- NOT "
+                      f"re-derived per current, see coil_scan_start_a's "
+                      f"comment for the Zeeman-shift caveat)")
+
+                coil_scan_rep_us = laser_us + pre_us + coil_scan_tau_mw_us + post_us
+                coil_scan_ref_period_s = 2 * n_reps * coil_scan_rep_us * 1e-6
+                coil_scan_settle_s = max(settle_periods * coil_scan_ref_period_s,
+                                          settle_time_constants * time_constant_s)
+                coil_scan_anchor_period_s = coil_scan_ref_period_s * anchor_free_reps
+                _configure_external_trigger(sdg, coil_scan_anchor_period_s,
+                                             margin=trigger_margin)
+                setup_awg_sequences(
+                    awg, coil_scan_tau_mw_us, n_reps, laser_us, pre_us, post_us,
+                    sequence_name_ch1="coil_scan_ch1",
+                    sequence_name_ch2="coil_scan_ch2",
+                    ch1_vpp=ch1_vpp, ch2_vpp=ch2_vpp, ch2_offset_v=ch2_offset_v,
+                    anchor_free_reps=anchor_free_reps,
+                )
+                if extra_settle_s > 0:
+                    time.sleep(extra_settle_s)
+                lia.read_overload_status()  # discard anything stale
+
+                coil_scan_currents_a = np.arange(
+                    coil_scan_start_a,
+                    coil_scan_stop_a + coil_scan_step_a / 2,
+                    coil_scan_step_a,
+                )
+                coil_scan_x = np.full(len(coil_scan_currents_a), np.nan)
+                coil_scan_y = np.full(len(coil_scan_currents_a), np.nan)
+                for ci, current_a in enumerate(coil_scan_currents_a):
+                    coil_scan_voltage_v = voltage_for_current(current_a) * coil_voltage_margin
+                    coil_psu.turn_on(coil_scan_voltage_v, current_a)
+                    time.sleep(coil_scan_current_settle_s)
+
+                    repeat_x = np.empty(coil_scan_n_repeats)
+                    repeat_y = np.empty(coil_scan_n_repeats)
+                    for ri in range(coil_scan_n_repeats):
+                        _wait_settle_discarding_transient_overload(lia, coil_scan_settle_s)
+                        repeat_x[ri], repeat_y[ri] = lia.read_xy()
+                    # Average X/Y across repeats, THEN compute R from the
+                    # averaged X/Y -- not averaging R directly, same
+                    # noise-rectification-bias convention as everywhere
+                    # else in this codebase (see cw_odmr_lock_in.py's
+                    # cmd_sweep_average()).
+                    coil_scan_x[ci] = repeat_x.mean()
+                    coil_scan_y[ci] = repeat_y.mean()
+                    r_here = (coil_scan_x[ci] ** 2 + coil_scan_y[ci] ** 2) ** 0.5
+                    print(f"[rabi] coil scan {ci + 1}/{len(coil_scan_currents_a)}: "
+                          f"current={current_a:.3f} A, "
+                          f"X={coil_scan_x[ci]:.6e} V, Y={coil_scan_y[ci]:.6e} V, "
+                          f"R={r_here:.6e} V")
+
+                coil_scan_r = np.sqrt(coil_scan_x ** 2 + coil_scan_y ** 2)
+                best_idx = int(np.argmax(coil_scan_r))
+                old_coil_current_a = coil_current_a
+                coil_current_a = float(coil_scan_currents_a[best_idx])
+                print(f"[rabi] coil current scan done: best current "
+                      f"{coil_current_a:.3f} A (R={coil_scan_r[best_idx]:.6e} V) "
+                      f"-- overriding coil_current_a from {old_coil_current_a} A "
+                      f"for the rest of this run")
+
+                np.save(f"{run_path}/{file_name}_coil_scan_current_a.npy",
+                        coil_scan_currents_a)
+                np.save(f"{run_path}/{file_name}_coil_scan_x.npy", coil_scan_x)
+                np.save(f"{run_path}/{file_name}_coil_scan_y.npy", coil_scan_y)
+                np.save(f"{run_path}/{file_name}_coil_scan_r.npy", coil_scan_r)
+                print(f"[rabi] coil current scan: saved "
+                      f"{run_path}/{file_name}_coil_scan_current_a.npy, "
+                      f"_coil_scan_x.npy, _coil_scan_y.npy, _coil_scan_r.npy")
+
+                # Actually apply the chosen current -- the loop above may
+                # have left the PSU at whatever current it tried LAST, not
+                # necessarily the best one.
+                coil_voltage_v = voltage_for_current(coil_current_a) * coil_voltage_margin
+                coil_psu.turn_on(coil_voltage_v, coil_current_a)
+                time.sleep(coil_scan_current_settle_s)
+
             if fixed_external_trigger:
                 # Worst case (highest bare-minimum trigger requirement) is
                 # the sweep's SHORTEST rep, at mw_start_us -- fast enough
                 # here means comfortably fast enough for every longer rep
-                # later in the sweep too.
-                fixed_rep_us = laser_us + pre_us + mw_start_us + post_us
+                # later in the sweep too. With constant_shot_period, every
+                # point's rep_us is actually identical by construction, so
+                # "worst case" doesn't really apply anymore, but computing
+                # it the same way still gives the right (now constant)
+                # value.
+                fixed_pad_us = ((mw_max_us - mw_start_us) + pad_min_us) if constant_shot_period else 0.0
+                fixed_rep_us = laser_us + pre_us + mw_start_us + post_us + fixed_pad_us
                 fixed_anchor_period_s = 2 * n_reps * fixed_rep_us * 1e-6 * anchor_free_reps
                 fixed_trigger_freq_hz = _configure_external_trigger(
                     sdg, fixed_anchor_period_s, margin=trigger_margin)
@@ -967,7 +1151,12 @@ def cmd_run(file_name, **kw):
                         awg.write("SOUR1:DATA:VOL:CLE")
                         awg.write("SOUR2:DATA:VOL:CLE")
 
-                    rep_us = laser_us + pre_us + mw_us + post_us
+                    # pad_us=0.0 (constant_shot_period off, the default)
+                    # reproduces the exact rep_us this loop has always
+                    # computed -- see setup_awg_sequences()'s pad_us
+                    # docstring and constant_shot_period's comment above.
+                    pad_us = ((mw_max_us - mw_us) + pad_min_us) if constant_shot_period else 0.0
+                    rep_us = laser_us + pre_us + mw_us + post_us + pad_us
                     ref_period_s = 2 * n_reps * rep_us * 1e-6
                     # The reference period can be much shorter than the
                     # lock-in's own RC filter time constant (e.g. at small
@@ -995,6 +1184,7 @@ def cmd_run(file_name, **kw):
                         sequence_name_ch2=f"rabi_ch2_{i}",
                         ch1_vpp=ch1_vpp, ch2_vpp=ch2_vpp, ch2_offset_v=ch2_offset_v,
                         anchor_free_reps=anchor_free_reps,
+                        pad_us=pad_us,
                     )
                     if extra_settle_s > 0:
                         time.sleep(extra_settle_s)
@@ -1218,6 +1408,12 @@ def cmd_run(file_name, **kw):
                     fh.write(f"settle_time_constants={settle_time_constants}\n")
                     fh.write(f"sensitivity_v={sensitivity_v}\n")
                     fh.write(f"phase_deg={phase_deg}\n")
+                    fh.write(f"coil_current_a={coil_current_a}\n")
+                    # Written as 1.0/0.0, not True/False -- every existing
+                    # metadata reader (e.g. rabi_result.ipynb's load cell)
+                    # does float(v) on every line uniformly.
+                    fh.write(f"constant_shot_period={int(constant_shot_period)}\n")
+                    fh.write(f"pad_min_us={pad_min_us}\n")
                 print(f"[rabi] step 3/3 done"
                       f"{' (PARTIAL -- interlock tripped)' if tripped else ''}: "
                       f"saved {run_path}/{file_name}_rabi_mw_us.npy "
@@ -1283,16 +1479,24 @@ def cmd_run_repeat(file_name, **kw):
     doesn't remove, same convention as cw_odmr_lock_in.py's
     cmd_sweep_average()).
 
-    Each repeat is a COMPLETELY INDEPENDENT cmd_run() call -- full
-    instrument reconnect, full pre-flight resonance scan (if
-    reflected_power_scan is still true), PSU on/off, from scratch. Slower
-    than reusing one long-lived connection across all repeats, but reuses
-    cmd_run() completely UNMODIFIED -- zero risk of a repeat-batching
-    wrapper introducing a new timing bug into the single-sweep path this
-    session spent so long validating (see notes.md) -- and gives each
-    repeat a genuinely fresh instrument state (no accumulated AWG/SR830
-    state across a very long combined run) rather than a reason to trust
-    it less.
+    Each repeat runs `python rabi.py run <repeat_name> ...` as a genuine
+    SEPARATE OS PROCESS (via subprocess), not an in-process cmd_run()
+    call -- reuses cmd_run() completely UNMODIFIED (zero risk of a
+    repeat-batching wrapper introducing a new timing bug into the single-
+    sweep path this session spent so long validating -- see notes.md),
+    gives each repeat a genuinely fresh instrument state, AND, critically,
+    a genuinely fresh process/address space. An earlier in-process version
+    (calling cmd_run() directly, many times, in the SAME Python process)
+    crashed on real hardware after enough repeats with `numpy._core.
+    _exceptions._ArrayMemoryError: Unable to allocate 7.68 MiB` inside
+    upload_waveform() -- a tiny allocation that should never fail on a
+    healthy system, consistent with heap fragmentation/resource
+    accumulation from hundreds of large arb uploads and VISA sessions
+    never being FULLY released within one long-lived process. A real OS
+    process boundary per repeat eliminates that whole class of bug for
+    free (the OS reclaims everything on exit), at the cost of one extra
+    Python interpreter startup per repeat (~1s, negligible next to an
+    actual sweep).
 
     All repeats' files land in ONE shared folder (D:/rabi/<file_name>/,
     same as a plain cmd_run() call would use), not one folder per repeat
@@ -1305,6 +1509,21 @@ def cmd_run_repeat(file_name, **kw):
       (everything else is passed through to cmd_run() UNCHANGED, once per
       repeat -- see cmd_run()'s own docstring/RUN_PARAMS_HELP for the full
       list)
+
+    Repeat 0 runs with whatever freq_hz/use_resonance_freq settings were
+    given (e.g. use_resonance_freq=true to resolve the actual drive
+    frequency from a coarse+fine scan around a freq_hz search midpoint,
+    which also triggers the coil-current optimization scan). Every repeat
+    AFTER that is automatically pinned to repeat 0's own recorded freq_hz
+    AND coil_current_a (both read back from its saved metadata) and run
+    with use_resonance_freq=false and fine_sweep=false, regardless of
+    what was passed in -- so the resonance/coil-current search and the
+    fine resonance sweep only happen once, not independently every
+    repeat (slower, and could drift point-to-point across an averaged
+    batch if the found dip/current isn't perfectly identical each time).
+    The coarse sweep and the reflected-power-at-operating-point check
+    still run on every repeat regardless (real safety checks, not part
+    of the search being skipped) -- only the FINE stage is skipped.
 
     A repeat that trips the interlock partway through saves a SHORTER
     mw_us array than a fully-completed one (same as a single cmd_run()
@@ -1322,14 +1541,92 @@ def cmd_run_repeat(file_name, **kw):
       requested vs. n_repeats_averaged).
     """
     n_repeats = int(kw.pop("n_repeats", 10))
-
-    for i in range(n_repeats):
-        repeat_name = f"{file_name}_repeat{i}"
-        print(f"[rabi] repeat {i + 1}/{n_repeats}: running {repeat_name} "
-              f"(saved into {file_name}/)")
-        cmd_run(repeat_name, output_dir=file_name, **kw)
-
     import os
+    import subprocess
+    import sys
+
+    resolved_freq_hz = None
+    resolved_coil_current_a = None
+    try:
+        for i in range(n_repeats):
+            repeat_name = f"{file_name}_repeat{i}"
+            repeat_kw = dict(kw)
+            pin_note = ""
+            if resolved_freq_hz is not None:
+                # Pin every repeat after the first to the frequency AND
+                # coil current repeat 0 actually ran at (whether those
+                # came from use_resonance_freq's coarse+fine search /
+                # coil-current scan, or were just the plain freq_hz/
+                # coil_current_a passed in -- either way, reusing repeat
+                # 0's own recorded values is a single code path for both
+                # cases). Without this, use_resonance_freq would re-search
+                # resonance independently every repeat -- slower, and an
+                # averaged batch could drift point-to-point if the found
+                # dip/current isn't perfectly identical each time. Bug
+                # found on real hardware: coil_current_a specifically
+                # wasn't being pinned here at all (only freq_hz was) --
+                # since use_resonance_freq is forced false below, the
+                # coil-current scan (gated on that same flag) never ran
+                # again for repeats 1+, so they silently fell back to
+                # whatever coil_current_a was in the ORIGINAL kwargs, not
+                # the value the scan actually found on repeat 0. Confirmed
+                # symptom: repeat 0's coil current was correct, every
+                # later repeat's wasn't.
+                repeat_kw["freq_hz"] = resolved_freq_hz
+                repeat_kw["use_resonance_freq"] = "false"
+                # Frequency's already pinned from repeat 0, so re-running
+                # the FINE resonance sweep on every later repeat is pure
+                # waste -- but keep the coarse sweep and the reflected-
+                # power-at-operating-point check running (both still run
+                # unconditionally inside cmd_run()'s `if reflected_power_
+                # scan:` block regardless of fine_sweep -- only the fine
+                # STAGE is gated on it), since those are real safety
+                # checks, not part of the resonance search this is
+                # skipping.
+                repeat_kw["fine_sweep"] = "false"
+                pin_note = f", pinned to {resolved_freq_hz/1e9:.5f} GHz"
+                if resolved_coil_current_a is not None:
+                    repeat_kw["coil_current_a"] = resolved_coil_current_a
+                    pin_note += f", {resolved_coil_current_a:.3f} A"
+                pin_note += " (from repeat 0), fine sweep skipped"
+            print(f"[rabi] repeat {i + 1}/{n_repeats}: running {repeat_name} "
+                  f"(saved into {file_name}/){pin_note}")
+
+            repeat_kw["output_dir"] = file_name
+            args = [sys.executable, __file__, "run", repeat_name]
+            args += [f"{k}={v}" for k, v in repeat_kw.items()]
+            # Inherits this process's stdout/stderr (no capture_output) so
+            # the repeat's own live progress prints straight through, same
+            # as watching a single cmd_run() call.
+            result = subprocess.run(args)
+            if result.returncode != 0:
+                print(f"[rabi] repeat {i}: subprocess exited with code "
+                      f"{result.returncode} -- check its output above; "
+                      f"continuing to the next repeat regardless (a repeat "
+                      f"with no saved data is just excluded from the "
+                      f"average below)")
+
+            if i == 0:
+                metadata_path = f"{DATA_DIR}/{file_name}/{repeat_name}_rabi_metadata.txt"
+                if os.path.exists(metadata_path):
+                    with open(metadata_path) as fh:
+                        metadata_text = fh.read()
+                    repeat0_metadata = dict(
+                        line.split("=", 1) for line in metadata_text.strip().splitlines()
+                    )
+                    resolved_freq_hz = float(repeat0_metadata["freq_hz"])
+                    resolved_coil_current_a = float(repeat0_metadata["coil_current_a"])
+                    print(f"[rabi] repeat 0 ran at freq_hz={resolved_freq_hz/1e9:.5f} GHz, "
+                          f"coil_current_a={resolved_coil_current_a:.3f} A -- pinning "
+                          f"repeats 1..{n_repeats - 1} to these same values")
+                else:
+                    print("[rabi] repeat 0: no metadata saved (0 points completed) -- "
+                          "can't resolve a frequency to pin later repeats to; they'll "
+                          "use their own settings as given")
+    except KeyboardInterrupt:
+        print("[rabi] repeat: stopped by user (Ctrl+C) -- averaging whatever "
+              "repeats completed so far")
+
     run_path = f"{DATA_DIR}/{file_name}"
     os.makedirs(run_path, exist_ok=True)
 
@@ -1841,8 +2138,9 @@ def cmd_calibrate_phase(file_name, **kw):
 
     Recognized key=value overrides (all optional): freq_hz, drive_power_dbm,
     mw_us, n_reps, laser_us, pre_us, post_us, time_constant_s,
-    settle_time_constants, input_coupling, ch1_vpp, ch2_vpp, ch2_offset_v,
-    trigger_margin, psu_voltage_v, psu_current_limit_a, coil_current_a,
+    settle_periods, settle_time_constants, input_coupling, ch1_vpp,
+    ch2_vpp, ch2_offset_v, trigger_margin, anchor_free_reps,
+    extra_settle_s, psu_voltage_v, psu_current_limit_a, coil_current_a,
     coil_voltage_margin -- same meaning/defaults as cmd_run()'s.
     """
     freq_hz = float(kw.get("freq_hz", 2.843e9))
@@ -1853,6 +2151,7 @@ def cmd_calibrate_phase(file_name, **kw):
     pre_us = float(kw.get("pre_us", 1.0))
     post_us = float(kw.get("post_us", 1.0))
     time_constant_s = float(kw.get("time_constant_s", 0.1))
+    settle_periods = float(kw.get("settle_periods", 5.0))
     # See cmd_run()'s settle_time_constants comment -- 9 TC needed for the
     # 24 dB/oct filter to actually settle (~98%), not 5.
     settle_time_constants = float(kw.get("settle_time_constants", 9.0))
@@ -1860,7 +2159,18 @@ def cmd_calibrate_phase(file_name, **kw):
     ch1_vpp = float(kw.get("ch1_vpp", 0.632))
     ch2_vpp = float(kw.get("ch2_vpp", 5.0))
     ch2_offset_v = float(kw.get("ch2_offset_v", 2.5))
-    trigger_margin = float(kw.get("trigger_margin", 100))
+    trigger_margin = float(kw.get("trigger_margin", 3.0))
+    # This was missing entirely until now -- setup_awg_sequences() call
+    # below silently defaulted to anchor_free_reps=1, the exact pre-fix
+    # worst-case configuration behind the whole "spurious off-resonance/
+    # no-MW-near-sample signal" investigation in notes.md. auto_phase()
+    # needs a clean, accurate X/Y null -- running it under the same
+    # background artifact that whole investigation was about would
+    # silently corrupt any phase_deg it produces. See notes.md for the
+    # full history of why 1000 (not the module's own smaller historical
+    # defaults) is the validated value.
+    anchor_free_reps = int(kw.get("anchor_free_reps", 1000))
+    extra_settle_s = float(kw.get("extra_settle_s", 0.0))
     psu_voltage_v = float(kw.get("psu_voltage_v", 12.0))
     psu_current_limit_a = float(kw.get("psu_current_limit_a", 1.9))
     coil_current_a = float(kw.get("coil_current_a", 2.0))
@@ -1902,14 +2212,26 @@ def cmd_calibrate_phase(file_name, **kw):
 
             rep_us = laser_us + pre_us + mw_us + post_us
             ref_period_s = 2 * n_reps * rep_us * 1e-6
-            settle_s = max(5 * ref_period_s, settle_time_constants * time_constant_s)
+            settle_s = max(settle_periods * ref_period_s,
+                            settle_time_constants * time_constant_s)
+            # Trigger needs to keep up with the ANCHOR-WRAP rate (once per
+            # anchor_free_reps cycles), not the single-cycle rate -- same
+            # fix as cmd_run()'s fixed_external_trigger. Passing plain
+            # ref_period_s here (as this function always had, before
+            # anchor_free_reps existed at all) would starve the trigger
+            # relative to how infrequently this sequence actually needs
+            # retriggering now.
+            anchor_period_s = ref_period_s * anchor_free_reps
 
-            _configure_external_trigger(sdg, ref_period_s, margin=trigger_margin)
+            _configure_external_trigger(sdg, anchor_period_s, margin=trigger_margin)
             setup_awg_sequences(
                 awg, mw_us, n_reps, laser_us, pre_us, post_us,
                 sequence_name_ch1="calib_ch1", sequence_name_ch2="calib_ch2",
                 ch1_vpp=ch1_vpp, ch2_vpp=ch2_vpp, ch2_offset_v=ch2_offset_v,
+                anchor_free_reps=anchor_free_reps,
             )
+            if extra_settle_s > 0:
+                time.sleep(extra_settle_s)
 
             print(f"[rabi] settling {settle_s * 1e3:.0f} ms, then auto-gain + auto-phase")
             time.sleep(settle_s)
@@ -1920,6 +2242,21 @@ def cmd_calibrate_phase(file_name, **kw):
             time.sleep(settle_s)
             phase_deg = lia.get_phase_deg()
             x, y = lia.read_xy()
+
+            # Same diagnostic added to cmd_run() during the background-
+            # artifact investigation -- a corrupted reading (from the
+            # artifact that used to be caused by anchor_free_reps=1, or
+            # anything else) would otherwise look identical to a clean
+            # auto-phase result with no way to tell the difference.
+            status = lia.read_overload_status()
+            print(f"[rabi] diagnostic: reference_unlock={status['reference_unlock']}, "
+                  f"input_overload={status['input']}, "
+                  f"filter_overload={status['filter']}, "
+                  f"output_overload={status['output']}")
+            if status["reference_unlock"] or status["any"]:
+                print("[rabi] WARNING: reference unlock or overload flagged right "
+                      "at the auto-phase reading -- this phase_deg may be corrupted, "
+                      "consider re-running before trusting it")
 
             print(f"[rabi] auto-phase result: phase_deg={phase_deg:.3f} deg "
                   f"(X={x:.6e} V, Y={y:.6e} V after nulling)")
@@ -2076,6 +2413,37 @@ Pre-flight reflected-power scan (run only):
     res_power_dbm=-40.0
     res_cal_dir=None
     fine_sweep=true                 false skips just the fine stage
+    use_resonance_freq=false        true: freq_hz becomes the search
+                                     midpoint, actual drive frequency is
+                                     resolved from the coarse+fine dip
+                                     (always runs the fine stage
+                                     regardless of fine_sweep) -- run-
+                                     repeat only resolves this on the
+                                     FIRST repeat, later repeats reuse
+                                     that same resolved freq_hz. ALSO
+                                     triggers the coil current scan below.
+
+Coil current scan (run only, only when use_resonance_freq=true -- picks
+the coil_current_a that maximizes R at a fixed tau_mw, at the already-
+resolved freq_hz, before the real tau_mw sweep starts):
+    coil_scan_start_a=1.0
+    coil_scan_stop_a=4.0
+    coil_scan_step_a=0.5
+    coil_scan_tau_mw_us=0.5
+    coil_scan_n_repeats=5
+    coil_scan_current_settle_s=2.0  wait after each current change, before
+                                     measuring, for the field to settle
+
+Constant shot period (holds the total rep period, and therefore the
+reference frequency and laser duty cycle, IDENTICAL at every tau_mw
+sweep point, by padding out the tail of every rep to compensate for the
+varying mw_us):
+    constant_shot_period=false     true: pad_us = (mw_max_us - mw_us) +
+                                    pad_min_us at every point, so
+                                    laser_us+pre_us+mw_us+post_us+pad_us
+                                    is the same constant throughout
+    pad_min_us=0.0                 minimum pad at the sweep's own longest
+                                    tau_mw point (where mw_max_us-mw_us=0)
 """.strip("\n")
 
 

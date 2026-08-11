@@ -2192,6 +2192,20 @@ being verified against before building the real sweep into `rabi.py`.
   irrelevant since R is always computed from X/Y in software, never read
   from the instrument directly. Offset/expand is NOT the explanation.
 
+  **Removed the `setup_lock_in()` OEXP check entirely.** It crashed a real
+  `cmd_run()` (`ValueError: not enough values to unpack (expected 2, got
+  1)` from `get_offset_expand()`'s `OEXP? {channel}` query) even though
+  the identical code had worked fine when run standalone via `check_sr830_
+  offset_expand.py` earlier -- the query's response format apparently
+  isn't reliable across every calling context on this instrument/driver,
+  and since the check already confirmed offset/expand wasn't the cause of
+  the background artifact, it wasn't worth hardening further. `setup_lock_
+  in()` no longer touches OEXP at all. `get_offset_expand()`/`set_offset_
+  expand()` are still in `sr830.py` and `check_sr830_offset_expand.py`
+  still exists as a standalone spot-check if ever needed again, but
+  nothing in a real `cmd_run()`/`cmd_run_repeat()` call path uses them
+  anymore.
+
 - **Isolated the artifact from the real sweep entirely with two new
   scripts, `debug_repeat_one_point.py` (`with-reupload`/`no-reupload`
   commands) and `check_sr830_offset_expand.py`** -- both connect ONLY to
@@ -2399,3 +2413,250 @@ being verified against before building the real sweep into `rabi.py`.
   mechanism -- worth keeping in mind if pursuing the optics investigation
   further (e.g. RIN, or genuinely lower background dose, matter more than
   switching frequency per this data).
+
+- **Added `rabi.py run-repeat` (`cmd_run_repeat()`)** to repeat a full
+  sweep `n_repeats` times (default 10) and average X/Y elementwise across
+  completed repeats (R computed from the averaged X/Y after, never
+  averaged directly -- same convention as `cw_odmr_lock_in.py`'s
+  `cmd_sweep_average()`). Deliberately implemented as a thin wrapper that
+  calls the existing `cmd_run()` UNCHANGED once per repeat (full
+  reconnect/pre-flight/PSU cycle each time) rather than refactoring
+  `cmd_run()`'s internals to share one long-lived connection across
+  repeats -- slower, but zero risk of a repeat-batching refactor
+  introducing a new timing bug into the single-sweep path this whole
+  session was spent validating. A repeat that trips the interlock partway
+  through saves a shorter `mw_us` array and is excluded from the average
+  (grid mismatch against the first fully-completed repeat).
+
+  **Initially saved each repeat under its own `<file_name>_repeat{i}/`
+  folder -- 100 repeats meant 100 folders, which wasn't wanted.** Fixed by
+  adding an `output_dir` override to `cmd_run()` itself (defaults to
+  `file_name`, so normal single-`run` calls are completely unaffected):
+  when given, it controls only the save DIRECTORY, while `file_name`
+  still controls the file-name PREFIX within it -- previously these were
+  the same thing by construction (`run_path = f"{DATA_DIR}/{file_name}"`).
+  `cmd_run_repeat()` now calls `cmd_run(f"{file_name}_repeat{i}",
+  output_dir=file_name, **kw)` for every repeat, so all repeats (and the
+  final average) land in ONE shared `D:/rabi/<file_name>/` folder,
+  distinguished by file name (`<file_name>_repeat{i}_rabi_x.npy`, ...,
+  `<file_name>_avg_rabi_x.npy`), not by directory. Not yet run on real
+  hardware.
+
+- **`cmd_run_repeat()` surfaced a real GPIB reliability bug on real
+  hardware: a later repeat's `read_xy()` (`SNAP? X,Y`) crashed with
+  `ValueError: not enough values to unpack (expected 2, got 1)`**, and the
+  debug log showed a garbled non-numeric `ERRS?` response
+  (`-1.37837e-007,-1.13361e-005`, not a valid SR830 error code) right
+  before it. Root cause: `cmd_run_repeat()` reconnects to the SR830 fresh
+  for every repeat, all within the SAME Python process (unlike a normal
+  single `cmd_run()` invocation, where the OS/VISA layer fully tears down
+  the GPIB session on process exit) -- a response still in flight, or a
+  write the instrument hadn't finished processing, from the PREVIOUS
+  repeat's connection can linger and get misread by the start of the NEXT
+  one. **Fixed**: `SR830.close()` now calls `self.inst.clear()` (IEEE-
+  488.2 selected device clear, flushes/aborts any pending I/O on the
+  interface) before actually closing, wrapped in a try/except since a
+  truly wedged instrument could fail the clear itself without that
+  blocking the rest of shutdown. Since all three of `rabi.py`'s per-
+  command shutdown blocks already call `lia.close()` in their `finally`
+  clause (confirmed `KeyboardInterrupt` is caught INSIDE the try block
+  around the per-point loop, so `finally` -- and therefore this -- always
+  runs on Ctrl+C too, not just normal completion), this fix applies
+  everywhere automatically without touching `rabi.py` itself. Not yet
+  re-confirmed on real hardware that this actually prevents the garbled-
+  response failure recurring.
+
+- **Added `use_resonance_freq` to `cmd_run()`** -- `freq_hz` becomes a
+  search MIDPOINT instead of the fixed drive frequency: the existing
+  pre-flight coarse(+fine) sweep (already there for `reflected_power_
+  scan`'s diagnostic check) runs regardless of `reflected_power_scan`,
+  always includes the fine stage regardless of `fine_sweep` (a coarse-
+  only dip isn't precise enough to actually drive at), and -- the key
+  behavioral difference from the existing diagnostic mode -- does NOT
+  pin the fine sweep's center to `freq_hz` (`fine_center_hz=None` instead
+  of `fine_center_hz=freq_hz`), letting it land on wherever the coarse
+  dip actually is, same as `cw_odmr_lock_in.py`'s `use_resonance_sweep`.
+  `freq_hz` is then reassigned to the resolved `result["f0_hz"]` before
+  the generator is set up for the real sweep, so everything downstream
+  (the actual drive, the interlock check messages, the saved metadata)
+  automatically uses the resolved value with no separate plumbing needed.
+  Default `false` -- existing behavior (fixed `freq_hz`, fine sweep
+  centered on it, diagnostic only) is completely unchanged.
+
+  **`cmd_run_repeat()` pins every repeat after the first to repeat 0's
+  own recorded `freq_hz`** (read back from its saved metadata file),
+  with `use_resonance_freq` forced `false` for those -- one code path
+  handles both the plain-fixed-frequency case (repeat 0's recorded
+  `freq_hz` is just whatever was passed in, so pinning changes nothing)
+  and the `use_resonance_freq=true` case (repeat 0 resolves it via the
+  coarse+fine search, every later repeat reuses that exact value instead
+  of independently re-searching resonance each time -- slower, and could
+  drift point-to-point across an averaged batch otherwise).
+
+- **`cmd_run_repeat()`'s in-process design crashed on real hardware after
+  enough repeats**: `numpy._core._exceptions._ArrayMemoryError: Unable to
+  allocate 7.68 MiB` inside `upload_waveform()` -- a tiny allocation that
+  should never fail on a healthy system. Root cause: calling `cmd_run()`
+  directly, many times, in the SAME long-lived Python process (the
+  original design specifically to avoid touching `cmd_run()`'s internals)
+  meant nothing forced a truly clean slate between repeats -- heap
+  fragmentation and/or VISA session state from hundreds of large arb
+  uploads and instrument reconnects accumulated until an ordinary-sized
+  allocation failed. This is exactly the risk that design tradeoff
+  accepted in exchange for reusing `cmd_run()` unmodified (see the
+  original entry above) -- it just hadn't shown up yet.
+
+  **Fixed**: each repeat now runs `python rabi.py run <repeat_name> ...`
+  as a genuine SEPARATE OS PROCESS via `subprocess.run()` (inheriting
+  stdout/stderr so live progress still prints straight through), not an
+  in-process function call. A real process boundary eliminates this whole
+  class of accumulation bug for free -- the OS reclaims everything on
+  exit -- at the cost of one extra Python interpreter startup per repeat
+  (~1s, negligible next to an actual sweep). `cmd_run_repeat()` still
+  reuses `cmd_run()` completely unmodified; only how it's INVOKED changed
+  (subprocess argv instead of a direct Python call), so the single-sweep
+  path itself is still untouched by this. A `KeyboardInterrupt` while
+  waiting on a repeat's subprocess now stops the repeat loop early
+  (printed, not raised further) and proceeds to average whatever
+  completed so far, same as the previous in-process version's behavior.
+  Not yet re-run on real hardware to confirm this actually prevents the
+  memory error recurring.
+
+- **Added a coil-current optimization scan to `cmd_run()`, gated on
+  `use_resonance_freq=true`.** After resonance is found (and the pre-
+  flight operating-point reflected-power check passes), scans
+  `coil_current_a` from `coil_scan_start_a` to `coil_scan_stop_a`
+  (defaults 1.0-4.0 A, step 0.5 A) at a FIXED `coil_scan_tau_mw_us`
+  (default 0.5 us) and the already-resolved `freq_hz` -- uploads ONE
+  fixed pulse sequence via `setup_awg_sequences()` (never reconfigured
+  during the scan, same "no per-point reconfigure" simplicity as `pulsed_
+  odmr.py`), then at each current: sets the coil PSU (`voltage_for_
+  current(current_a) * coil_voltage_margin`, same pattern used
+  everywhere else in this codebase), waits `coil_scan_current_settle_s`
+  (default 2.0 s) for the field to settle, takes `coil_scan_n_repeats`
+  (default 5) repeated readings, and averages X/Y across them (R computed
+  from the averaged X/Y after, never averaged directly -- same
+  convention as `cmd_run_repeat()`/`cw_odmr_lock_in.py`). Picks the
+  current with the largest resulting R, overrides `coil_current_a` with
+  it for the rest of the run (re-applies it to the coil PSU before
+  continuing, since the scan loop's last-tried current isn't necessarily
+  the best one), and saves the whole scan
+  (`<file_name>_coil_scan_current_a.npy`/`_x.npy`/`_y.npy`/`_r.npy`).
+  `coil_current_a` is now also written to the run's saved metadata
+  (wasn't before), so it's visible whether a run used the value passed in
+  or one resolved by this scan.
+
+  **Important physics caveat, documented in the code comment**: the coil
+  current changes the static field, which shifts the NV resonance
+  frequency itself (Zeeman splitting) -- this scan does NOT re-find
+  resonance at each current, it holds `freq_hz` fixed at the ORIGINALLY
+  -resolved value throughout. So what's actually being optimized is
+  "signal at the original resonance frequency as a function of current,"
+  not "true on-resonance signal as a function of current" -- if the real
+  resonance drifts enough across the scanned current range (relative to
+  the linewidth), R could read artificially low at currents where the
+  line has moved off `freq_hz`, not because the true signal is weaker
+  there. Fine for a narrow scan relative to the linewidth; worth keeping
+  in mind if `coil_scan_stop_a - coil_scan_start_a` is large relative to
+  how fast the resonance shifts with current on this setup.
+
+  **Confirmed on real hardware (`measurement14`, `run-repeat` with
+  `use_resonance_freq=true`, 5/5 repeats).** Resolved `freq_hz=2839.85`
+  MHz from the coarse+fine scan, then the coil-current scan (1.0-4.0 A,
+  0.5 A step, `tau_mw=0.5 us`, 5 repeats/point) gave a clean, single-
+  peaked curve (roughly 16-23 uV across the range) with a clear maximum
+  at `coil_current_a=2.6` A -- picked and applied correctly, matching
+  what's in the saved metadata. Only `repeat0` actually ran the scan
+  (as designed -- `cmd_run_repeat()` pins later repeats to repeat 0's
+  resolved `freq_hz`, and since `coil_current_a` is likewise resolved and
+  then just an ordinary override for the rest of that same `cmd_run()`
+  call, subsequent repeats reuse it too without re-scanning).
+
+- **Added `constant_shot_period` to `cmd_run()`/`setup_awg_sequences()`**:
+  holds the TOTAL rep period (`laser_us+pre_us+mw_us+post_us+pad_us`)
+  identical at every point across the tau_mw sweep, instead of it varying
+  with `mw_us` like it always has. `pad_us = (mw_max_us - mw_us) +
+  pad_min_us` (`mw_max_us` = `mw_values_us.max()`, the sweep's actual
+  realized largest tau_mw -- NOT the nominal `mw_stop_us`, since `np.
+  arange`'s `stop+step/2` rounding can realize a value slightly past
+  `mw_stop_us`, which would make `pad_us` go negative for that point if
+  the nominal value were used instead). `pad_us` is appended as an extra
+  dead-time segment to the END of every rep (after `post_us`), on BOTH
+  channels -- `setup_awg_sequences()` takes a new `pad_us=0.0` parameter
+  for this, and 0.0 skips adding the segment ENTIRELY (not just a zero-
+  length one), so every existing default-off call site reproduces the
+  exact sample counts it always has, byte for byte.
+
+  Motivation: `fixed_external_trigger` already keeps the EXTERNAL
+  trigger's rate constant across the sweep regardless of `mw_us`, but the
+  AWG's own actual rep period (and therefore the true reference
+  frequency and the laser's duty cycle) still varied point to point
+  purely because `mw_us` does -- this closes that gap, making every
+  point's laser duty cycle and repetition rate genuinely identical, not
+  just the external trigger rate. `constant_shot_period` and `pad_min_us`
+  are threaded through the `fixed_external_trigger` setup block (using
+  `mw_start_us` as before, now also correctly padded) and the main per-
+  point loop's `rep_us`/`ref_period_s`/`settle_s` computation, and
+  `constant_shot_period`/`pad_min_us` are now saved to the run's
+  metadata (`constant_shot_period` written as `1`/`0`, not `True`/
+  `False`, since every existing metadata reader does `float(v)` on every
+  line uniformly -- see `rabi_result.ipynb`'s load cell). Off by default.
+
+  **Confirmed on real hardware (`measurement16`, `run-repeat` with
+  `use_resonance_freq=true` + `constant_shot_period=1`, `pad_min_us=0.1`,
+  5/5 repeats).** Resolved `freq_hz=2800.5` MHz, coil scan picked
+  `coil_current_a=3.9` A, ran clean (`reference_unlock=False` across all
+  5 repeats, no output-overload spikes) -- the padding segment addition
+  didn't introduce any new AWG/reference-side issue.
+
+- **Real bug found on real hardware: `cmd_run_repeat()` pinned `freq_hz`
+  across repeats but NOT `coil_current_a`.** Symptom: repeat 0's coil
+  current was correct (whatever the coil-current scan found), but every
+  later repeat's wasn't. Root cause: the pinning block sets `use_
+  resonance_freq=false` for repeats after the first, and the coil-current
+  scan is gated on that SAME flag -- so it never runs again for those
+  repeats, and since `coil_current_a` was never separately pinned, they
+  silently fell back to whatever was in the ORIGINAL kwargs (the
+  unoptimized starting value), not the value the scan actually found on
+  repeat 0. **Fixed**: read back `coil_current_a` from repeat 0's saved
+  metadata alongside `freq_hz` (it's saved unconditionally regardless of
+  `use_resonance_freq`, so this always works once repeat 0 completes),
+  and pin it into every later repeat's kwargs the same way. Not yet
+  re-run on real hardware to confirm.
+
+- **Also skip the FINE resonance sweep on repeats after the first**,
+  since `freq_hz` is already pinned by then and re-running it is pure
+  waste -- forces `fine_sweep=false` in the same pinning block. The
+  coarse sweep and the reflected-power-at-operating-point check still run
+  on every repeat regardless (both are unconditional inside `cmd_run()`'s
+  `if reflected_power_scan:` block -- only the fine STAGE is gated on
+  `fine_sweep`), since those are real safety checks, not part of the
+  resonance search being skipped. Not yet run on real hardware.
+
+- **`cmd_calibrate_phase()` was significantly out of date relative to
+  everything fixed in `cmd_run()` this session -- found when asked to
+  audit it.** Its `setup_awg_sequences()` call didn't pass `anchor_free_
+  reps` at all, silently defaulting to `1` -- the exact pre-fix worst-
+  case configuration behind the entire "spurious off-resonance/no-MW-
+  near-sample signal" investigation above. Since `auto_phase()` needs a
+  clean, accurate X/Y null, running phase calibration under that same
+  background artifact could silently produce a corrupted `phase_deg`
+  with no way to tell. Also missing: `extra_settle_s` entirely; the
+  `_configure_external_trigger()` call used raw `ref_period_s` instead of
+  `anchor_period_s = ref_period_s * anchor_free_reps` (would have needed
+  fixing together with adding `anchor_free_reps`, or the trigger
+  wouldn't actually keep up); `settle_s` hardcoded `5 * ref_period_s`
+  instead of an overridable `settle_periods` like `cmd_run()`; and none
+  of the `reference_unlock`/overload diagnostics added to `cmd_run()`
+  during the investigation.
+
+  **Fixed**: added `anchor_free_reps` (default `1000`, matching `cmd_
+  run()`'s current validated default), `extra_settle_s` (default `0.0`),
+  and `settle_periods` (default `5.0`) as proper overrides; fixed the
+  trigger call to use `anchor_period_s`; added the `extra_settle_s` sleep
+  after `setup_awg_sequences()`; and added the same `reference_unlock`/
+  overload check `cmd_run()` does, printed right at the auto-phase
+  reading with a warning if anything looks off. Not yet run on real
+  hardware -- worth re-calibrating phase with this fixed version before
+  trusting any `phase_deg` obtained from the OLD version, since it may
+  have been silently affected by the anchor_free_reps=1 issue.
