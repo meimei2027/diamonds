@@ -41,7 +41,10 @@ Usage:
         folder and averaging X/Y across completed repeats -- see cmd_
         run_repeat()'s docstring for details, including how use_
         resonance_sweep's resolved frequency range and coil_current_a
-        get pinned from repeat 0 for every repeat after it.
+        get pinned from repeat 0 for every repeat after it. Also supports
+        tau_mw_us_list (e.g. "0.5,1.0,2.0,5.0") to scan tau_mw_us across
+        independent repeat BATCHES, same idea as cw_odmr_lock_in.py's
+        drive_power_dbm_list -- see cmd_run_repeat()'s docstring.
 
     python pulsed_odmr.py calibrate-phase <file_name> [key=value ...]
         Runs continuously at a single, fixed freq_hz (opposite of
@@ -72,7 +75,14 @@ from spd1168x import SPD1168X
 from cw_odmr import parse_kv_args, _tee_stdout
 from cw_odmr_lock_in import set_switch_static
 
-DATA_DIR = rabi.DATA_DIR
+# Own dedicated data directory -- previously reused rabi.DATA_DIR
+# (D:/rabi), mixing pulsed ODMR frequency sweeps in with rabi.py's own
+# tau_mw sweeps. Matches cw_odmr.py's/cw_odmr_lock_in.py's convention of
+# each measurement TYPE getting its own top-level folder (D:/cw_odmr,
+# D:/cw_odmr_lock_in). Only affects NEW runs -- existing data (pulsed1-5,
+# pulsed_repeat, etc.) stays under D:/rabi where it was already saved and
+# already analyzed in pulsed_odmr_result.ipynb; not moved automatically.
+DATA_DIR = "D:\\pulsed_odmr"
 
 AWG_RESOURCE = rabi.AWG_RESOURCE
 SDG_RESOURCE = rabi.SDG_RESOURCE
@@ -879,6 +889,14 @@ def cmd_run(file_name, **kw):
     print("[pulsed_odmr] done")
 
 
+def _tau_tag(tau_mw_us):
+    """Filesystem-safe tag for a tau_mw_us value, e.g. 0.5 -> '0p5us',
+    2.0 -> '2us' -- used to disambiguate per-tau_mw output files in
+    cmd_run_repeat()'s tau_mw_us_list mode. Same idea as cw_odmr_lock_
+    in.py's _power_tag() for its drive_power_dbm_list."""
+    return f"{tau_mw_us:g}us".replace(".", "p")
+
+
 def cmd_run_repeat(file_name, **kw):
     """
     Repeat cmd_run() n_repeats times in a row with IDENTICAL settings,
@@ -897,10 +915,10 @@ def cmd_run_repeat(file_name, **kw):
     process, at the cost of one extra interpreter startup per repeat
     (negligible next to an actual frequency sweep).
 
-    All repeats' files land in ONE shared folder (D:/rabi/<file_name>/,
-    same as a plain cmd_run() call would use), distinguished by file name
-    (<file_name>_repeat{i}_pulsed_odmr_x.npy etc.) via cmd_run()'s
-    output_dir override, not by directory.
+    All repeats' files land in ONE shared folder (D:/pulsed_odmr/
+    <file_name>/, same as a plain cmd_run() call would use), distinguished
+    by file name (<file_name>_repeat{i}_pulsed_odmr_x.npy etc.) via
+    cmd_run()'s output_dir override, not by directory.
 
     DIFFERENCE 1 from rabi.py's version: rabi.py pins a single resolved
     freq_hz (its use_resonance_freq finds ONE frequency to drive at, for
@@ -928,8 +946,25 @@ def cmd_run_repeat(file_name, **kw):
     from repeat 0's metadata), covering the case where use_resonance_
     sweep also ran the coil-current scan.
 
+    tau_mw_us_list (optional, e.g. "0.5,1.0,2.0,5.0"): scans tau_mw_us
+    across repeat BATCHES, same idea as cw_odmr_lock_in.py's cmd_sweep_
+    average() drive_power_dbm_list -- for EACH tau_mw_us value, runs its
+    own independent batch of n_repeats repeats (its own repeat 0 finds/
+    pins its own resonance range and coil current, not shared across
+    tau_mw_us values, since the resonance frequency itself doesn't depend
+    on tau_mw but this keeps the pinning logic simple and matches cw_
+    odmr_lock_in.py's per-power independence), and averages within that
+    batch alone. Output files get a tau_mw tag via _tau_tag() (e.g.
+    "0.5" -> "0p5us") to disambiguate, same idea as cw_odmr_lock_in.py's
+    _power_tag() -- <file_name>_tau0p5us_repeat0_..., <file_name>_
+    tau0p5us_avg_..., etc. Without tau_mw_us_list, behaves exactly as
+    before (no tag, plain <file_name>_repeat{i}_...).
+
     Recognized key=value overrides:
-      n_repeats=10  number of times to repeat the sweep
+      n_repeats=10  number of times to repeat the sweep, per tau_mw_us
+                    value if tau_mw_us_list is given
+      tau_mw_us_list=None  comma-separated list of tau_mw_us values, e.g.
+                    "0.5,1.0,2.0,5.0" -- overrides tau_mw_us if given
       (everything else passed through to cmd_run() UNCHANGED, once per
       repeat)
 
@@ -939,131 +974,157 @@ def cmd_run_repeat(file_name, **kw):
     repeat's), not padded or partially averaged in.
 
     Saves each repeat's normal cmd_run() file set (prefixed <file_name>_
-    repeat{i}_...) plus, once at least one repeat completes fully, the
-    average (prefixed <file_name>_avg_...) -- all under D:/rabi/<file_name>/:
+    [tau<tag>_]repeat{i}_...) plus, once at least one repeat in a batch
+    completes fully, that batch's average (prefixed <file_name>_[tau<tag>_]
+    avg_...) -- all under D:/pulsed_odmr/<file_name>/:
       <file_name>_repeat{i}_pulsed_odmr_freqs_hz.npy, _x.npy, _y.npy, ...
       <file_name>_avg_pulsed_odmr_freqs_hz.npy, _avg_pulsed_odmr_x.npy,
       _avg_pulsed_odmr_y.npy, _avg_pulsed_odmr_r.npy, _avg_pulsed_odmr_
       metadata.txt (records n_repeats_requested vs. n_repeats_averaged).
     """
     n_repeats = int(kw.pop("n_repeats", 10))
+    tau_mw_us_list_raw = kw.pop("tau_mw_us_list", None)
+    multi_tau = tau_mw_us_list_raw is not None
+    if multi_tau:
+        tau_list = [float(t) for t in str(tau_mw_us_list_raw).split(",")]
+    else:
+        tau_list = [None]  # single batch, no tag, tau_mw_us left as given (or cmd_run()'s own default)
     import subprocess
     import glob
     import re
 
-    resolved_start_hz = None
-    resolved_stop_hz = None
-    resolved_coil_current_a = None
-    try:
+    for tau_mw_us in tau_list:
+        if multi_tau:
+            tau_tag = _tau_tag(tau_mw_us)
+            group_prefix = f"{file_name}_tau{tau_tag}"
+            print(f"[pulsed_odmr] tau_mw_us={tau_mw_us} us: starting batch "
+                  f"of {n_repeats} repeats (saved as {group_prefix}_...)")
+        else:
+            group_prefix = file_name
+
+        resolved_start_hz = None
+        resolved_stop_hz = None
+        resolved_coil_current_a = None
+        try:
+            for i in range(n_repeats):
+                repeat_name = f"{group_prefix}_repeat{i}"
+                repeat_kw = dict(kw)
+                if multi_tau:
+                    repeat_kw["tau_mw_us"] = tau_mw_us
+                pin_note = ""
+                if resolved_start_hz is not None:
+                    repeat_kw["start_hz"] = resolved_start_hz
+                    repeat_kw["stop_hz"] = resolved_stop_hz
+                    repeat_kw["use_resonance_sweep"] = "false"
+                    pin_note = (f", pinned to {resolved_start_hz/1e9:.5f}-"
+                                f"{resolved_stop_hz/1e9:.5f} GHz")
+                    if resolved_coil_current_a is not None:
+                        repeat_kw["coil_current_a"] = resolved_coil_current_a
+                        pin_note += f", {resolved_coil_current_a:.3f} A"
+                    pin_note += " (from this batch's repeat 0)"
+                print(f"[pulsed_odmr] repeat {i + 1}/{n_repeats}: running "
+                      f"{repeat_name} (saved into {file_name}/){pin_note}")
+
+                repeat_kw["output_dir"] = file_name
+                args = [sys.executable, __file__, "run", repeat_name]
+                args += [f"{k}={v}" for k, v in repeat_kw.items()]
+                # Inherits this process's stdout/stderr (no capture_output)
+                # so the repeat's own live progress prints straight
+                # through, same as watching a single cmd_run() call.
+                result = subprocess.run(args)
+                if result.returncode != 0:
+                    print(f"[pulsed_odmr] repeat {i}: subprocess exited "
+                          f"with code {result.returncode} -- check its "
+                          f"output above; continuing to the next repeat "
+                          f"regardless (a repeat with no saved data is "
+                          f"just excluded from the average below)")
+
+                if i == 0:
+                    run_path0 = f"{DATA_DIR}/{file_name}"
+                    freqs_path = f"{run_path0}/{repeat_name}_pulsed_odmr_freqs_hz.npy"
+                    metadata_path = f"{run_path0}/{repeat_name}_pulsed_odmr_metadata.txt"
+                    if os.path.exists(freqs_path):
+                        freqs0 = np.load(freqs_path)
+                        resolved_start_hz = float(freqs0.min())
+                        resolved_stop_hz = float(freqs0.max())
+                        print(f"[pulsed_odmr] {group_prefix} repeat 0 swept "
+                              f"{resolved_start_hz/1e9:.5f}-{resolved_stop_hz/1e9:.5f} "
+                              f"GHz -- pinning repeats 1..{n_repeats - 1} to "
+                              f"this same range")
+                        if os.path.exists(metadata_path):
+                            with open(metadata_path) as fh:
+                                metadata_text = fh.read()
+                            repeat0_metadata = dict(
+                                line.split("=", 1) for line in metadata_text.strip().splitlines()
+                            )
+                            if "coil_current_a" in repeat0_metadata:
+                                resolved_coil_current_a = float(repeat0_metadata["coil_current_a"])
+                                print(f"[pulsed_odmr] {group_prefix} repeat 0 "
+                                      f"used coil_current_a="
+                                      f"{resolved_coil_current_a:.3f} A -- "
+                                      f"pinning later repeats to this too")
+                    else:
+                        print(f"[pulsed_odmr] {group_prefix} repeat 0: no "
+                              f"data saved (0 points completed) -- can't "
+                              f"resolve a range to pin later repeats to; "
+                              f"they'll use their own settings as given")
+        except KeyboardInterrupt:
+            print("[pulsed_odmr] repeat: stopped by user (Ctrl+C) -- "
+                  "averaging whatever repeats completed so far")
+
+        run_path = f"{DATA_DIR}/{file_name}"
+        os.makedirs(run_path, exist_ok=True)
+
+        reference_freqs_hz = None
+        xs, ys = [], []
+        n_averaged = 0
         for i in range(n_repeats):
-            repeat_name = f"{file_name}_repeat{i}"
-            repeat_kw = dict(kw)
-            pin_note = ""
-            if resolved_start_hz is not None:
-                repeat_kw["start_hz"] = resolved_start_hz
-                repeat_kw["stop_hz"] = resolved_stop_hz
-                repeat_kw["use_resonance_sweep"] = "false"
-                pin_note = (f", pinned to {resolved_start_hz/1e9:.5f}-"
-                            f"{resolved_stop_hz/1e9:.5f} GHz")
-                if resolved_coil_current_a is not None:
-                    repeat_kw["coil_current_a"] = resolved_coil_current_a
-                    pin_note += f", {resolved_coil_current_a:.3f} A"
-                pin_note += " (from repeat 0)"
-            print(f"[pulsed_odmr] repeat {i + 1}/{n_repeats}: running "
-                  f"{repeat_name} (saved into {file_name}/){pin_note}")
+            repeat_name = f"{group_prefix}_repeat{i}"
+            freqs_path = f"{run_path}/{repeat_name}_pulsed_odmr_freqs_hz.npy"
+            if not os.path.exists(freqs_path):
+                print(f"[pulsed_odmr] {group_prefix} repeat {i}: no data "
+                      f"saved (0 points completed) -- excluded from average")
+                continue
+            freqs_i = np.load(freqs_path)
+            if reference_freqs_hz is None:
+                reference_freqs_hz = freqs_i
+            elif len(freqs_i) != len(reference_freqs_hz) or not np.allclose(freqs_i, reference_freqs_hz):
+                print(f"[pulsed_odmr] {group_prefix} repeat {i}: freqs_hz "
+                      f"grid doesn't match the first completed repeat's "
+                      f"({len(freqs_i)} vs {len(reference_freqs_hz)} "
+                      f"points) -- partial/tripped repeat, excluded from "
+                      f"average")
+                continue
+            xs.append(np.load(f"{run_path}/{repeat_name}_pulsed_odmr_x.npy"))
+            ys.append(np.load(f"{run_path}/{repeat_name}_pulsed_odmr_y.npy"))
+            n_averaged += 1
 
-            repeat_kw["output_dir"] = file_name
-            args = [sys.executable, __file__, "run", repeat_name]
-            args += [f"{k}={v}" for k, v in repeat_kw.items()]
-            # Inherits this process's stdout/stderr (no capture_output) so
-            # the repeat's own live progress prints straight through, same
-            # as watching a single cmd_run() call.
-            result = subprocess.run(args)
-            if result.returncode != 0:
-                print(f"[pulsed_odmr] repeat {i}: subprocess exited with "
-                      f"code {result.returncode} -- check its output "
-                      f"above; continuing to the next repeat regardless "
-                      f"(a repeat with no saved data is just excluded "
-                      f"from the average below)")
+        if n_averaged == 0:
+            print(f"[pulsed_odmr] {group_prefix}: no complete repeats to "
+                  f"average -- nothing saved for this batch")
+            if multi_tau:
+                continue
+            return
 
-            if i == 0:
-                run_path0 = f"{DATA_DIR}/{file_name}"
-                freqs_path = f"{run_path0}/{repeat_name}_pulsed_odmr_freqs_hz.npy"
-                metadata_path = f"{run_path0}/{repeat_name}_pulsed_odmr_metadata.txt"
-                if os.path.exists(freqs_path):
-                    freqs0 = np.load(freqs_path)
-                    resolved_start_hz = float(freqs0.min())
-                    resolved_stop_hz = float(freqs0.max())
-                    print(f"[pulsed_odmr] repeat 0 swept "
-                          f"{resolved_start_hz/1e9:.5f}-{resolved_stop_hz/1e9:.5f} "
-                          f"GHz -- pinning repeats 1..{n_repeats - 1} to this "
-                          f"same range")
-                    if os.path.exists(metadata_path):
-                        with open(metadata_path) as fh:
-                            metadata_text = fh.read()
-                        repeat0_metadata = dict(
-                            line.split("=", 1) for line in metadata_text.strip().splitlines()
-                        )
-                        if "coil_current_a" in repeat0_metadata:
-                            resolved_coil_current_a = float(repeat0_metadata["coil_current_a"])
-                            print(f"[pulsed_odmr] repeat 0 used coil_current_a="
-                                  f"{resolved_coil_current_a:.3f} A -- pinning "
-                                  f"later repeats to this too")
-                else:
-                    print("[pulsed_odmr] repeat 0: no data saved (0 points "
-                          "completed) -- can't resolve a range to pin later "
-                          "repeats to; they'll use their own settings as given")
-    except KeyboardInterrupt:
-        print("[pulsed_odmr] repeat: stopped by user (Ctrl+C) -- averaging "
-              "whatever repeats completed so far")
+        x_avg = np.mean(xs, axis=0)
+        y_avg = np.mean(ys, axis=0)
+        r_avg = np.sqrt(x_avg ** 2 + y_avg ** 2)
 
-    run_path = f"{DATA_DIR}/{file_name}"
-    os.makedirs(run_path, exist_ok=True)
+        np.save(f"{run_path}/{group_prefix}_avg_pulsed_odmr_freqs_hz.npy", reference_freqs_hz)
+        np.save(f"{run_path}/{group_prefix}_avg_pulsed_odmr_x.npy", x_avg)
+        np.save(f"{run_path}/{group_prefix}_avg_pulsed_odmr_y.npy", y_avg)
+        np.save(f"{run_path}/{group_prefix}_avg_pulsed_odmr_r.npy", r_avg)
+        with open(f"{run_path}/{group_prefix}_avg_pulsed_odmr_metadata.txt", "w") as fh:
+            fh.write(f"n_repeats_requested={n_repeats}\n")
+            fh.write(f"n_repeats_averaged={n_averaged}\n")
+            if multi_tau:
+                fh.write(f"tau_mw_us={tau_mw_us}\n")
 
-    reference_freqs_hz = None
-    xs, ys = [], []
-    n_averaged = 0
-    for i in range(n_repeats):
-        repeat_name = f"{file_name}_repeat{i}"
-        freqs_path = f"{run_path}/{repeat_name}_pulsed_odmr_freqs_hz.npy"
-        if not os.path.exists(freqs_path):
-            print(f"[pulsed_odmr] repeat {i}: no data saved (0 points "
-                  f"completed) -- excluded from average")
-            continue
-        freqs_i = np.load(freqs_path)
-        if reference_freqs_hz is None:
-            reference_freqs_hz = freqs_i
-        elif len(freqs_i) != len(reference_freqs_hz) or not np.allclose(freqs_i, reference_freqs_hz):
-            print(f"[pulsed_odmr] repeat {i}: freqs_hz grid doesn't match "
-                  f"the first completed repeat's ({len(freqs_i)} vs "
-                  f"{len(reference_freqs_hz)} points) -- partial/tripped "
-                  f"repeat, excluded from average")
-            continue
-        xs.append(np.load(f"{run_path}/{repeat_name}_pulsed_odmr_x.npy"))
-        ys.append(np.load(f"{run_path}/{repeat_name}_pulsed_odmr_y.npy"))
-        n_averaged += 1
-
-    if n_averaged == 0:
-        print(f"[pulsed_odmr] repeat: no complete repeats to average -- "
-              f"nothing saved to {run_path}")
-        return
-
-    x_avg = np.mean(xs, axis=0)
-    y_avg = np.mean(ys, axis=0)
-    r_avg = np.sqrt(x_avg ** 2 + y_avg ** 2)
-
-    np.save(f"{run_path}/{file_name}_avg_pulsed_odmr_freqs_hz.npy", reference_freqs_hz)
-    np.save(f"{run_path}/{file_name}_avg_pulsed_odmr_x.npy", x_avg)
-    np.save(f"{run_path}/{file_name}_avg_pulsed_odmr_y.npy", y_avg)
-    np.save(f"{run_path}/{file_name}_avg_pulsed_odmr_r.npy", r_avg)
-    with open(f"{run_path}/{file_name}_avg_pulsed_odmr_metadata.txt", "w") as fh:
-        fh.write(f"n_repeats_requested={n_repeats}\n")
-        fh.write(f"n_repeats_averaged={n_averaged}\n")
-
-    print(f"[pulsed_odmr] repeat done: averaged {n_averaged}/{n_repeats} "
-          f"completed repeats, saved {run_path}/{file_name}_avg_pulsed_odmr_"
-          f"freqs_hz.npy, _avg_pulsed_odmr_x.npy, _avg_pulsed_odmr_y.npy, "
-          f"_avg_pulsed_odmr_r.npy, _avg_pulsed_odmr_metadata.txt")
+        print(f"[pulsed_odmr] {group_prefix} done: averaged {n_averaged}/"
+              f"{n_repeats} completed repeats, saved {run_path}/"
+              f"{group_prefix}_avg_pulsed_odmr_freqs_hz.npy, "
+              f"_avg_pulsed_odmr_x.npy, _avg_pulsed_odmr_y.npy, "
+              f"_avg_pulsed_odmr_r.npy, _avg_pulsed_odmr_metadata.txt")
 
 
 def cmd_calibrate_phase(file_name, **kw):

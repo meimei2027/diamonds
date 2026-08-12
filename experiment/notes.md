@@ -3040,5 +3040,80 @@ being verified against before building the real sweep into `rabi.py`.
   `rabi.py`'s version -- read back from repeat 0's metadata. Saves
   `_avg_pulsed_odmr_freqs_hz.npy`/`_x.npy`/`_y.npy`/`_r.npy`/`_metadata.
   txt` (records `n_repeats_requested` vs. `n_repeats_averaged`), same
-  convention as `rabi.py`'s `_avg_rabi_*` files. Not yet run on real
+  convention as `rabi.py`'s `_avg_rabi_*` files. Confirmed working on real
+  hardware (`pulsed_repeat`, 5+ repeats averaged cleanly).
+
+- **Gave `pulsed_odmr.py` its own dedicated data directory**
+  (`DATA_DIR = "D:\\pulsed_odmr"`, was `rabi.DATA_DIR` i.e. `D:/rabi`).
+  Matches `cw_odmr.py`'s/`cw_odmr_lock_in.py`'s convention of each
+  measurement TYPE getting its own top-level folder, instead of mixing
+  pulsed ODMR frequency sweeps into `rabi.py`'s own `tau_mw`-sweep folder.
+  Only affects NEW runs -- existing data (`pulsed1-5`, `pulsed_repeat`,
+  etc.) stays under `D:/rabi` where it was already saved and already
+  analyzed in `pulsed_odmr_result.ipynb`; not moved automatically. Any
+  new `pulsed_odmr.py` runs from now on need `DATA_DIR = "D:/pulsed_odmr"`
+  in the analysis notebook instead of `"D:/rabi"`.
+
+- **Added `tau_mw_us_list` to `pulsed_odmr.py`'s `run-repeat`** (e.g.
+  `tau_mw_us_list=0.5,1.0,2.0,5.0`), mirroring `cw_odmr_lock_in.py`'s
+  `drive_power_dbm_list` on its own `cmd_sweep_average()`. For EACH
+  `tau_mw_us` value, runs its own independent batch of `n_repeats`
+  repeats -- that batch's OWN repeat 0 finds/pins its own resonance range
+  and coil current (not shared across `tau_mw_us` values, for simplicity,
+  matching `cw_odmr_lock_in.py`'s per-power independence even though the
+  resonance frequency itself doesn't actually depend on `tau_mw`), and
+  averages within that batch alone. New `_tau_tag()` helper (mirrors
+  `cw_odmr_lock_in.py`'s `_power_tag()`) makes output files filesystem-
+  safe-tagged per `tau_mw_us` value (e.g. `0.5` -> `0p5us`) so all
+  batches still land in the same shared folder
+  (`D:/pulsed_odmr/<file_name>/`) without colliding:
+  `<file_name>_tau0p5us_repeat0_...`, `<file_name>_tau0p5us_avg_...`,
+  etc. Without `tau_mw_us_list`, behavior is unchanged (no tag, plain
+  `<file_name>_repeat{i}_...`, exactly as before). Not yet run on real
   hardware.
+
+- **Added `tests/amplifier_power_scan.ipynb`** -- a proper amplifier
+  power/compression sweep, companion to `tests/new_amplifier_gain.ipynb`
+  (which only ever sampled TWO fixed drive powers, -40 and 0 dBm, across
+  a frequency sweep). This new one fixes frequency and sweeps `power_dbm`
+  continuously from -40 to 0 dBm (`POWER_STEP_DBM=2.0` default) to trace
+  a real P_out-vs-P_in compression curve and compute P1dB (1 dB
+  compression point, linearly interpolated between bracketing points,
+  referenced to the lowest-power/least-compressed point's small-signal
+  gain). Uses the SAME coupled physical path (amplifier -> isolator ->
+  coupler -> load, forward-coupled port -> E4403B) as `new_amplifier_
+  gain.ipynb`'s "Compression point" section, for the WHOLE sweep (not
+  just the high end) -- 0 dBm in plus ~30 dB of gain is unsafe direct
+  into the analyzer at any point in this range, not only at the top.
+  `FIXED_FREQ_HZ` defaults to 2.5 GHz (band center, no more specific
+  target given) -- docstring notes 2.22 GHz (this amplifier's own
+  measured peak-output frequency at 0 dBm, from the already-saved
+  `new_amplifier_max_output_0dbm.csv`) and ~2.84 GHz (the actual NV drive
+  frequency used elsewhere in this project) as alternatives depending on
+  whether the goal is characterizing the amplifier itself or real
+  operating performance.
+
+  Settling time: `hp8673h.py`'s `frequency_sweep()` docstring documents a
+  confirmed real GPIB-race bug on this generator (`settle_s=0` -> false
+  >13 dB "dips" at specific frequencies, since the analyzer's `INIT:IMM`
+  fires before the generator finishes processing the previous SCPI
+  command). That bug was characterized for FREQUENCY steps, but a `PL...
+  DB` power-level command still has to settle through the generator's own
+  leveling loop, so the same race is plausible for POWER steps too --
+  applied the identical defense: `INITIAL_SETTLE_S=1.0` once after the
+  first power/frequency jump (mirrors `frequency_sweep()`'s `initial_
+  settle_s`), a smaller but still nonzero `SETTLE_S=0.05` between each
+  subsequent power step (never 0), and the same `INIT:IMM` + `*OPC?`
+  synchronization before reading the marker (the actual defense against
+  the race -- the sleep alone reduces the odds but `*OPC?` is what
+  confirms the analyzer's own measurement genuinely completed first).
+
+  Saves `data/new_amplifier_power_scan.csv` (`input_power_dbm`,
+  `coupled_power_dbm`, `estimated_output_dbm`, `gain_db`) and `data/
+  new_amplifier_power_scan_metadata.txt` (`fixed_freq_hz`, `coupling_db`,
+  `small_signal_gain_db`, `p1db_dbm`), plus a standalone "Analysis from
+  saved data" section reproducing both plots + P1dB from disk, same
+  pattern as `new_amplifier_gain.ipynb`'s own reload section. Validated
+  the notebook's JSON structure and that every code cell parses as valid
+  Python -- NOT yet run against real hardware (needs the HP8673H/E4403B
+  connected, which this environment doesn't have).

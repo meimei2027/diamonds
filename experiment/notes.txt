@@ -61,4 +61,8 @@ python rabi.py run-repeat measurement17 laser_us=5 constant_shot_period=true pad
 
 
 
-python pulsed_odmr.py run pulsed4 extra_settle_s=1 threshold_dbm=-5 freq_step_hz=100e3 laser_us=5 use_resonance_sweep=false start_hz=2.83e9 stop_hz=2.85e9 anchor_free_reps=80000 coil_current_a=2.5 tau_mw_us=2
+
+python rabi.py run-repeat measurement17 laser_us=5 constant_shot_period=true pad_min_us=0.1 n_repeats=5 freq_hz=2.84e9 threshold_dbm=-5 coil_current_a=2.5 mw_start_us=0.02 mw_stop_us=5 mw_step_us=0.2 extra_settle_s=1
+
+
+python pulsed_odmr.py run-repeat scan1 tau_mw_us_list=0.5,1.0,2.0,5.0 n_repeats=5 freq_hz=2.8e9
