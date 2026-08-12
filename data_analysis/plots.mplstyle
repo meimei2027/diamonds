@@ -1,0 +1,22 @@
+axes.grid : True
+axes.titlesize : 18
+axes.labelsize : 14
+
+grid.color : "#cccccc"
+grid.linestyle : --
+grid.linewidth : 0.8
+
+lines.linewidth : 2.5
+lines.markersize : 3
+
+font.family : DejaVu Sans
+font.size : 12
+
+xtick.labelsize : 11
+ytick.labelsize : 11
+
+legend.frameon : False
+legend.fontsize : 13
+
+savefig.dpi : 300
+savefig.bbox : tight
