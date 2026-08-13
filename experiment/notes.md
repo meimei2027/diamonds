@@ -897,6 +897,12 @@ off, far off-resonance) before trusting any result from it.
   the relevant relaxation timescale is (the T1 sweep above suggests
   order-100s of us, not the ~18.7us originally assumed) rather than
   worrying about T2*.
+- `run-repeat`'s `tau_mw_us_list` and `drive_power_dbm_list` can now be
+  combined for a full 2D grid (one independent `n_repeats` batch per
+  (tau_mw_us, drive_power_dbm) pair, each pair's own repeat 0 independently
+  finding/pinning its own resonance range and coil current) -- output files
+  get both tags, e.g. `<file_name>_tau0p5us_powerm5dBm_repeat0_...`. With
+  only one list given, behaves exactly as that list's existing 1D case.
 
 ## Rabi oscillation (rabi.py) -- NOT YET TESTED
 
@@ -1858,6 +1864,20 @@ being verified against before building the real sweep into `rabi.py`.
 
 ## General
 
+- **E4403B's RBW/VBW can be left in manual mode from a previous
+  measurement, and `hp8673h.py`'s `frequency_sweep()`/`coarse_sweep()`/
+  `fine_sweep()` never touch `BAND`/`BAND:VID` -- they just inherit
+  whatever the analyzer was last set to.** Found the RBW manually pinned
+  at 10 kHz (`BAND:AUTO?` -> 0) while starting a fresh 1 GHz-span sweep
+  (`tests/amplifier_power_scan.ipynb`) -- with `SWE:TIME:AUTO ON`, that
+  narrow a RBW across that wide a span forced `SWE:TIME?` to ~12.9s
+  *per point* (`frequency_sweep()` calls `INIT:IMM` once per frequency
+  step), which is what "one point taking forever" looks like. Confirmed
+  live: `sa.write("BAND:AUTO ON")` immediately re-couples RBW to ~3 MHz
+  for a 1 GHz span and drops the sweep time to ~4ms -- over 3000x
+  faster. Any notebook doing a wide-span sweep should explicitly force
+  `BAND:AUTO ON`/`BAND:VID:AUTO ON` in its setup rather than trusting
+  the instrument's current state.
 - **Two GPIB-USB adapters share a USB hub**, causing intermittent
   `VI_ERROR_CONN_LOST`. `visa_retry.py`'s `call_with_reconnect()` retries
   automatically (up to 3x) and is already wired into both driver classes'

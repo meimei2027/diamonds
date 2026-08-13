@@ -59,6 +59,8 @@ python rabi.py run-repeat measurement14 n_repeats=5 freq_hz=2.842e9 threshold_db
 
 python rabi.py run-repeat measurement17 laser_us=5 constant_shot_period=true pad_min_us=0.1 n_repeats=5 freq_hz=2.842e9 threshold_dbm=-5 use_resonance_freq=true coil_scan_start_a=1.0 coil_scan_stop_a=5.0 coil_scan_step_a=0.1 coil_scan_tau_mw_us=0.5 coil_scan_n_repeats=5 mw_start_us=0.005 mw_stop_us=0.5 mw_step_us=0.01 extra_settle_s=1
 
+python pulsed_odmr.py run-repeat tau_scan_14 tau_mw_us_list=0.13,0.16,0.19 n_repeats=1 use_resonance_sweep=false start_hz=2.855e9 stop_hz=2.885e9 freq_step_hz=50e3 threshold_dbm=-5 laser_us=5 extra_settle_s=1 coil_current_a=0 anchor_free_reps=800000 drive_power_dbm_list=-25
+
 
 
 
