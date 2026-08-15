@@ -1,0 +1,5 @@
+gain_start_hz=1500000000.0
+gain_stop_hz=3000000000.0
+gain_step_hz=20000000.0
+coupling_db=20.0
+power_list_dbm=0,-5,-10,-15,-20,-25

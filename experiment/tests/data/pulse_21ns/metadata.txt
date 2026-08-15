@@ -1,0 +1,8 @@
+period_ns=21
+chop_freq_hz=47619047.61904761
+duty_cycle_pct=50.0
+drive_power_dbm=0.0
+carrier_hz=2500000000.0
+span_hz=952380952.3809522
+rbw_hz=2380952.3809523806
+timestamp=2026-08-11T23:19:30.617619

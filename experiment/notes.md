@@ -903,6 +903,25 @@ off, far off-resonance) before trusting any result from it.
   finding/pinning its own resonance range and coil current) -- output files
   get both tags, e.g. `<file_name>_tau0p5us_powerm5dBm_repeat0_...`. With
   only one list given, behaves exactly as that list's existing 1D case.
+- **`reference_unlock` fraction scales sharply with `tau_mw_us` itself,
+  independent of `drive_power_dbm`.** Found while building a max-R heatmap
+  across `tau_scan_15/16/17` (2D `tau_mw_us_list` x `drive_power_dbm_list`
+  grids, `anchor_free_reps=800000`): unlock fraction was ~5-7% at
+  `tau_mw=8` us, ~15-19% at 16 us, ~29-35% at 32 us, and 60-64% at 64 us --
+  consistent across EVERY power level checked (-5 to -40 dBm), so this
+  isn't a power/signal-strength effect. A single unlock-flagged point can
+  be a severe outlier (one `tau=64us, -10dBm` point read 255 uV against a
+  ~3 uV median for that sweep -- a >90x spike), which silently corrupted
+  an early max-R heatmap into a false bright band at `tau=64us` before
+  points were filtered by `reference_unlock` (same convention as every
+  other fit/stat in this codebase). Not yet root-caused -- plausible
+  cause is the same trigger-period/`anchor_free_reps` timing sensitivity
+  from the earlier `trigger_retrigger_free_reps` investigation (this
+  module's whole-sweep-long AWG upload period should be independent of
+  `tau_mw_us`, but the periodic interlock ABOR-and-resume cycle's timing
+  relative to one AWG rep period does depend on it) -- worth checking
+  whether `trigger_retrigger_free_reps` or `extra_settle_s` need to scale
+  with `tau_mw_us` too, not just stay fixed.
 
 ## Rabi oscillation (rabi.py) -- NOT YET TESTED
 
