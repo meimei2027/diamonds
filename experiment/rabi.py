@@ -33,17 +33,14 @@ on real hardware in tests/rabi_awg_marker_test.ipynb -- see notes.md's
 See notes.md's "cw_odmr_lock_in.py operation notes" section for the
 lock-in/PSU conventions reused here.
 
-Interlock note: reflected power is checked with the spectrum analyzer in
-MAX HOLD mode (HP8673H.read_max_hold_reflected_power_dbm()), not a single
-sweep. A single sweep (read_reflected_power_dbm(), used everywhere else in
-this codebase) has no way to reliably land inside a microsecond-scale MW
-pulse -- GPIB round-trip time plus the analyzer's own sweep time both run
-far slower than that. MAX HOLD instead free-runs for several full
-reference periods, so it's guaranteed to catch at least one real pulse at
-its peak somewhere in that window -- trading timing precision for a
-hardware guarantee. Each check takes multiple reference periods to
-complete, so it only runs periodically (interlock_check_interval), not on
-every sweep point.
+Interlock note: reflected power is checked with a CW reading
+(_cw_interlock_check()): CH2 is held high so RF goes to the sample
+continuously at the real drive power, and one single-sweep reading is
+taken. The analyzer can't measure the ns-to-us pulses themselves -- the
+old MAX HOLD approach under-read them by 20-40 dB on pcb_rabi1 -- and the
+CW reflected power is the pulses' peak reflected power. Runs once before
+every sweep (whatever reflected_power_scan is) and before the sequence
+setup of every interlock_check_interval-th point.
 
 Usage:
     python rabi.py run <file_name> [key=value ...]
@@ -527,6 +524,55 @@ def _configure_external_trigger(sdg, ref_period_s, margin=100):
     return freq_hz
 
 
+CW_CHECK_SETTLE_S = 0.2
+
+
+def _cw_interlock_check(gen, awg, sa, freq_hz, threshold_dbm, where):
+    """
+    Hold CH2 high so the switch routes RF to the sample continuously, take one
+    single-sweep reflected-power reading at freq_hz, and trip the interlock if
+    it's over threshold_dbm or unreadable. A CW reading is needed because the
+    analyzer under-reads ns-to-us pulses by 20-40 dB even in MAX HOLD
+    (confirmed on pcb_rabi1). Leaves CH2 static -- the caller's next
+    setup_awg_sequences() puts it back to pulsing.
+
+    Returns (power_dbm or None, tripped).
+    """
+    set_switch_static(awg, route_to_sample=True)
+    time.sleep(CW_CHECK_SETTLE_S)
+    power_dbm = HP8673H.read_reflected_power_dbm(sa, freq_hz)
+    if power_dbm is not None:
+        print(f"[rabi] CW interlock check ({where}): reflected power {power_dbm:.2f} dBm "
+              f"(threshold {threshold_dbm} dBm) -- "
+              f"{'OK' if power_dbm <= threshold_dbm else 'OVER THRESHOLD'}")
+    if power_dbm is None or power_dbm > threshold_dbm:
+        reason = ("spectrum analyzer unreachable" if power_dbm is None else
+                  f"reflected power {power_dbm:.2f} dBm exceeds threshold {threshold_dbm} dBm")
+        gen.trip_interlock(f"{reason} at the CW check ({where})")
+        return power_dbm, True
+    return power_dbm, False
+
+
+def _trace_lockin(lia, duration_s, dt_s, label):
+    """Diagnostic: sample the SR830 every dt_s for duration_s and log each sample.
+
+    Returns
+    -------
+    list of (t_s, x_v, y_v, ref_freq_hz, reference_unlock, any_overload) tuples, t from the call.
+    """
+    rows = []
+    t0 = time.monotonic()
+    while (t := time.monotonic() - t0) < duration_s:
+        x, y = lia.read_xy()
+        f_ref = lia.get_frequency_hz()
+        status = lia.read_overload_status()
+        rows.append((t, x, y, f_ref, bool(status["reference_unlock"]), bool(status["any"])))
+        print(f"[rabi] trace {label} t=+{t:5.2f} s: X={x:.6e} V, Y={y:.6e} V, f_ref={f_ref:.6f} Hz, "
+              f"unlock={status['reference_unlock']}, overload={status['any']}")
+        time.sleep(max(0.0, dt_s - (time.monotonic() - t0 - t)))
+    return rows
+
+
 def setup_lock_in(lia, time_constant_s, sensitivity_v, phase_deg, input_coupling,
                    auto_sensitivity=False):
     """Same convention as cw_odmr_lock_in.py's setup_lock_in(), minus the
@@ -619,7 +665,8 @@ def cmd_run(file_name, **kw):
     underload_margin, underload_persistence, fixed_sensitivity,
     psu_voltage_v,
     psu_current_limit_a, coil_current_a, coil_voltage_margin,
-    interlock_check_interval, interlock_hold_periods, interlock_during_sweep,
+    interlock_check_interval, interlock_during_sweep, remeasure_after_cw_check,
+    cw_check_trace_s, cw_check_trace_dt_s,
     resequence_interval, extra_settle_s, ch1_vpp, ch2_vpp,
     ch2_offset_v, trigger_margin, anchor_free_reps, fixed_external_trigger,
     reflected_power_scan, res_span_hz, coarse_step_hz, fine_span_hz,
@@ -636,12 +683,13 @@ def cmd_run(file_name, **kw):
     NOT change freq_hz; it's just a pre-flight check/record of the
     reflected-power profile around the fixed operating frequency, run at a
     low, safe res_power_dbm. Saves {file_name}_resonance_coarse.csv and
-    _resonance_fine.csv in the run's data directory. Once the generator is
-    then set to the real operating point (freq_hz, drive_power_dbm) and RF
-    is turned on for the tau_mw sweep, also prints a single reflected-power
-    reading AT that exact operating point -- the coarse/fine sweep above
-    only ran at the low res_power_dbm, so this is the first real check at
-    the actual power level about to be used.
+    _resonance_fine.csv in the run's data directory.
+
+    Whatever reflected_power_scan is, once RF is on at the real operating
+    point (freq_hz, drive_power_dbm) a CW reflected-power check runs there
+    (_cw_interlock_check()) and trips the interlock if it's over
+    threshold_dbm -- the coarse/fine sweep only ran at the low
+    res_power_dbm, so this is the first check at the real power.
     """
     freq_hz = float(kw.get("freq_hz", 2.843e9))
     drive_power_dbm = float(kw.get("drive_power_dbm", 0.0))
@@ -778,20 +826,21 @@ def cmd_run(file_name, **kw):
     # actually settle, not just the PSU's own output.
     coil_scan_current_settle_s = float(kw.get("coil_scan_current_settle_s", 2.0))
     interlock_check_interval = int(kw.get("interlock_check_interval", 5))
-    interlock_hold_periods = float(kw.get("interlock_hold_periods", 3.0))
-    # The PERIODIC per-point check below (not the pre-flight coarse/fine
-    # scan + operating-point check before the sweep starts, which always
-    # runs regardless of this flag) turned out to be a real source of the
-    # background-artifact spikes: its ~1s GPIB round trip to the HP8673H
-    # is comparable to anchor_period_s, so it races with the AWG's own
-    # anchor-wrap timing (see notes.md). ABOR-ing after every check
-    # (added to remove that race) did NOT fully eliminate the spikes on
-    # real hardware, so this lets the periodic check be skipped entirely
-    # during the sweep as a further isolation step -- MW is still being
-    # driven at whatever power was validated at the pre-flight check, just
-    # without periodic re-verification while sweeping tau_mw. Use with
-    # care: no periodic reflected-power protection while this is false.
+    # false skips the PERIODIC CW checks during the sweep (the pre-flight CW
+    # check always runs). Originally added because the old MAX HOLD check
+    # raced the AWG's anchor-wrap timing and caused artifact spikes (see
+    # notes.md); the CW check now runs before each point's sequence setup
+    # instead, so that race shouldn't apply. Use with care: no periodic
+    # reflected-power protection while this is false.
     interlock_during_sweep = str(kw.get("interlock_during_sweep", "true")).lower() == "true"
+    # At points where a CW check ran, discard the first settled reading and
+    # take the point after a second settle_s instead (costs ~settle_s per check).
+    remeasure_after_cw_check = str(kw.get("remeasure_after_cw_check", "true")).lower() == "true"
+    # Diagnostic (0 = off): at each CW-check point and the point after, log the
+    # lock-in every cw_check_trace_dt_s for cw_check_trace_s from the sequence
+    # restart, and save it to _rabi_cw_trace.npy. Adds that time per traced point.
+    cw_check_trace_s = float(kw.get("cw_check_trace_s", 0.0))
+    cw_check_trace_dt_s = float(kw.get("cw_check_trace_dt_s", 0.2))
     # Overrides the module-level RESEQUENCE_INTERVAL default for this run.
     # Bucketing rabi_new14/15/16/17 by distance from the nearest awg.reset()
     # showed points right after a reset are clean (0% hitting the ~1.5e-4
@@ -902,7 +951,7 @@ def cmd_run(file_name, **kw):
     # repeats' saved files at one shared folder (all still prefixed with
     # their own distinct file_name, e.g. "<file_name>_repeat3_rabi_x.npy")
     # instead of each repeat getting its own <file_name>_repeat{i}/
-    # directory. Not documented in RUN_PARAMS_HELP since it's an internal
+    # directory. Not documented in USAGE since it's an internal
     # plumbing knob for cmd_run_repeat(), not something to set by hand in
     # normal use.
     output_dir = kw.get("output_dir", file_name)
@@ -999,52 +1048,25 @@ def cmd_run(file_name, **kw):
                       f"{run_path}/{file_name}_resonance_coarse.csv"
                       f"{', _resonance_fine.csv' if effective_fine_sweep else ' (fine_sweep=false -- fine.csv not written)'}")
 
+            # Route the switch to the sample BEFORE RF comes on at full drive
+            # power -- with reflected_power_scan=false nothing above has set
+            # CH2, so it would otherwise be in whatever state the AWG
+            # connection left it in.
+            set_switch_static(awg, route_to_sample=True)
             gen.preset()
             gen.set_power_dbm(drive_power_dbm)
             gen.set_frequency_hz(freq_hz)
             gen.rf_on()
             time.sleep(1.0)  # let the initial frequency/level settle
 
-            if reflected_power_scan:
-                # The coarse/fine sweep above ran at the low, safe
-                # res_power_dbm -- this is a separate readout at the ACTUAL
-                # operating point (freq_hz, drive_power_dbm) now that the
-                # generator is running there for real, right before the
-                # tau_mw sweep starts. CH2 is still statically routed to
-                # the sample path (set_switch_static() above, not chopping
-                # yet -- setup_awg_sequences() hasn't run), and the signal
-                # is CW at this point, so a single-sweep read is enough
-                # (no need for read_max_hold_reflected_power_dbm()'s
-                # pulsed-signal handling, which only matters once the
-                # per-point loop below starts gating).
-                reflected_at_freq_dbm = HP8673H.read_reflected_power_dbm(ilock_sa, freq_hz)
-                if reflected_at_freq_dbm is not None:
-                    print(f"[rabi] pre-flight: reflected power at the operating "
-                          f"point ({freq_hz/1e9:.5f} GHz, {drive_power_dbm} dBm) = "
-                          f"{reflected_at_freq_dbm:.2f} dBm")
-                else:
-                    print("[rabi] pre-flight: WARNING -- failed to read reflected "
-                          "power at the operating point")
-
-                # This was print-only until now -- unlike the periodic
-                # in-sweep interlock check below, it never actually
-                # enforced threshold_dbm, so a dangerously high reflected
-                # power at the REAL operating point (not just the low,
-                # safe res_power_dbm used for the coarse/fine sweep above)
-                # could sail straight through with nothing but a log line.
-                # Enforce it here too, before the tau_mw sweep even
-                # starts.
-                if reflected_at_freq_dbm is None or reflected_at_freq_dbm > threshold_dbm:
-                    reason = (
-                        "spectrum analyzer unreachable"
-                        if reflected_at_freq_dbm is None else
-                        f"reflected power {reflected_at_freq_dbm:.2f} dBm exceeds "
-                        f"threshold {threshold_dbm} dBm"
-                    )
-                    gen.trip_interlock(f"{reason} at the pre-flight operating-point "
-                                        f"check ({freq_hz/1e9:.5f} GHz, "
-                                        f"{drive_power_dbm} dBm)")
-                    return
+            # Always runs, regardless of reflected_power_scan: the sweep
+            # above (if any) only ran at the low res_power_dbm, so this is the
+            # first check at the real operating point.
+            _, tripped_preflight = _cw_interlock_check(
+                gen, awg, ilock_sa, freq_hz, threshold_dbm,
+                f"pre-flight, {freq_hz/1e9:.5f} GHz, {drive_power_dbm} dBm")
+            if tripped_preflight:
+                return
 
             if use_resonance_freq:
                 print(f"[rabi] coil current scan: {coil_scan_start_a}-"
@@ -1202,6 +1224,8 @@ def cmd_run(file_name, **kw):
             n_completed = 0
             tripped = False
             underload_streak = 0
+            trace_rows = []
+            prev_point_checked = False
 
             try:
                 for i, mw_us in enumerate(mw_values_us):
@@ -1229,6 +1253,18 @@ def cmd_run(file_name, **kw):
                     settle_s = max(settle_periods * ref_period_s,
                                     settle_time_constants * time_constant_s)
 
+                    # Done BEFORE this point's setup_awg_sequences(), which
+                    # reconfigures CH2 anyway -- so the CW interval adds no
+                    # extra AWG reconfigure and can't race a running sequence.
+                    cw_checked_this_point = interlock_during_sweep and i % interlock_check_interval == 0
+                    if cw_checked_this_point:
+                        power_dbm, tripped = _cw_interlock_check(
+                            gen, awg, ilock_sa, freq_hz, threshold_dbm,
+                            f"point {i + 1}/{len(mw_values_us)}, tau_mw={mw_us:.3f} us")
+                        reflected_dbm_arr[i] = power_dbm if power_dbm is not None else np.nan
+                        if tripped:
+                            break
+
                     # With anchor_free_reps > 1, both channels only wrap
                     # back through their anchor once every anchor_free_reps
                     # off+on cycles (see setup_awg_sequences()'s docstring)
@@ -1248,6 +1284,17 @@ def cmd_run(file_name, **kw):
                         anchor_free_reps=anchor_free_reps,
                         pad_us=pad_us,
                     )
+                    # Diagnostic: trace the lock-in from the moment the sequence
+                    # restarts, at CW-check points and at the point after (a
+                    # normal reupload with no CW check, as a comparison). The
+                    # normal settle/read below is unchanged.
+                    if cw_check_trace_s > 0 and (cw_checked_this_point or prev_point_checked):
+                        kind = "after CW check" if cw_checked_this_point else "no CW check"
+                        rows = _trace_lockin(lia, cw_check_trace_s, cw_check_trace_dt_s,
+                                             f"point {i + 1}/{len(mw_values_us)} ({kind})")
+                        trace_rows.extend((i + 1, int(cw_checked_this_point), *row) for row in rows)
+                    prev_point_checked = cw_checked_this_point
+
                     if extra_settle_s > 0:
                         time.sleep(extra_settle_s)
 
@@ -1275,78 +1322,17 @@ def cmd_run(file_name, **kw):
                               f"{actual_sensitivity_v:.3e} V full scale")
                         sensitivity_v = actual_sensitivity_v
 
-                    if interlock_during_sweep and i % interlock_check_interval == 0:
-                        hold_s = interlock_hold_periods * ref_period_s
-                        anchor_period_s_for_check = ref_period_s * anchor_free_reps
-                        check_start_s = time.monotonic()
-                        power_dbm = HP8673H.read_max_hold_reflected_power_dbm(
-                            ilock_sa, freq_hz, hold_s)
-                        check_elapsed_s = time.monotonic() - check_start_s
-                        reflected_dbm_arr[i] = power_dbm if power_dbm is not None else np.nan
-
-                        # Diagnostic for the "spikes near interlock checks"
-                        # investigation (see notes.md): if this GPIB round
-                        # trip takes longer than anchor_period_s, the AWG's
-                        # current anchor_free_reps-repeat run has already
-                        # finished and wrapped back to its onceWaitTrig
-                        # anchor by the time settle_s starts below -- a
-                        # fresh, uncontrolled trigger-wait dead time then
-                        # lands inside the settle window instead of settle_s
-                        # overlapping an already-steady, mid-run signal.
-                        print(f"[rabi] interlock check timing (point {i + 1}/"
-                              f"{len(mw_values_us)}): took {check_elapsed_s:.3f} s "
-                              f"(nominal hold_s={hold_s:.3f} s) vs. this point's "
-                              f"anchor_period_s={anchor_period_s_for_check:.3f} s -- "
-                              f"{'EXCEEDS anchor period, AWG likely re-idled' if check_elapsed_s > anchor_period_s_for_check else 'within anchor period'}")
-
-                        if power_dbm is not None:
-                            print(f"[rabi] interlock check (point {i + 1}/"
-                                  f"{len(mw_values_us)}, tau_mw={mw_us:.3f} us): "
-                                  f"reflected power {power_dbm:.2f} dBm "
-                                  f"(threshold {threshold_dbm} dBm) -- "
-                                  f"{'OK' if power_dbm <= threshold_dbm else 'OVER THRESHOLD'}")
-
-                        if power_dbm is None or power_dbm > threshold_dbm:
-                            reason = (
-                                "spectrum analyzer unreachable"
-                                if power_dbm is None else
-                                f"reflected power {power_dbm:.2f} dBm exceeds "
-                                f"threshold {threshold_dbm} dBm"
-                            )
-                            gen.trip_interlock(f"{reason} at tau_mw={mw_us:.3f} us "
-                                                f"(point {i + 1}/{len(mw_values_us)})")
-                            tripped = True
-                            break
-
-                        # The GPIB round trip above takes a real, variable
-                        # amount of time (confirmed ~1s on real hardware --
-                        # comparable to anchor_period_s itself), so whether
-                        # this point's sequence is still mid-run or has
-                        # already wrapped back to its onceWaitTrig anchor by
-                        # now is a race, not a known state -- sometimes
-                        # settle_s below overlaps already-steady signal,
-                        # sometimes it needs a fresh, uncontrolled retrigger
-                        # partway through. ABOR forces the latter every time
-                        # instead of leaving it to chance: the sequence data
-                        # is untouched (no reupload needed), just stopped, so
-                        # the very next external trigger edge restarts it
-                        # from its anchor -- a single, bounded (<= one
-                        # trigger period) dead time right at the start of
-                        # settle_s, which the transient-discard wait below is
-                        # already designed to absorb. Also apply extra_
-                        # settle_s here, same as after setup_awg_sequences()
-                        # -- this ABOR is a SEPARATE reconfigure event from
-                        # that one, so it needs its own margin too (found on
-                        # real hardware: with a normal-cadence interlock
-                        # check, this was the ONLY point in an otherwise-
-                        # clean sweep that still hit the output_overload
-                        # rail, since this path went straight into settle_s
-                        # with no extra_settle_s buffer at all).
-                        awg.write("ABOR")
-                        if extra_settle_s > 0:
-                            time.sleep(extra_settle_s)
-
                     _wait_settle_discarding_transient_overload(lia, settle_s)
+
+                    # The reading right after a CW check is sometimes disturbed
+                    # (confirmed off resonance: a ~26 uV jump at a check point,
+                    # flat elsewhere) -- take it, log it, settle again, and keep
+                    # the second reading instead.
+                    if cw_checked_this_point and remeasure_after_cw_check:
+                        x_first, y_first = lia.read_xy()
+                        print(f"[rabi] point {i + 1}/{len(mw_values_us)}: after CW check, discarding "
+                              f"first reading X={x_first:.6e} V, Y={y_first:.6e} V and re-settling")
+                        _wait_settle_discarding_transient_overload(lia, settle_s)
 
                     x, y = lia.read_xy()
                     ref_freq_hz = lia.get_frequency_hz()
@@ -1458,6 +1444,12 @@ def cmd_run(file_name, **kw):
                 np.save(f"{run_path}/{file_name}_rabi_x.npy", x_values)
                 np.save(f"{run_path}/{file_name}_rabi_y.npy", y_values)
                 np.save(f"{run_path}/{file_name}_rabi_reflected_dbm.npy", reflected_dbm_arr)
+                if trace_rows:
+                    # columns: point (1-based), CW check at that point (0/1), t [s] from sequence
+                    # restart, X [V], Y [V], SR830 reference [Hz], reference_unlock, any overload
+                    np.save(f"{run_path}/{file_name}_rabi_cw_trace.npy", np.array(trace_rows, dtype=float))
+                    print(f"[rabi] saved {len(trace_rows)} lock-in trace samples to "
+                          f"{file_name}_rabi_cw_trace.npy")
                 with open(f"{run_path}/{file_name}_rabi_metadata.txt", "w") as fh:
                     fh.write(f"freq_hz={freq_hz}\n")
                     fh.write(f"drive_power_dbm={drive_power_dbm}\n")
@@ -1569,7 +1561,7 @@ def cmd_run_repeat(file_name, **kw):
     Recognized key=value overrides:
       n_repeats=10  number of times to repeat the sweep
       (everything else is passed through to cmd_run() UNCHANGED, once per
-      repeat -- see cmd_run()'s own docstring/RUN_PARAMS_HELP for the full
+      repeat -- see cmd_run()'s own docstring/USAGE for the full
       list)
 
     Repeat 0 runs with whatever freq_hz/use_resonance_freq settings were
@@ -2199,8 +2191,11 @@ def cmd_calibrate_phase(file_name, **kw):
     {file_name}_calibrate_phase.txt -- pass it into a real cmd_run() via
     phase_deg=<value>.
 
+    Runs the same pre-flight CW reflected-power check as cmd_run() before
+    starting, tripping at threshold_dbm.
+
     Recognized key=value overrides (all optional): freq_hz, drive_power_dbm,
-    mw_us, n_reps, laser_us, pre_us, post_us, time_constant_s,
+    threshold_dbm, mw_us, n_reps, laser_us, pre_us, post_us, time_constant_s,
     settle_periods, settle_time_constants, input_coupling, ch1_vpp,
     ch2_vpp, ch2_offset_v, trigger_margin, anchor_free_reps,
     extra_settle_s, psu_voltage_v, psu_current_limit_a, coil_current_a,
@@ -2208,6 +2203,7 @@ def cmd_calibrate_phase(file_name, **kw):
     """
     freq_hz = float(kw.get("freq_hz", 2.843e9))
     drive_power_dbm = float(kw.get("drive_power_dbm", 0.0))
+    threshold_dbm = float(kw.get("threshold_dbm", -10.0))
     mw_us = float(kw.get("mw_us", 1.0))
     n_reps = int(kw.get("n_reps", 250))
     laser_us = float(kw.get("laser_us", 2.0))
@@ -2262,16 +2258,29 @@ def cmd_calibrate_phase(file_name, **kw):
         gen = HP8673H(GEN_RESOURCE)
         amp_psu = SPD1168X(AMP_PSU_RESOURCE)
         coil_psu = SPD1305X(COIL_PSU_RESOURCE)
+        ilock_sa = None
         try:
             amp_psu.turn_on(psu_voltage_v, psu_current_limit_a)
             coil_voltage_v = voltage_for_current(coil_current_a) * coil_voltage_margin
             coil_psu.turn_on(coil_voltage_v, coil_current_a)
 
+            ilock_sa = HP8673H.try_connect_analyzer(SA_RESOURCE)
+            if ilock_sa is None:
+                gen.trip_interlock("spectrum analyzer not reachable at startup")
+                return
+
+            set_switch_static(awg, route_to_sample=True)
             gen.preset()
             gen.set_power_dbm(drive_power_dbm)
             gen.set_frequency_hz(freq_hz)
             gen.rf_on()
             time.sleep(1.0)  # let the initial frequency/level settle
+
+            _, tripped_preflight = _cw_interlock_check(
+                gen, awg, ilock_sa, freq_hz, threshold_dbm,
+                f"pre-flight, {freq_hz/1e9:.5f} GHz, {drive_power_dbm} dBm")
+            if tripped_preflight:
+                return
 
             rep_us = laser_us + pre_us + mw_us + post_us
             ref_period_s = 2 * n_reps * rep_us * 1e-6
@@ -2453,6 +2462,8 @@ def cmd_calibrate_phase(file_name, **kw):
             except Exception:
                 pass
             coil_psu.close()
+            if ilock_sa is not None:
+                ilock_sa.close()
             try:
                 lia.go_to_local()
             except Exception:
@@ -2480,149 +2491,57 @@ def cmd_calibrate_phase(file_name, **kw):
     print("[rabi] phase calibration done")
 
 
-RUN_PARAMS_HELP = """
-'run' (cmd_run()) key=value overrides, with their current defaults --
-also apply to 'run-no-mw'/'run-ch2-constant'/'run-ch1-ch2-constant'
-(_run_no_mw_impl()) except where noted, though several defaults differ
-there (that impl never touches the generator/PSUs/interlock, so it skips
-the psu_*/coil_*/interlock_*/reflected_power_scan/res_*/fine_* group
-entirely). See each parameter's inline comment in the source (rg the
-name in rabi.py) and notes.md for the reasoning behind non-obvious ones.
+USAGE = """\
+Before running:
+    SR830 REF IN <- AWG Sync/Marker output (NOT CH2 -- that's for cw_odmr_lock_in.py)
+    SDG1062X powered on, CH1 output -> AWG rear-panel Ext Trig
+    run-no-mw / run-ch2-constant / run-ch1-ch2-constant: generator RF and both PSUs off
 
-'run-repeat' (cmd_run_repeat()) repeats a 'run' n_repeats times (default
-10) with otherwise IDENTICAL settings -- everything below still applies,
-plus n_repeats=10. Each repeat is a fully independent cmd_run() call
-(saved under <file_name>_repeat{i}/), then X/Y are averaged elementwise
-across completed repeats and R computed from the averaged X/Y, saved to
-<file_name>/<file_name>_avg_rabi_*.npy. See cmd_run_repeat()'s docstring.
+python rabi.py run <file_name>
+    freq_hz=2.843e9 drive_power_dbm=0 threshold_dbm=-10 mw_start_us=0.02
+    mw_stop_us=5 mw_step_us=0.02 mw_spacing=linear mw_log_ratio=1.15 n_reps=250
+    laser_us=2 pre_us=1 post_us=1 constant_shot_period=false pad_min_us=0
+    time_constant_s=0.1 settle_periods=5 settle_time_constants=9 sensitivity_v=5e-3
+    auto_sensitivity=true phase_deg=0 input_coupling=ac auto_rescale_on_overload=true
+    max_rescale_attempts=10 auto_rescale_on_underload=true underload_margin=0.5
+    underload_persistence=3 fixed_sensitivity=false psu_voltage_v=12
+    psu_current_limit_a=1.9 coil_current_a=2 coil_voltage_margin=1.5
+    interlock_check_interval=5 interlock_during_sweep=true remeasure_after_cw_check=true
+    cw_check_trace_s=0 cw_check_trace_dt_s=0.2
+    resequence_interval=4 extra_settle_s=0 ch1_vpp=0.632 ch2_vpp=5 ch2_offset_v=2.5
+    trigger_margin=3 anchor_free_reps=1000 fixed_external_trigger=true
+    reflected_power_scan=true res_span_hz=100e6 coarse_step_hz=2e6 fine_span_hz=20e6
+    fine_step_hz=50e3 res_power_dbm=-40 res_cal_dir=None fine_sweep=true
+    use_resonance_freq=false coil_scan_start_a=1 coil_scan_stop_a=4
+    coil_scan_step_a=0.5 coil_scan_tau_mw_us=0.5 coil_scan_n_repeats=5
+    coil_scan_current_settle_s=2
 
-Sweep range:
-    freq_hz=2.843e9            fixed MW frequency for the whole sweep
-    drive_power_dbm=0.0        generator power at freq_hz
-    threshold_dbm=-10.0        reflected-power interlock trip threshold
-    mw_start_us=0.02           tau_mw sweep start (must be > 0 if
-                               mw_spacing=log)
-    mw_stop_us=5.0             tau_mw sweep stop
-    mw_step_us=0.02            tau_mw sweep step (mw_spacing=linear only)
-    mw_spacing=linear          "log" for a geometric progression instead
-                               (each point mw_log_ratio times the last,
-                               from mw_start_us up to mw_stop_us) -- covers
-                               a wide range (e.g. 10 ns to 3 us) with fine
-                               resolution at short tau_mw without the huge
-                               point count a linear step that fine would
-                               need all the way to the long end
-    mw_log_ratio=1.15          geometric ratio between points, mw_spacing=
-                               log only (must be > 1.0)
-    n_reps=250                 on+off reps per point's combined arb
+python rabi.py run-repeat <file_name>
+    n_repeats=10 (plus every 'run' option above)
 
-Pulse timing:
-    laser_us=2.0               laser/AOM gate duration per rep
-    pre_us=1.0                 dead time before the MW pulse
-    post_us=1.0                dead time after the MW pulse
+python rabi.py run-no-mw <file_name>
+python rabi.py run-ch2-constant <file_name>
+python rabi.py run-ch1-ch2-constant <file_name>
+    freq_hz=0 drive_power_dbm=0 mw_start_us=0.02 mw_stop_us=5 mw_step_us=0.02
+    n_reps=250 laser_us=2 pre_us=1 post_us=1 time_constant_s=0.1 settle_periods=5
+    settle_time_constants=9 sensitivity_v=5e-3 auto_sensitivity=true phase_deg=0
+    input_coupling=ac auto_rescale_on_overload=true max_rescale_attempts=10
+    auto_rescale_on_underload=true underload_margin=0.5 underload_persistence=3
+    fixed_sensitivity=false ch1_vpp=0.632 ch2_vpp=5 ch2_offset_v=2.5
+    trigger_margin=100 anchor_free_reps=1 (run-ch2-constant: 20)
+    resequence_interval=4 extra_settle_s=0
 
-Lock-in:
-    time_constant_s=0.1        SR830 RC time constant
-    settle_periods=5.0         min wait, in reference periods
-    settle_time_constants=9.0  min wait, in time constants (usually dominant)
-    sensitivity_v=5e-3         SR830 full-scale sensitivity (run-no-mw etc.: 5e-3)
-    auto_sensitivity=true      AGAN once at the first point
-    phase_deg=0.0              SR830 reference phase
-    input_coupling=ac          SR830 input coupling ("ac"/"dc")
-
-Overload/underload auto-rescaling:
-    auto_rescale_on_overload=true
-    max_rescale_attempts=10   raised from 3 -- confirmed on real hardware
-                              that 3 wasn't enough headroom to recover
-                              from a large overload (e.g. right after a
-                              big coil-current jump), since each attempt
-                              only steps ONE sensitivity range coarser out
-                              of 27 total (SR830.SENSITIVITY_V)
-    auto_rescale_on_underload=true
-    underload_margin=0.5
-    underload_persistence=3    consecutive underload points before stepping finer
-    fixed_sensitivity=false    true disables all three rescale flags above,
-                               using sensitivity_v as-is for the whole sweep
-
-Amplifier/coil PSUs (run only -- not in run-no-mw/etc.):
-    psu_voltage_v=12.0
-    psu_current_limit_a=1.9
-    coil_current_a=2.0
-    coil_voltage_margin=1.5
-
-Interlock (run only):
-    interlock_check_interval=5     points between periodic reflected-power checks
-    interlock_hold_periods=3.0     MAX HOLD duration, in reference periods
-    interlock_during_sweep=true    false skips the PERIODIC check entirely
-                                    (the pre-flight check before the sweep
-                                    always still runs) -- no protection
-                                    while sweeping if false, use with care
-
-AWG sequencing / background-artifact avoidance (see notes.md's "spurious
-off-resonance/no-MW-near-sample signal" entry for the full investigation):
-    resequence_interval=4 (module RESEQUENCE_INTERVAL)
-                                    points between full awg.reset() (*RST)
-    extra_settle_s=0.0              extra wait after each point's reupload/
-                                     re-arm, before settle_s's own countdown --
-                                     1.0 confirmed to eliminate the rare large
-                                     (~1.5e-4 V) output_overload rail spikes
-    ch1_vpp=0.632
-    ch2_vpp=5.0
-    ch2_offset_v=2.5
-    trigger_margin=3.0 (run-no-mw etc.: 100)
-    anchor_free_reps=1000 (run-no-mw etc.: 1, run-ch2-constant: 20)
-                                    if you raise extra_settle_s, raise this
-                                    too -- anchor_period_s must still exceed
-                                    extra_settle_s + settle_s at the sweep's
-                                    shortest tau_mw
-    fixed_external_trigger=true (run-no-mw etc.: false)
-
-Pre-flight reflected-power scan (run only):
-    reflected_power_scan=true
-    res_span_hz=100e6
-    coarse_step_hz=2e6
-    fine_span_hz=20e6
-    fine_step_hz=50e3
-    res_power_dbm=-40.0
-    res_cal_dir=None
-    fine_sweep=true                 false skips just the fine stage
-    use_resonance_freq=false        true: freq_hz becomes the search
-                                     midpoint, actual drive frequency is
-                                     resolved from the coarse+fine dip
-                                     (always runs the fine stage
-                                     regardless of fine_sweep) -- run-
-                                     repeat only resolves this on the
-                                     FIRST repeat, later repeats reuse
-                                     that same resolved freq_hz. ALSO
-                                     triggers the coil current scan below.
-
-Coil current scan (run only, only when use_resonance_freq=true -- picks
-the coil_current_a that maximizes R at a fixed tau_mw, at the already-
-resolved freq_hz, before the real tau_mw sweep starts):
-    coil_scan_start_a=1.0
-    coil_scan_stop_a=4.0
-    coil_scan_step_a=0.5
-    coil_scan_tau_mw_us=0.5
-    coil_scan_n_repeats=5
-    coil_scan_current_settle_s=2.0  wait after each current change, before
-                                     measuring, for the field to settle
-
-Constant shot period (holds the total rep period, and therefore the
-reference frequency and laser duty cycle, IDENTICAL at every tau_mw
-sweep point, by padding out the tail of every rep to compensate for the
-varying mw_us):
-    constant_shot_period=false     true: pad_us = (mw_max_us - mw_us) +
-                                    pad_min_us at every point, so
-                                    laser_us+pre_us+mw_us+post_us+pad_us
-                                    is the same constant throughout
-    pad_min_us=0.0                 minimum pad at the sweep's own longest
-                                    tau_mw point (where mw_max_us-mw_us=0)
-""".strip("\n")
+python rabi.py calibrate-phase <file_name>
+    freq_hz=2.843e9 drive_power_dbm=0 threshold_dbm=-10 mw_us=1 n_reps=250 laser_us=2 pre_us=1
+    post_us=1 time_constant_s=0.1 settle_periods=5 settle_time_constants=9
+    input_coupling=ac ch1_vpp=0.632 ch2_vpp=5 ch2_offset_v=2.5 trigger_margin=3
+    anchor_free_reps=1000 extra_settle_s=0 psu_voltage_v=12 psu_current_limit_a=1.9
+    coil_current_a=2 coil_voltage_margin=1.5"""
 
 
 def main():
     if len(sys.argv) < 3:
-        print(__doc__)
-        print(RUN_PARAMS_HELP)
+        print(USAGE)
         raise SystemExit(1)
 
     command = sys.argv[1]

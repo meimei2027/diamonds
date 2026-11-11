@@ -81,17 +81,29 @@ class KS33600A:
             return ch1
 
 
+    DAC_FULL_SCALE = 32767
+
     def upload_waveform(self, waveform, arb_name, ch=1, sample_rate=None):
+        """Upload a normalized waveform (values in [-1, 1]) as int16 DAC codes
+        (DATA:ARB:DAC) -- half the bytes of float32 DATA:ARB and no on-instrument
+        float conversion, so large arbs upload much faster."""
         if sample_rate is None:
             sample_rate = self.MAX_SAMPLE_RATE
+
+        waveform = np.asarray(waveform, dtype=np.float64)
+        peak = np.max(np.abs(waveform)) if waveform.size else 0.0
+        if peak > 1 + 1e-6:
+            raise ValueError(f"waveform for {arb_name!r} exceeds the normalized range "
+                             f"[-1, 1] (peak {peak:.6g})")
+        dac = np.round(np.clip(waveform, -1, 1) * self.DAC_FULL_SCALE).astype("<i2")
 
         # binary format
         self.write("FORM:BORD SWAP")
 
         self.inst.write_binary_values(
-            f"SOUR{ch}:DATA:ARB {arb_name},",
-            waveform,
-            datatype='f',
+            f"SOUR{ch}:DATA:ARB:DAC {arb_name},",
+            dac,
+            datatype='h',
             is_big_endian=False
         )
 

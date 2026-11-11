@@ -4,8 +4,6 @@ resonance-sweep + inline-interlock design as cw_odmr.py's run_spectrum(),
 but reading out via lock-in (SR830) synchronous detection instead of scope
 segments.
 
-NOT YET TESTED against real hardware.
-
 See notes.md's "cw_odmr_lock_in.py operation notes" section for hardware
 wiring, how lock-in readout works, phase calibration, and design rationale
 for cmd_single/cmd_sweep_average -- and its "CW-ODMR contrast_check" /
@@ -85,6 +83,36 @@ COIL_PSU_RESOURCE = "USB0::0xF4EC::0x1410::SPD13DCD7R1877::INSTR"
 AMP_PSU_RESOURCE = "USB0::0xF4EC::0x1410::SPD13DCQ7R0986::INSTR"
 
 DATA_DIR = "D:\\cw_odmr_lock_in"
+
+USAGE = """\
+python cw_odmr_lock_in.py run <file_name>
+    use_resonance_sweep=true res_start_hz=2e9 res_stop_hz=3e9 coarse_step_hz=6.7e6
+    fine_span_hz=20e6 fine_step_hz=50e3 res_power_dbm=-40 res_cal_dir=None
+    start_hz=None stop_hz=None drive_power_dbm=0 threshold_dbm=-10 freq_step_hz=10e3
+    fwhm_margin=1.0 settle_s=0.05 chop_freq_hz=1000 chop_duty_pct=50
+    time_constant_s=0.1 settle_time_constants=5 sensitivity_v=5e-3
+    auto_sensitivity=true phase_deg=0 input_coupling=ac ch1_carrier_freq_hz=80e6
+    ch1_carrier_vpp=0.632 psu_voltage_v=12 psu_current_limit_a=1.9
+    coil_current_a=1.5 coil_voltage_margin=1.5
+
+python cw_odmr_lock_in.py single <file_name>
+    freq_hz=2.87e9 drive_power_dbm=0 threshold_dbm=-10 carrier_off=false
+    duration_s=0 sample_interval_s=1.0 chop_freq_hz=1000 chop_duty_pct=50
+    time_constant_s=0.1 sensitivity_v=5e-3 auto_sensitivity=true phase_deg=0
+    input_coupling=ac ch1_carrier_freq_hz=80e6 ch1_carrier_vpp=0.632
+    coil_current_a=1.5 coil_voltage_margin=1.5
+
+python cw_odmr_lock_in.py sweep-average <file_name>
+    use_resonance_sweep=true res_start_hz=2e9 res_stop_hz=3e9 coarse_step_hz=6.7e6
+    fine_span_hz=20e6 fine_step_hz=50e3 res_power_dbm=-40 res_cal_dir=None
+    fwhm_margin=1.0 start_hz=None stop_hz=None freq_step_hz=1e6 n_repeats=30
+    check_resonance_before_sweep=true print_points=false drive_power_dbm=0
+    drive_power_dbm_list=None threshold_dbm=-10 auto_rescale_on_overload=true
+    max_rescale_attempts=10 rescan_backoff_points=2 settle_s=0.05 chop_freq_hz=1000 chop_duty_pct=50
+    time_constant_s=0.1 settle_time_constants=5 sensitivity_v=5e-3
+    auto_sensitivity=true phase_deg=0 input_coupling=ac ch1_carrier_freq_hz=80e6
+    ch1_carrier_vpp=0.632 psu_voltage_v=12 psu_current_limit_a=1.9
+    coil_current_a=1.5 coil_voltage_margin=1.5"""
 
 
 def check_resonance_position(gen, ilock_sa, freqs_hz, settle_s):
@@ -840,6 +868,8 @@ def cmd_sweep_average(file_name, **kw):
                               <file_prefix>_resonance_check_freqs_hz.npy /
                               _resonance_check_reflected_dbm.npy per power
                               level.
+      print_points=false      print X/Y/reflected power at every point as
+                              it's read, like cmd_run does
       drive_power_dbm=0.0     (constant) drive power during the scan --
                               ignored if drive_power_dbm_list is given
       drive_power_dbm_list=None  comma-separated list of drive powers, e.g.
@@ -852,8 +882,8 @@ def cmd_sweep_average(file_name, **kw):
       threshold_dbm=-10.0     interlock trip threshold, in dBm
       auto_rescale_on_overload=true  detect SR830 overload in real time and
                               auto-rescale + restart the current repeat
-      max_rescale_attempts=3  rescale-and-rescan attempts per repeat before
-                              giving up and treating it as PARTIAL
+      max_rescale_attempts=10  rescale-and-rescan attempts per repeat (not per
+                              point) before giving up and treating it as PARTIAL
       rescan_backoff_points=2  points to back up (not restart from 0)
                               before rescanning after an overload
       settle_s=0.05           settle time after each frequency change --
@@ -923,6 +953,7 @@ def cmd_sweep_average(file_name, **kw):
     n_repeats = int(kw.get("n_repeats", 30))
     check_resonance_before_sweep = str(
         kw.get("check_resonance_before_sweep", "true")).lower() == "true"
+    print_points = str(kw.get("print_points", "false")).lower() == "true"
     drive_power_dbm_list_raw = kw.get("drive_power_dbm_list", None)
     multi_power = drive_power_dbm_list_raw is not None
     if multi_power:
@@ -931,7 +962,7 @@ def cmd_sweep_average(file_name, **kw):
         power_list = [float(kw.get("drive_power_dbm", 0.0))]
     threshold_dbm = float(kw.get("threshold_dbm", -10.0))
     auto_rescale_on_overload = str(kw.get("auto_rescale_on_overload", "true")).lower() == "true"
-    max_rescale_attempts = int(kw.get("max_rescale_attempts", 3))
+    max_rescale_attempts = int(kw.get("max_rescale_attempts", 10))
     rescan_backoff_points = int(kw.get("rescan_backoff_points", 2))
     settle_s = float(kw.get("settle_s", 0.05))  # NEVER 0 -- see
                                                   # hp8673h.py's
@@ -975,7 +1006,9 @@ def cmd_sweep_average(file_name, **kw):
             set_switch_static(awg, route_to_sample=True)
         else:
             setup_chop(awg, chop_freq_hz, chop_duty_pct)
-            awg.close()
+        # The AWG session stays open (closed in the finally block) so the
+        # resonance check below can park CH2 and then restart the chop --
+        # reconnecting would *RST the AWG and drop the CH1 carrier.
 
         lia = SR830(SR830_RESOURCE, debug=True)
         setup_lock_in(lia, chop_freq_hz, time_constant_s, sensitivity_v, phase_deg,
@@ -1019,7 +1052,6 @@ def cmd_sweep_average(file_name, **kw):
                 print("[cw_odmr_lock_in] enabling switch chop now that resonance is "
                       f"located ({chop_duty_pct:.0f}% duty @ {chop_freq_hz:.0f} Hz)")
                 setup_chop(awg, chop_freq_hz, chop_duty_pct)
-                awg.close()
 
                 if manual_start_hz is not None and manual_stop_hz is not None:
                     start_hz = float(manual_start_hz)
@@ -1069,7 +1101,14 @@ def cmd_sweep_average(file_name, **kw):
                 print(f"[cw_odmr_lock_in] drive power {power_dbm:g} dBm: settled")
 
                 if check_resonance_before_sweep:
+                    # Park the switch on the sample path for the check -- while
+                    # CH2 chops, each analyzer reading lands in the RF-on or
+                    # RF-off half at random (readings alternating ~-35/-75 dBm),
+                    # and the "dip" becomes the lowest RF-off reading.
+                    set_switch_static(awg, route_to_sample=True)
                     res_check = check_resonance_position(gen, ilock_sa, freqs_hz, settle_s)
+                    setup_chop(awg, chop_freq_hz, chop_duty_pct)
+                    time.sleep(settle_after_step_s)  # let the lock-in relock to the restarted chop
                     np.save(f"{run_path}/{file_prefix}_resonance_check_freqs_hz.npy",
                             res_check["freqs_hz"])
                     np.save(f"{run_path}/{file_prefix}_resonance_check_reflected_dbm.npy",
@@ -1173,6 +1212,12 @@ def cmd_sweep_average(file_name, **kw):
                             x_values[i] = x
                             y_values[i] = y
                             n_completed = i + 1
+                            if print_points:
+                                print(f"[cw_odmr_lock_in] {power_dbm:g} dBm, repeat "
+                                      f"{rep + 1}/{n_repeats}, point "
+                                      f"{n_completed}/{len(freqs_hz)}: "
+                                      f"f={f/1e9:.5f} GHz, X={x:.6e} V, Y={y:.6e} V, "
+                                      f"reflected={reflected_dbm:.2f} dBm")
                             i += 1
 
                         np.save(f"{run_path}/{file_prefix}_repeat{rep}_freqs_hz.npy",
@@ -1283,7 +1328,7 @@ def cmd_sweep_average(file_name, **kw):
 
 def main():
     if len(sys.argv) < 3:
-        print(__doc__)
+        print(USAGE)
         raise SystemExit(1)
 
     command = sys.argv[1]
