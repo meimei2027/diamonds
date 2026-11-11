@@ -170,6 +170,23 @@ def _us_to_samples(duration_us, sample_rate_hz):
     return max(1, round(duration_us * 1e-6 * sample_rate_hz))
 
 
+def _warn_unplayable_pulse_lengths(mw_values_us, sample_rate_hz=1e9):
+    """Print a warning if any tau_mw isn't a whole number of AWG samples (1 ns at 1 GSa/s).
+    _us_to_samples() rounds each one, so e.g. a 2.5 ns step plays 5, 7, 10, 12, ... ns
+    (7.5 comes out of the float maths as 7.4999..., so it rounds down) while the saved
+    _rabi_mw_us.npy keeps the nominal values."""
+    nominal_ns = np.atleast_1d(np.asarray(mw_values_us, dtype=float)) * 1e3
+    played_ns = np.array([_us_to_samples(v * 1e-3, sample_rate_hz) for v in nominal_ns]) * 1e9 / sample_rate_hz
+    off = np.abs(played_ns - nominal_ns) > 1e-6
+    if not off.any():
+        return
+    pairs = ", ".join(f"{n:g}->{p:g}" for n, p in zip(nominal_ns[off], played_ns[off]))
+    print(f"[rabi] WARNING: {int(off.sum())}/{len(nominal_ns)} tau_mw values aren't whole AWG "
+          f"samples ({1e9 / sample_rate_hz:g} ns at {sample_rate_hz / 1e9:g} GSa/s) and will play "
+          f"rounded (nominal ns -> played ns): {pairs}. The saved _rabi_mw_us.npy keeps the "
+          f"nominal values. Use a whole-ns step and start (e.g. mw_step_us=0.002) to avoid this.")
+
+
 def _rf_pulse(freq_hz, n_samples, sample_rate_hz):
     t = np.arange(n_samples) / sample_rate_hz
     return np.sin(2 * np.pi * freq_hz * t).astype(np.float32)
@@ -835,7 +852,12 @@ def cmd_run(file_name, **kw):
     interlock_during_sweep = str(kw.get("interlock_during_sweep", "true")).lower() == "true"
     # At points where a CW check ran, discard the first settled reading and
     # take the point after a second settle_s instead (costs ~settle_s per check).
-    remeasure_after_cw_check = str(kw.get("remeasure_after_cw_check", "true")).lower() == "true"
+    # Off by default: the second settle pushes the read to ~2 s after the
+    # sequence restart, right where the first anchor wrap (anchor_free_reps
+    # blocks, ~2.08 s at the usual settings) disturbs the lock-in -- the
+    # "after-CW-check" glitches were reads landing on that wrap (traced in
+    # pcb_rabi8_glitches_work/_work2, 2.450 GHz controls).
+    remeasure_after_cw_check = str(kw.get("remeasure_after_cw_check", "false")).lower() == "true"
     # Diagnostic (0 = off): at each CW-check point and the point after, log the
     # lock-in every cw_check_trace_dt_s for cw_check_trace_s from the sequence
     # restart, and save it to _rabi_cw_trace.npy. Adds that time per traced point.
@@ -865,15 +887,18 @@ def cmd_run(file_name, **kw):
     ch1_vpp = float(kw.get("ch1_vpp", 0.632))
     ch2_vpp = float(kw.get("ch2_vpp", 5.0))
     ch2_offset_v = float(kw.get("ch2_offset_v", 2.5))
-    # Lowered from 100 -- that large a margin was needed when every
-    # single off+on cycle (a few ms) went through the onceWaitTrig
-    # anchor, since the trigger's own asynchronous dead time (up to one
-    # trigger period) was a meaningful fraction of that short cycle,
-    # visibly skewing its duty cycle. With anchor_free_reps now spacing
-    # anchor-wraps out to a much longer stretch (see below), that same
-    # dead time is a tiny fraction of the much longer period -- a modest
-    # margin is "just enough" without needlessly fast triggering.
-    trigger_margin = float(kw.get("trigger_margin", 3.0))
+    # Trigger rate = trigger_margin / anchor block period. At each block wrap
+    # the sequence waits up to one trigger period at its onceWaitTrig anchor,
+    # with CH2 and the Sync output stopped, which knocks the SR830 off for
+    # ~0.6 s. The old default of 3 (1.44 Hz, waits up to 0.69 s) gave the
+    # large glitches on the points after each AWG reset and ~150 uV bursts
+    # at every wrap with 100.5; 10000.5 (~4.8 kHz, waits <= 0.2 ms) cut the
+    # wrap burst to ~23 uV with no unlocks, and the after-reset points came
+    # out clean (pcb_rabi8_glitches_work2). The .5 keeps the block end half
+    # a trigger period from an edge (with constant_shot_period every block
+    # is the same length), so the wait is the same at every point instead of
+    # flipping between ~0 and a full period with tiny clock differences.
+    trigger_margin = float(kw.get("trigger_margin", 10000.5))
     # Since the combined-arb rewrite, anchor_free_reps is a free repeat
     # count (one table entry regardless of size), so it's no longer bound
     # by the old ~250-listing sequence-table ceiling -- it's tuned instead
@@ -969,6 +994,7 @@ def cmd_run(file_name, **kw):
               f"{spacing_desc} ({len(mw_values_us)} points), "
               f"n_reps={n_reps}, fixed frequency {freq_hz/1e9:.5f} GHz, "
               f"{drive_power_dbm} dBm")
+        _warn_unplayable_pulse_lengths(mw_values_us)
 
         print("[rabi] step 1/3: configuring AWG + SDG1062X (external "
               "trigger) + SR830 lock-in")
@@ -1524,134 +1550,83 @@ def cmd_run(file_name, **kw):
     print("[rabi] done")
 
 
-def cmd_run_repeat(file_name, **kw):
+def _freq_tag(freq_hz):
+    """Filesystem-safe tag for a drive frequency, e.g. 2.9e9 -> '2900MHz',
+    2.8955e9 -> '2895p5MHz' -- used to tell apart per-frequency batches in
+    cmd_run_repeat()'s freq_hz_list mode."""
+    return f"{freq_hz / 1e6:g}MHz".replace(".", "p")
+
+
+def _power_tag(power_dbm):
+    """Filesystem-safe tag for a dBm value, e.g. -10.0 -> 'm10dBm', 0.0 ->
+    '0dBm' -- same convention as pulsed_odmr.py's and cw_odmr_lock_in.py's
+    _power_tag(), used in cmd_run_repeat()'s drive_power_dbm_list mode."""
+    sign = "m" if power_dbm < 0 else ""
+    return f"{sign}{abs(power_dbm):g}dBm".replace(".", "p")
+
+
+def _repeat_tripped(repeat_name):
+    """True if a repeat's log (D:/rabi/logs/<repeat_name>_rabi.txt) shows an interlock trip."""
+    import os
+    log_path = f"{DATA_DIR}/logs/{repeat_name}_rabi.txt"
+    if not os.path.exists(log_path):
+        return False
+    with open(log_path, errors="replace") as fh:
+        return "[interlock] TRIPPED" in fh.read()
+
+
+def _run_repeat_batch(file_name, group_prefix, n_repeats, kw):
     """
-    Repeat cmd_run() n_repeats times in a row with IDENTICAL settings, then
-    average X and Y elementwise across the completed repeats (then
-    computing R from the averaged X/Y, not by averaging R directly -- R has
-    a positive noise-rectification bias that averaging after the fact
-    doesn't remove, same convention as cw_odmr_lock_in.py's
-    cmd_sweep_average()).
+    One run-repeat batch: n_repeats `rabi.py run` subprocesses named
+    <group_prefix>_repeat{i}, all saved into D:/rabi/<file_name>/, then the
+    average saved as <group_prefix>_avg_rabi_*. Repeats 1+ are pinned to
+    repeat 0's recorded freq_hz and coil_current_a (see cmd_run_repeat()).
 
-    Each repeat runs `python rabi.py run <repeat_name> ...` as a genuine
-    SEPARATE OS PROCESS (via subprocess), not an in-process cmd_run()
-    call -- reuses cmd_run() completely UNMODIFIED (zero risk of a
-    repeat-batching wrapper introducing a new timing bug into the single-
-    sweep path this session spent so long validating -- see notes.md),
-    gives each repeat a genuinely fresh instrument state, AND, critically,
-    a genuinely fresh process/address space. An earlier in-process version
-    (calling cmd_run() directly, many times, in the SAME Python process)
-    crashed on real hardware after enough repeats with `numpy._core.
-    _exceptions._ArrayMemoryError: Unable to allocate 7.68 MiB` inside
-    upload_waveform() -- a tiny allocation that should never fail on a
-    healthy system, consistent with heap fragmentation/resource
-    accumulation from hundreds of large arb uploads and VISA sessions
-    never being FULLY released within one long-lived process. A real OS
-    process boundary per repeat eliminates that whole class of bug for
-    free (the OS reclaims everything on exit), at the cost of one extra
-    Python interpreter startup per repeat (~1s, negligible next to an
-    actual sweep).
-
-    All repeats' files land in ONE shared folder (D:/rabi/<file_name>/,
-    same as a plain cmd_run() call would use), not one folder per repeat
-    -- distinguished by file name (<file_name>_repeat{i}_rabi_x.npy etc.)
-    via cmd_run()'s output_dir override, not by directory. 100 repeats
-    means 100 sets of files in that one folder, not 100 folders.
-
-    Recognized key=value overrides:
-      n_repeats=10  number of times to repeat the sweep
-      (everything else is passed through to cmd_run() UNCHANGED, once per
-      repeat -- see cmd_run()'s own docstring/USAGE for the full
-      list)
-
-    Repeat 0 runs with whatever freq_hz/use_resonance_freq settings were
-    given (e.g. use_resonance_freq=true to resolve the actual drive
-    frequency from a coarse+fine scan around a freq_hz search midpoint,
-    which also triggers the coil-current optimization scan). Every repeat
-    AFTER that is automatically pinned to repeat 0's own recorded freq_hz
-    AND coil_current_a (both read back from its saved metadata) and run
-    with use_resonance_freq=false and fine_sweep=false, regardless of
-    what was passed in -- so the resonance/coil-current search and the
-    fine resonance sweep only happen once, not independently every
-    repeat (slower, and could drift point-to-point across an averaged
-    batch if the found dip/current isn't perfectly identical each time).
-    The coarse sweep and the reflected-power-at-operating-point check
-    still run on every repeat regardless (real safety checks, not part
-    of the search being skipped) -- only the FINE stage is skipped.
-
-    A repeat that trips the interlock partway through saves a SHORTER
-    mw_us array than a fully-completed one (same as a single cmd_run()
-    call always has) -- such a repeat is excluded from the average
-    entirely (its mw_us grid won't match the first fully-completed
-    repeat's), not padded or partially averaged in.
-
-    Saves each repeat's normal cmd_run() file set (prefixed <file_name>_
-    repeat{i}_...) plus, once at least one repeat completes fully, the
-    average (prefixed <file_name>_avg_...) -- all under
-    D:/rabi/<file_name>/:
-      <file_name>_repeat{i}_rabi_mw_us.npy, _rabi_x.npy, _rabi_y.npy, ...
-      <file_name>_avg_rabi_mw_us.npy, _avg_rabi_x.npy, _avg_rabi_y.npy,
-      _avg_rabi_r.npy, _avg_rabi_metadata.txt (records n_repeats_
-      requested vs. n_repeats_averaged).
+    Returns "ok", "interrupted" (Ctrl+C) or "tripped" (a repeat's log shows
+    an interlock trip) -- the caller stops the whole grid on either of the
+    last two.
     """
-    n_repeats = int(kw.pop("n_repeats", 10))
     import os
     import subprocess
     import sys
 
+    status = "ok"
     resolved_freq_hz = None
     resolved_coil_current_a = None
     try:
         for i in range(n_repeats):
-            repeat_name = f"{file_name}_repeat{i}"
+            repeat_name = f"{group_prefix}_repeat{i}"
             repeat_kw = dict(kw)
             pin_note = ""
             if resolved_freq_hz is not None:
-                # Pin every repeat after the first to the frequency AND
-                # coil current repeat 0 actually ran at (whether those
-                # came from use_resonance_freq's coarse+fine search /
-                # coil-current scan, or were just the plain freq_hz/
-                # coil_current_a passed in -- either way, reusing repeat
-                # 0's own recorded values is a single code path for both
-                # cases). Without this, use_resonance_freq would re-search
-                # resonance independently every repeat -- slower, and an
-                # averaged batch could drift point-to-point if the found
-                # dip/current isn't perfectly identical each time. Bug
-                # found on real hardware: coil_current_a specifically
-                # wasn't being pinned here at all (only freq_hz was) --
-                # since use_resonance_freq is forced false below, the
-                # coil-current scan (gated on that same flag) never ran
-                # again for repeats 1+, so they silently fell back to
-                # whatever coil_current_a was in the ORIGINAL kwargs, not
-                # the value the scan actually found on repeat 0. Confirmed
-                # symptom: repeat 0's coil current was correct, every
-                # later repeat's wasn't.
+                # Pin every repeat after the first to the frequency AND coil
+                # current repeat 0 actually ran at (whether those came from
+                # use_resonance_freq's search / coil-current scan, or were
+                # just the plain freq_hz/coil_current_a passed in). Without
+                # this, use_resonance_freq would re-search every repeat, and
+                # the coil-current scan (gated on the same flag, forced false
+                # below) would silently fall back to the ORIGINAL
+                # coil_current_a for repeats 1+ -- a bug seen on real
+                # hardware before coil_current_a was pinned too.
                 repeat_kw["freq_hz"] = resolved_freq_hz
                 repeat_kw["use_resonance_freq"] = "false"
-                # Frequency's already pinned from repeat 0, so re-running
-                # the FINE resonance sweep on every later repeat is pure
-                # waste -- but keep the coarse sweep and the reflected-
-                # power-at-operating-point check running (both still run
-                # unconditionally inside cmd_run()'s `if reflected_power_
-                # scan:` block regardless of fine_sweep -- only the fine
-                # STAGE is gated on it), since those are real safety
-                # checks, not part of the resonance search this is
-                # skipping.
+                # Skip only the FINE resonance sweep on later repeats; the
+                # coarse sweep and the reflected-power check at the operating
+                # point still run inside cmd_run() (real safety checks).
                 repeat_kw["fine_sweep"] = "false"
                 pin_note = f", pinned to {resolved_freq_hz/1e9:.5f} GHz"
                 if resolved_coil_current_a is not None:
                     repeat_kw["coil_current_a"] = resolved_coil_current_a
                     pin_note += f", {resolved_coil_current_a:.3f} A"
-                pin_note += " (from repeat 0), fine sweep skipped"
+                pin_note += " (from this batch's repeat 0), fine sweep skipped"
             print(f"[rabi] repeat {i + 1}/{n_repeats}: running {repeat_name} "
                   f"(saved into {file_name}/){pin_note}")
 
             repeat_kw["output_dir"] = file_name
             args = [sys.executable, __file__, "run", repeat_name]
             args += [f"{k}={v}" for k, v in repeat_kw.items()]
-            # Inherits this process's stdout/stderr (no capture_output) so
-            # the repeat's own live progress prints straight through, same
-            # as watching a single cmd_run() call.
+            # Inherits this process's stdout/stderr, so the repeat's own live
+            # progress prints straight through.
             result = subprocess.run(args)
             if result.returncode != 0:
                 print(f"[rabi] repeat {i}: subprocess exited with code "
@@ -1659,6 +1634,12 @@ def cmd_run_repeat(file_name, **kw):
                       f"continuing to the next repeat regardless (a repeat "
                       f"with no saved data is just excluded from the "
                       f"average below)")
+
+            if _repeat_tripped(repeat_name):
+                print(f"[rabi] {repeat_name}: interlock tripped -- stopping "
+                      f"(no further repeats or grid points)")
+                status = "tripped"
+                break
 
             if i == 0:
                 metadata_path = f"{DATA_DIR}/{file_name}/{repeat_name}_rabi_metadata.txt"
@@ -1670,16 +1651,18 @@ def cmd_run_repeat(file_name, **kw):
                     )
                     resolved_freq_hz = float(repeat0_metadata["freq_hz"])
                     resolved_coil_current_a = float(repeat0_metadata["coil_current_a"])
-                    print(f"[rabi] repeat 0 ran at freq_hz={resolved_freq_hz/1e9:.5f} GHz, "
-                          f"coil_current_a={resolved_coil_current_a:.3f} A -- pinning "
-                          f"repeats 1..{n_repeats - 1} to these same values")
+                    print(f"[rabi] {group_prefix} repeat 0 ran at freq_hz="
+                          f"{resolved_freq_hz/1e9:.5f} GHz, coil_current_a="
+                          f"{resolved_coil_current_a:.3f} A -- pinning repeats "
+                          f"1..{n_repeats - 1} to these same values")
                 else:
-                    print("[rabi] repeat 0: no metadata saved (0 points completed) -- "
-                          "can't resolve a frequency to pin later repeats to; they'll "
-                          "use their own settings as given")
+                    print(f"[rabi] {group_prefix} repeat 0: no metadata saved (0 "
+                          f"points completed) -- can't resolve a frequency to pin "
+                          f"later repeats to; they'll use their own settings as given")
     except KeyboardInterrupt:
         print("[rabi] repeat: stopped by user (Ctrl+C) -- averaging whatever "
-              "repeats completed so far")
+              "repeats completed so far, then stopping")
+        status = "interrupted"
 
     run_path = f"{DATA_DIR}/{file_name}"
     os.makedirs(run_path, exist_ok=True)
@@ -1688,18 +1671,22 @@ def cmd_run_repeat(file_name, **kw):
     xs, ys = [], []
     n_averaged = 0
     for i in range(n_repeats):
-        repeat_name = f"{file_name}_repeat{i}"
+        repeat_name = f"{group_prefix}_repeat{i}"
         mw_us_path = f"{run_path}/{repeat_name}_rabi_mw_us.npy"
         if not os.path.exists(mw_us_path):
-            print(f"[rabi] repeat {i}: no data saved (0 points completed) -- "
-                  f"excluded from average")
+            print(f"[rabi] {group_prefix} repeat {i}: no data saved -- excluded from average")
+            continue
+        if _repeat_tripped(repeat_name):
+            # Partial even if it happens to be the first saved repeat (which
+            # would otherwise become the reference grid).
+            print(f"[rabi] {group_prefix} repeat {i}: interlock tripped -- excluded from average")
             continue
         mw_us = np.load(mw_us_path)
         if reference_mw_us is None:
             reference_mw_us = mw_us
         elif len(mw_us) != len(reference_mw_us) or not np.allclose(mw_us, reference_mw_us):
-            print(f"[rabi] repeat {i}: mw_us grid doesn't match the first "
-                  f"completed repeat's ({len(mw_us)} vs {len(reference_mw_us)} "
+            print(f"[rabi] {group_prefix} repeat {i}: mw_us grid doesn't match the "
+                  f"first completed repeat's ({len(mw_us)} vs {len(reference_mw_us)} "
                   f"points) -- partial/tripped repeat, excluded from average")
             continue
         xs.append(np.load(f"{run_path}/{repeat_name}_rabi_x.npy"))
@@ -1707,26 +1694,133 @@ def cmd_run_repeat(file_name, **kw):
         n_averaged += 1
 
     if n_averaged == 0:
-        print(f"[rabi] repeat: no complete repeats to average -- nothing saved "
-              f"to {run_path}")
-        return
+        print(f"[rabi] {group_prefix}: no complete repeats to average -- nothing saved")
+        return status
 
     x_avg = np.mean(xs, axis=0)
     y_avg = np.mean(ys, axis=0)
     r_avg = np.sqrt(x_avg ** 2 + y_avg ** 2)
-
-    np.save(f"{run_path}/{file_name}_avg_rabi_mw_us.npy", reference_mw_us)
-    np.save(f"{run_path}/{file_name}_avg_rabi_x.npy", x_avg)
-    np.save(f"{run_path}/{file_name}_avg_rabi_y.npy", y_avg)
-    np.save(f"{run_path}/{file_name}_avg_rabi_r.npy", r_avg)
-    with open(f"{run_path}/{file_name}_avg_rabi_metadata.txt", "w") as fh:
+    avg_prefix = f"{run_path}/{group_prefix}_avg_rabi"
+    np.save(f"{avg_prefix}_mw_us.npy", reference_mw_us)
+    np.save(f"{avg_prefix}_x.npy", x_avg)
+    np.save(f"{avg_prefix}_y.npy", y_avg)
+    np.save(f"{avg_prefix}_r.npy", r_avg)
+    with open(f"{avg_prefix}_metadata.txt", "w") as fh:
         fh.write(f"n_repeats_requested={n_repeats}\n")
         fh.write(f"n_repeats_averaged={n_averaged}\n")
+        for key in ("freq_hz", "drive_power_dbm"):
+            if key in kw:
+                fh.write(f"{key}={kw[key]}\n")
+    print(f"[rabi] {group_prefix} done: averaged {n_averaged}/{n_repeats} completed "
+          f"repeats, saved {avg_prefix}_mw_us.npy, _x.npy, _y.npy, _r.npy, _metadata.txt")
+    return status
 
-    print(f"[rabi] repeat done: averaged {n_averaged}/{n_repeats} completed "
-          f"repeats, saved {run_path}/{file_name}_avg_rabi_mw_us.npy, "
-          f"_avg_rabi_x.npy, _avg_rabi_y.npy, _avg_rabi_r.npy, "
-          f"_avg_rabi_metadata.txt")
+
+def cmd_run_repeat(file_name, **kw):
+    """
+    Repeat cmd_run() n_repeats times in a row with IDENTICAL settings, then
+    average X and Y elementwise across the completed repeats (then
+    computing R from the averaged X/Y, not by averaging R directly -- R has
+    a positive noise-rectification bias that averaging after the fact
+    doesn't remove, same convention as cw_odmr_lock_in.py's
+    cmd_sweep_average()).
+
+    Each repeat runs `python rabi.py run <repeat_name> ...` as a genuine
+    SEPARATE OS PROCESS (via subprocess), not an in-process cmd_run()
+    call -- reuses cmd_run() completely UNMODIFIED, gives each repeat a
+    genuinely fresh instrument state, AND a fresh process/address space.
+    An earlier in-process version (calling cmd_run() directly, many times,
+    in the SAME Python process) crashed on real hardware after enough
+    repeats with `numpy._core._exceptions._ArrayMemoryError: Unable to
+    allocate 7.68 MiB` inside upload_waveform() -- consistent with heap
+    fragmentation/resource accumulation from hundreds of large arb uploads
+    and VISA sessions never being FULLY released within one long-lived
+    process. A real OS process boundary per repeat eliminates that whole
+    class of bug, at the cost of one extra Python interpreter startup per
+    repeat (~1 s, negligible next to an actual sweep).
+
+    All repeats' files land in ONE shared folder (D:/rabi/<file_name>/),
+    distinguished by file name (<file_name>_repeat{i}_rabi_x.npy etc.) via
+    cmd_run()'s output_dir override, not by directory.
+
+    Repeat 0 of a batch runs with whatever freq_hz/use_resonance_freq
+    settings were given. Every repeat AFTER that is pinned to repeat 0's own
+    recorded freq_hz AND coil_current_a (read back from its saved metadata)
+    and run with use_resonance_freq=false and fine_sweep=false -- so the
+    resonance/coil-current search and the fine resonance sweep only happen
+    once per batch. The coarse sweep and the reflected-power-at-operating-
+    point check still run on every repeat (real safety checks).
+
+    freq_hz_list / drive_power_dbm_list (optional, same idea as
+    pulsed_odmr.py's tau_mw_us_list / drive_power_dbm_list): run one
+    independent n_repeats batch per drive frequency, per drive power, or --
+    with both -- per (frequency, power) pair of the full grid (frequency is
+    the outer loop). Each batch's own repeat 0 resolves and pins its own
+    frequency and coil current. File names get a tag per list given:
+    <file_name>_f2900MHz_pm10dBm_repeat0_..., <file_name>_f2900MHz_pm10dBm_
+    avg_..., all in the one D:/rabi/<file_name>/ folder. With neither list,
+    behaves exactly as a single plain batch (no tags). Unlike pulsed_odmr.py,
+    a Ctrl+C or an interlock trip (found in a repeat's log) stops the WHOLE
+    grid, not just the current batch -- the current batch is still averaged.
+
+    Recognized key=value overrides:
+      n_repeats=10  number of times to repeat the sweep, per grid point
+      freq_hz_list=None  comma-separated drive frequencies in Hz, e.g.
+                    "2.895e9,2.9e9" -- overrides freq_hz
+      drive_power_dbm_list=None  comma-separated drive powers, e.g.
+                    "-16,-13,-10,-7" -- overrides drive_power_dbm
+      (everything else is passed through to cmd_run() UNCHANGED, once per
+      repeat -- see cmd_run()'s own docstring/USAGE)
+
+    A repeat that trips the interlock partway through saves a SHORTER
+    mw_us array than a fully-completed one -- excluded from the average
+    (its mw_us grid won't match the first fully-completed repeat's), not
+    padded or partially averaged in.
+
+    Saves each repeat's normal cmd_run() file set plus, once at least one
+    repeat in a batch completes fully, that batch's average -- all under
+    D:/rabi/<file_name>/:
+      <prefix>_repeat{i}_rabi_mw_us.npy, _rabi_x.npy, _rabi_y.npy, ...
+      <prefix>_avg_rabi_mw_us.npy, _avg_rabi_x.npy, _avg_rabi_y.npy,
+      _avg_rabi_r.npy, _avg_rabi_metadata.txt (records n_repeats_requested
+      vs. n_repeats_averaged, and the batch's freq_hz/drive_power_dbm)
+    where <prefix> is <file_name> plus any _f<freq>/_p<power> tags.
+    """
+    n_repeats = int(kw.pop("n_repeats", 10))
+    freq_list_raw = kw.pop("freq_hz_list", None)
+    power_list_raw = kw.pop("drive_power_dbm_list", None)
+    multi_freq = freq_list_raw is not None
+    multi_power = power_list_raw is not None
+    freq_list = [float(f) for f in str(freq_list_raw).split(",")] if multi_freq else [None]
+    power_list = [float(p) for p in str(power_list_raw).split(",")] if multi_power else [None]
+
+    grid = [(f, p) for f in freq_list for p in power_list]
+    if multi_freq or multi_power:
+        print(f"[rabi] run-repeat grid: {len(grid)} batch(es) of {n_repeats} repeats -- "
+              f"frequencies {', '.join(f'{f/1e9:.4f} GHz' for f in freq_list) if multi_freq else 'as given'}; "
+              f"powers {', '.join(f'{p:g} dBm' for p in power_list) if multi_power else 'as given'}")
+
+    for n, (freq_hz, power_dbm) in enumerate(grid):
+        group_prefix = file_name
+        batch_kw = dict(kw)
+        if multi_freq:
+            group_prefix += f"_f{_freq_tag(freq_hz)}"
+            batch_kw["freq_hz"] = freq_hz
+        if multi_power:
+            group_prefix += f"_p{_power_tag(power_dbm)}"
+            batch_kw["drive_power_dbm"] = power_dbm
+        if multi_freq or multi_power:
+            print(f"[rabi] batch {n + 1}/{len(grid)}: "
+                  f"{f'{freq_hz/1e9:.4f} GHz ' if multi_freq else ''}"
+                  f"{f'{power_dbm:g} dBm ' if multi_power else ''}"
+                  f"-> {group_prefix}_...")
+        status = _run_repeat_batch(file_name, group_prefix, n_repeats, batch_kw)
+        if status != "ok":
+            remaining = len(grid) - n - 1
+            if remaining:
+                print(f"[rabi] run-repeat: {status} -- skipping the remaining "
+                      f"{remaining} batch(es) of the grid")
+            break
 
 
 def cmd_run_no_mw(file_name, **kw):
@@ -1982,6 +2076,7 @@ def _run_no_mw_impl(file_name, ch2_hold_constant, ch1_hold_constant=False,
               f"{' CH1 held constant (plain continuous 80 MHz sine, no sequence) this run.' if ch1_hold_constant else ''} "
               f"tau_mw sweep: {mw_start_us}-{mw_stop_us} us, step {mw_step_us} us "
               f"({len(mw_values_us)} points), n_reps={n_reps}")
+        _warn_unplayable_pulse_lengths(mw_values_us)
 
         print("[rabi] configuring AWG + SDG1062X (external trigger) + SR830 "
               "lock-in -- no generator, no interlock, no PSUs")
@@ -2218,7 +2313,7 @@ def cmd_calibrate_phase(file_name, **kw):
     ch1_vpp = float(kw.get("ch1_vpp", 0.632))
     ch2_vpp = float(kw.get("ch2_vpp", 5.0))
     ch2_offset_v = float(kw.get("ch2_offset_v", 2.5))
-    trigger_margin = float(kw.get("trigger_margin", 3.0))
+    trigger_margin = float(kw.get("trigger_margin", 10000.5))  # see cmd_run()'s trigger_margin comment
     # This was missing entirely until now -- setup_awg_sequences() call
     # below silently defaulted to anchor_free_reps=1, the exact pre-fix
     # worst-case configuration behind the whole "spurious off-resonance/
@@ -2245,6 +2340,7 @@ def cmd_calibrate_phase(file_name, **kw):
     with _tee_stdout(log_path):
         print(f"[rabi] phase calibration: tau_mw={mw_us} us, n_reps={n_reps}, "
               f"fixed frequency {freq_hz/1e9:.5f} GHz, {drive_power_dbm} dBm")
+        _warn_unplayable_pulse_lengths([mw_us])
 
         awg = ks33600a.KS33600A(AWG_RESOURCE, debug=True)
         sdg = SDG1062X(SDG_RESOURCE, debug=True)
@@ -2506,10 +2602,10 @@ python rabi.py run <file_name>
     max_rescale_attempts=10 auto_rescale_on_underload=true underload_margin=0.5
     underload_persistence=3 fixed_sensitivity=false psu_voltage_v=12
     psu_current_limit_a=1.9 coil_current_a=2 coil_voltage_margin=1.5
-    interlock_check_interval=5 interlock_during_sweep=true remeasure_after_cw_check=true
+    interlock_check_interval=5 interlock_during_sweep=true remeasure_after_cw_check=false
     cw_check_trace_s=0 cw_check_trace_dt_s=0.2
     resequence_interval=4 extra_settle_s=0 ch1_vpp=0.632 ch2_vpp=5 ch2_offset_v=2.5
-    trigger_margin=3 anchor_free_reps=1000 fixed_external_trigger=true
+    trigger_margin=10000.5 anchor_free_reps=1000 fixed_external_trigger=true
     reflected_power_scan=true res_span_hz=100e6 coarse_step_hz=2e6 fine_span_hz=20e6
     fine_step_hz=50e3 res_power_dbm=-40 res_cal_dir=None fine_sweep=true
     use_resonance_freq=false coil_scan_start_a=1 coil_scan_stop_a=4
@@ -2517,7 +2613,7 @@ python rabi.py run <file_name>
     coil_scan_current_settle_s=2
 
 python rabi.py run-repeat <file_name>
-    n_repeats=10 (plus every 'run' option above)
+    n_repeats=10 freq_hz_list=None drive_power_dbm_list=None (plus every 'run' option above)
 
 python rabi.py run-no-mw <file_name>
 python rabi.py run-ch2-constant <file_name>
@@ -2534,7 +2630,7 @@ python rabi.py run-ch1-ch2-constant <file_name>
 python rabi.py calibrate-phase <file_name>
     freq_hz=2.843e9 drive_power_dbm=0 threshold_dbm=-10 mw_us=1 n_reps=250 laser_us=2 pre_us=1
     post_us=1 time_constant_s=0.1 settle_periods=5 settle_time_constants=9
-    input_coupling=ac ch1_vpp=0.632 ch2_vpp=5 ch2_offset_v=2.5 trigger_margin=3
+    input_coupling=ac ch1_vpp=0.632 ch2_vpp=5 ch2_offset_v=2.5 trigger_margin=10000.5
     anchor_free_reps=1000 extra_settle_s=0 psu_voltage_v=12 psu_current_limit_a=1.9
     coil_current_a=2 coil_voltage_margin=1.5"""
 
