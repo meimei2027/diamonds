@@ -1,0 +1,28 @@
+
+# Load with alpha channel
+img = cv2.imread("diamond.png", cv2.IMREAD_UNCHANGED)
+
+# Check if image has alpha channel
+if img.shape[2] == 4:
+    bgr = img[:, :, :3]
+    alpha = img[:, :, 3]
+else:
+    raise ValueError("Image has no alpha channel")
+
+# Define white threshold
+threshold = 240
+white_mask = np.all(bgr >= threshold, axis=2)
+
+# Only modify visible (non-transparent) pixels
+visible_mask = alpha > 0
+
+# Combine masks: non-white AND visible
+mask = (~white_mask) & visible_mask
+
+# Set those pixels to red
+bgr[mask] = [31, 24, 180]
+
+# Recombine channels
+output = np.dstack((bgr, alpha))
+
+cv2.imwrite("output.png", output)
